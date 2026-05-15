@@ -1,0 +1,1 @@
+"""Polymarket API adapter scaffolding."""
