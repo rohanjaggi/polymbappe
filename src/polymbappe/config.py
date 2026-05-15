@@ -1,0 +1,25 @@
+"""Application configuration."""
+
+from pathlib import Path
+
+from pydantic import Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    """Runtime settings loaded from environment."""
+
+    model_config = SettingsConfigDict(env_prefix="POLYMBAPPE_", env_file=".env", extra="ignore")
+
+    random_seed: int = Field(default=20260611)
+    data_dir: Path = Field(default=Path("data"))
+    friendly_weight: float = Field(default=0.3, ge=0.0, le=1.0)
+    dixon_coles_xi: float = Field(default=0.0019, ge=0.0)
+
+    @property
+    def raw_data_dir(self) -> Path:
+        return self.data_dir / "raw"
+
+    @property
+    def processed_data_dir(self) -> Path:
+        return self.data_dir / "processed"
