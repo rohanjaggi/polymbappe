@@ -121,7 +121,7 @@ def resolve_group_table(
             if j - i > 1:
                 lot_order = rng.permutation(j - i)
                 for offset, lot_pos in enumerate(lot_order):
-                    tied_rows[i + int(lot_pos)].lots_rank = offset
+                    tied_rows[i + lot_pos].lots_rank = offset
                 tied_rows[i:j] = sorted(tied_rows[i:j], key=lambda row: row.lots_rank)
 
             resolved.extend(tied_rows[i:j])
