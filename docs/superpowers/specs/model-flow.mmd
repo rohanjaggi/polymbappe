@@ -1,0 +1,33 @@
+---
+title: Polymbappe — Model Flow
+---
+graph TD
+    %% Main prediction pipeline - strict linear flow
+    DATA["<b>Data Sources</b><br/>Kaggle · Elo · Transfermarkt · FBref · Odds · Reddit · RSS"]
+
+    DATA --> CORE["<b>Core Features</b><br/>Elo · Squad value · Market odds · xG · Form · H2H"]
+    DATA --> CTX["<b>Contextual Features</b><br/>xG overperformance · PPDA · Club cluster<br/>Manager pedigree · Fatigue · Draw pressure"]
+
+    CORE --> BASE["<b>3 Base Models</b><br/>MLE Dixon-Coles · Bayesian DC (PyMC) · LightGBM"]
+    BASE --> META["<b>Meta-Learner</b><br/>L2 Logistic Regression → calibrated H/D/A"]
+
+    META --> ADJ["<b>Contextual Adjuster</b><br/>LightGBM on residuals (±3pp cap)"]
+    CTX --> ADJ
+
+    %% Dual pipeline split
+    ADJ --> CALIB["<b>Calibration Pipeline</b><br/>(with market odds)"]
+    ADJ --> EDGE["<b>Edge Pipeline</b><br/>(without market odds)"]
+
+    %% Downstream
+    CALIB --> SIM["<b>Monte Carlo Simulation</b><br/>100K runs · Groups → R32 → Final"]
+    SIM --> PROBS["Tournament Probabilities"]
+    EDGE --> EDGES["Market Edges"]
+    PROBS --> DASH["<b>Streamlit Dashboard</b>"]
+    EDGES --> DASH
+
+    %% Auxiliary systems - minimal connections
+    AGENT["<b>LangGraph Agent</b><br/>Scan → Assess → Act → Reflect"]
+    AGENT -.->|"re-simulates"| SIM
+
+    TUNE["<b>Autotuner</b><br/>Phase 1: Structural (LLM) · Phase 2: Numeric (Optuna)"]
+    TUNE -.->|"best config"| BASE

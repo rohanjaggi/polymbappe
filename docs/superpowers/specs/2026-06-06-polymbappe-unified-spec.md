@@ -17,20 +17,20 @@ A probabilistic forecasting engine for the 2026 FIFA World Cup that produces cal
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                           DATA LAYER                                         │
 │  Kaggle Results · EloRatings.net · Transfermarkt · FBref · Polymarket       │
-│  EA FC (Kaggle) · FM25 · Reddit API · Google News RSS · Google Trends      │
+│  EA FC (Kaggle) · FM25 · Reddit API · BBC Sport RSS                        │
 └──────────────────────────────────┬──────────────────────────────────────────┘
                                    ↓
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                        FEATURE ENGINEERING                                    │
 │                                                                              │
 │  ┌─── Core Features (Tier 1-3) ───┐    ┌─── Contextual Features ────────┐  │
-│  │ Elo ratings                     │    │ Tactical matchup modeling      │  │
+│  │ Elo ratings                     │    │ PPDA difference                │  │
 │  │ Squad market value              │    │ Squad cohesion & chemistry     │  │
 │  │ Market-implied probabilities    │    │ Manager tournament pedigree    │  │
 │  │ Rolling xG                      │    │ Fatigue & schedule modeling    │  │
 │  │ Recent form                     │    │ Multi-source sentiment         │  │
 │  │ Head-to-head record             │    │                                │  │
-│  │ Confederation strength          │    │                                │  │
+│  │ Neutral site flag                │    │                                │  │
 │  │ Home/host advantage             │    │                                │  │
 │  │ Tournament stage                │    │                                │  │
 │  └─────────────────────────────────┘    └────────────────────────────────┘  │
@@ -43,7 +43,7 @@ A probabilistic forecasting engine for the 2026 FIFA World Cup that produces cal
 │  Base Model 2: Bayesian Hierarchical Dixon-Coles (PyMC, posterior draws)    │
 │  Base Model 3: LightGBM (all core features + base model outputs)            │
 │       ↓ [out-of-fold H/D/A probabilities]                                   │
-│  Meta-Learner: Isotonic Regression (per-class calibration)                  │
+│  Meta-Learner: Logistic Regression (L2-regularized calibration)             │
 │       ↓ [calibrated base probabilities]                                     │
 │  Contextual Adjuster: LightGBM on residuals (contextual features only)      │
 │       ↓ [final calibrated H/D/A probabilities]                              │
@@ -55,20 +55,20 @@ A probabilistic forecasting engine for the 2026 FIFA World Cup that produces cal
 │  100,000 Monte Carlo iterations                                              │
 │  Group stage → Best third-place → R32 → R16 → QF → SF → Final              │
 │  Full FIFA 2026 tiebreakers · Extra time · Penalties                        │
-│  Contextual features injected per-match (tactical matchups, fatigue)        │
+│  Contextual features injected per-match (PPDA, fatigue, draw pressure)      │
 └──────────────────────────────────┬──────────────────────────────────────────┘
                                    ↓
 ┌────────────────────────────┐  ┌─────────────────────────────────────────────┐
 │     EDGE DETECTION         │  │           LIVE UPDATE SYSTEM                 │
-│  Model vs. Polymarket      │  │  LangGraph Agent (5-node state machine)     │
-│  Confidence intervals      │  │  Scan → Assess → Cross-Ref → Act → Reflect │
-│  Kelly criterion sizing    │  │  Every 6h pre-tournament, 2h during         │
+│  Separate market-blind     │  │  LangGraph Agent (5-node state machine)     │
+│  pipeline vs. Polymarket   │  │  Scan → Assess → Cross-Ref → Act → Reflect │
+│  Confidence intervals      │  │  Every 6h pre-tournament, 2h during         │
 └────────────────────────────┘  └─────────────────────────────────────────────┘
                                    ↓
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                      STREAMLIT DASHBOARD                                      │
 │  Overview · Team Deep Dive · Match Predictor · Market Edges                 │
-│  What-If Simulator · Upset Watch · Agent Activity                           │
+│  Upset Watch · Agent Activity                                               │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -88,9 +88,7 @@ A probabilistic forecasting engine for the 2026 FIFA World Cup that produces cal
 | FM25 (Football Manager) | Tournament-specific mental attributes unavailable in EA FC: ImportantMatches, Pressure, Consistency, Teamwork, Leadership, Dirtiness, Temperament, Adaptability. 159K+ players, 89 attributes. Used for 2026 live predictions only (sourced from public GitHub repo) | CSV from RXGUL/WC2026-AI-PREDICTOR |
 | Polymarket + betting odds | Market-implied H/D/A probabilities, line movements | Polymarket CLOB API + Football-Data.co.uk CSVs |
 | Reddit API | Post-match thread sentiment from r/soccer | PRAW library |
-| Google News RSS | Pre-tournament headline sentiment per team | RSS feed parsing + LLM classification |
-| Google Trends API | Search interest volume per team | `pytrends` library |
-| Expert power rankings | Aggregated professional pre-tournament rankings | Web scrape (BBC, Guardian, ESPN, FiveThirtyEight, The Athletic) |
+| BBC Sport RSS + sports news feeds | Pre-tournament headline sentiment per team | RSS feed parsing + LLM classification |
 | Tournament venue data | 16 host city coordinates, schedule, venue assignments | Static JSON (FIFA published data) |
 | Manager career history | Tournament knockout records, tenure data | Match database cross-referenced with Wikipedia |
 | EA FC historical editions (FIFA 18, 20, 22, via Kaggle) | Player attributes for backtest periods. FM25-exclusive attributes (ImportantMatches, Pressure, etc.) use FM25 data as a proxy for 2022 era since personality attributes are stable year-to-year for established players | CSV download from Kaggle |
@@ -107,8 +105,7 @@ All data lands in DuckDB. Normalized into Pydantic schemas:
 - `MarketOdds` — match_id, source, home_win_prob, draw_prob, away_win_prob, timestamp
 - `PlayerStatus` — player, team, status (fit/doubt/injured/out), last_updated, source, confidence
 - `ManagerRecord` — manager, team, tournament, stage_reached, knockout_matches, knockout_wins
-- `TacticalProfile` — team, tournament, archetype, ppda, formation_variance
-- `SentimentSnapshot` — team, date, reddit_score, expert_rank, line_movement, trends_volume, news_tone, composite
+- `SentimentSnapshot` — team, date, xg_overperformance, reddit_score, news_tone
 
 ### 1.3 Live Update Flow
 
@@ -135,7 +132,7 @@ During tournament: Agent frequency increases to every 2 hours. Additionally, `po
 
 | Feature | Source | Construction |
 |---------|--------|-------------|
-| Rolling xG (last 10 matches) | FBref | Sum player-level club xG for national team squad, weighted by minutes |
+| Rolling xG (last 10 matches) | FBref | Team-level international xG from FBref (2018+). Pre-2018: opponent-strength-adjusted goals scored as proxy |
 | Recent form (last 5/10/15) | Kaggle results | Goals scored/conceded rolling windows, opponent-strength-adjusted |
 | Days since last match | Kaggle results | Fatigue/rust indicator |
 | Head-to-head record | Kaggle results | Win rate in last 5 meetings |
@@ -144,32 +141,24 @@ During tournament: Agent frequency increases to every 2 hours. Additionally, `po
 
 | Feature | Source | Construction |
 |---------|--------|-------------|
-| Confederation strength | Derived from Elo | Mean Elo of confederation |
 | Home/host advantage | Tournament metadata | Binary: is team a host nation? |
 | Tournament stage | Simulation context | Group vs. knockout indicator |
 | Neutral site flag | Match metadata | Already in `Match` schema |
 
 ### 2.2 Contextual Features — Fed to Contextual Adjuster Only
 
-**Group A — Tactical Matchup:**
+**Group A — Tactical Profile:**
 
 | Feature | Source | Construction |
 |---------|--------|-------------|
-| Formation archetype (each team) | EA FC/FM25 + FBref | Classify into: high-press possession, counter-attack, direct/physical, hybrid flexible. Based on PPDA + formation frequency + player attribute profiles |
-| Archetype matchup advantage | Historical results (2010+) | Win rate delta when archetype A faces B vs. Elo-predicted baseline |
-| Pressing intensity index | FBref PPDA | Passes allowed per defensive action |
-| Defensive compactness | EA FC (backtest) / FM25 (2026) | Aggregate of positional discipline, teamwork, concentration for starting XI |
-| Style clash indicator | Derived | Binary: similar vs. opposing styles. Two possession teams → more draws historically |
+| Pressing intensity (PPDA difference) | FBref | `PPDA_home - PPDA_away`. Raw pressing difference between the two teams — captures high-press vs. low-block dynamic without requiring a full archetype taxonomy. Available 2018+ |
 
 **Group B — Squad Cohesion & Chemistry:**
 
 | Feature | Source | Construction |
 |---------|--------|-------------|
-| Club cluster index | Transfermarkt squad lists | For each club with `n` called-up players: `n*(n-1)/2`. Sum across all clubs |
-| Core continuity | Historical squad data | % of starting XI that also started in last 3 major tournaments |
-| Tournament experience depth | Kaggle + squad lists | Average major tournament caps per player in expected XI |
-| Age profile maturity | Transfermarkt | Squad age distribution distance from international peak (27-30) |
-| Leadership spine age | Squad data | Average age of GK, CB leader, midfield anchor, captain |
+| Club cluster index | Transfermarkt squad lists | For each club with `n` called-up players: `n*(n-1)/2`. Sum across all clubs. Computable from same Transfermarkt scrape as squad value |
+| Median squad age | Transfermarkt | Median age of expected XI. Simple proxy for experience vs. athleticism tradeoff. International peak is ~27-30 |
 
 **Group C — Manager Tournament Pedigree:**
 
@@ -179,7 +168,6 @@ During tournament: Agent frequency increases to every 2 hours. Additionally, `po
 | Manager deepest run (weighted recency) | Match data | Furthest stage reached, exponentially decayed (lambda=0.3 per tournament) |
 | Manager knockout conversion rate | Match data | % of knockout matches won (group stage excluded) |
 | Manager tenure matches | Match data | Competitive matches managed for current national team |
-| Manager tactical flexibility | FBref | Variance in formation usage across last 10 matches |
 
 **Group D — Fatigue & Schedule:**
 
@@ -187,22 +175,46 @@ During tournament: Agent frequency increases to every 2 hours. Additionally, `po
 |---------|--------|-------------|
 | Rest days between matches | Tournament schedule | Calendar difference. <4 days = fatigued flag |
 | Travel distance between venues | Venue coordinates (16 cities) | Haversine distance between consecutive match venues |
-| Club season minutes load | FBref | Total minutes played by expected XI in preceding club season |
-| Match intensity accumulation | Simulation state | Cumulative tournament minutes + extra-time matches so far |
-| Fixture congestion index | FBref | Matches played in final 2 months of club season |
+| Club season minutes load | FBref | Total minutes played by expected XI in preceding club season. Captures "players are tired from a 60-game season" |
 
-**Group E — Multi-Source Sentiment:**
+**Group E — Sentiment:**
 
 | Feature | Source | Construction |
 |---------|--------|-------------|
-| Reddit match sentiment | Reddit API (r/soccer) | NLP scoring (VADER + LLM reranking) on top comments from last 5-10 post-match threads |
-| Expert power rankings | Web scrape (10-15 sources) | Normalize to 0-1, take median rank across BBC, Guardian, ESPN, FiveThirtyEight, The Athletic |
-| Betting line movement | Polymarket + odds portals | Direction and magnitude of odds movement in 30 days pre-tournament |
-| Google Trends interest | Google Trends API | Relative search volume for "[team] world cup 2026" |
-| News headline sentiment | Google News RSS | Classify positive/negative/neutral using Claude Haiku, aggregate to net score |
-| Composite sentiment score | Derived | Learned weighted combination: `w1*reddit + w2*expert + w3*lines + w4*trends + w5*news` |
+| xG overperformance (permanent) | FBref | `goals_scored - xG` over last 10 matches. The quantitative "winning ugly/well" signal. Backtestable (2018+), mechanistically clean |
+| Reddit match sentiment (additive, Tier B) | Reddit API (r/soccer) | NLP scoring (VADER + LLM reranking) on top comments from last 5-10 post-match threads. Additive signal on top of xG overperformance — captures narratives that numbers miss. Known noisy due to sarcasm. Forward-test only |
+| News headline sentiment (additive, Tier B) | BBC Sport RSS | Classify positive/negative/neutral using local LLM (Qwen 9B via Ollama), aggregate to net score. Forward-test only, bounded by ±3pp cap |
 
-### 2.3 Feature Builder Pattern
+**Group F — Draw Pressure Indicators:**
+
+Draws are the hardest outcome to predict (~25-28% of group matches) and systematically underpredicted by Poisson-based models. These features specifically target draw probability adjustment.
+
+| Feature | Source | Construction |
+|---------|--------|-------------|
+| Mutual qualification incentive | Group standings + simulation state | Binary: would a draw qualify both teams? Historically increases draw probability by 5-8pp in final group matches |
+| PPDA similarity | Derived | Two teams with similar PPDA values (both high-press or both low-block) draw more. `1 - |PPDA_home - PPDA_away| / max_PPDA_range` |
+| Low-scoring match probability | Dixon-Coles output | P(total goals ≤ 1) from the scoreline matrix. Low-scoring matches have higher draw probability mechanically |
+| Tournament stage × Elo gap interaction | Derived | Group stage + small Elo gap (<100) → draw more likely. Knockout stage → draw less likely (extra time resolves) |
+
+### 2.3 Squad Selection Uncertainty
+
+Pre-tournament predictions require computing features (tactical, cohesion, fatigue) for a starting XI that isn't known until matchday. This introduces uncertainty that must be handled explicitly.
+
+**Expected XI inference:**
+- Build from qualifying campaign + recent friendlies: most frequent starters per position (weighted by recency)
+- Maintain a "likely XI" and "rotation candidates" (players who started >30% of recent matches)
+- For each position, track probability of each player starting (based on start frequency)
+
+**Feature computation:**
+- Primary: compute all features using the expected XI
+- Sensitivity: for each key player (top-3 by FM25 overall rating), compute features with that player removed and replaced by their backup. Report the max prediction shift as "squad uncertainty range"
+- During tournament: once actual lineups are announced (~1h pre-match), recompute and re-simulate
+
+**Impact on simulation:**
+- Pre-tournament simulations use expected XI features (no uncertainty sampling — adds noise without improving calibration)
+- Live simulations after squad announcement use actual XI
+
+### 2.4 Feature Builder Pattern
 
 Each feature group gets its own builder module. All builders implement:
 
@@ -212,15 +224,9 @@ def build(matches: pl.DataFrame, as_of_date: date) -> pl.DataFrame
 
 Returns a team-date-level feature table. A `FeaturePipeline` orchestrator joins them into the final training matrix. Features computed using only data available before the prediction date (`as_of_date` enforces no leakage).
 
-**Exception:** Tactical matchup features are match-pair level (require known opponent). These use a different interface:
+**Match-pair features:** Draw pressure indicators (mutual qualification incentive) and PPDA difference are match-pair level (require known opponent). For group stage (known opponents), pre-computed before simulation. For knockout matches (unknown until simulated), computed dynamically per path inside the Monte Carlo loop.
 
-```python
-TacticalMatchupBuilder.compute(team_a: str, team_b: str) -> dict
-```
-
-Called inside the Monte Carlo simulation loop per match. For group stage (known opponents), pre-computed before simulation.
-
-### 2.4 Manager Pedigree — Small Sample Mitigation
+### 2.5 Manager Pedigree — Small Sample Mitigation
 
 Apply Bayesian shrinkage for managers with thin tournament records:
 
@@ -254,7 +260,7 @@ Existing `DixonColesModel` with time decay (xi=0.0019), tau correction, competit
 
 **Output:** Posterior predictive draws giving distribution over H/D/A probabilities with credible intervals. Key advantage: principled uncertainty quantification.
 
-**Literature basis:** Baio & Blangiardo (2010), Alan Turing Institute WorldCupPrediction (6th in 2022 Futbolmetrix contest, beating FiveThirtyEight, Opta, and Betfair).
+**Literature basis:** Baio & Blangiardo (2010), Alan Turing Institute WorldCupPrediction (6th in 2022 Futbolmetrix contest, outperforming multiple professional forecasters).
 
 ### 3.3 Base Model 3: LightGBM Stacked Model
 
@@ -272,11 +278,13 @@ Existing `DixonColesModel` with time decay (xi=0.0019), tau correction, competit
 
 **Input:** Out-of-fold predictions from all 3 base models (9 features: 3 probabilities x 3 models).
 
-**Method:** Isotonic regression per outcome class (non-parametric monotonic calibration).
+**Default method:** Logistic regression (multinomial, L2-regularized). With only 9 features and ~300 training samples, a parametric calibrator with strong regularization is more appropriate than non-parametric methods.
+
+**Upgrade path:** Isotonic regression per outcome class is available as an autotuner option, but only promoted if it outperforms logistic regression on held-out tournament data by >0.003 RPS. At this sample size, isotonic will likely overfit.
 
 **Output:** Calibrated H/D/A probabilities.
 
-**Fallback:** If isotonic overfits (possible with small validation sets), fall back to logistic regression or optimized weighted average.
+**Fallback:** If both underperform, fall back to optimized weighted average (convex combination of base model probabilities, weights found via grid search).
 
 ### 3.5 Contextual Adjustment Layer
 
@@ -288,15 +296,28 @@ Sits between the meta-learner output and final predictions. Trained on **residua
 
 **Output:** Adjustment vector applied to base probs, softmax-normalized to valid probability simplex.
 
-**Training:** Same leave-one-tournament-out CV protocol. For tactical matchup features (which require known opponents), only group-stage matches and historical knockout matches are used for training; in simulation, knockout matchups are computed dynamically per path.
+**Training:** Same leave-one-tournament-out CV protocol. Match-pair features (PPDA difference, draw pressure) are computed for both group-stage (known opponents) and historical knockout matches. In simulation, knockout matchups compute these dynamically per path.
 
 **Toggle:** The autotuner can disable this entire layer to measure marginal RPS contribution.
 
 **Final calibration:** An optional final isotonic pass is applied only if the adjuster degrades calibration on the validation set.
 
-### 3.6 Edge Detection Layer
+### 3.6 Dual Pipeline: Calibration vs. Edge Detection
 
-Compare final ensemble probabilities against Polymarket/bookmaker implied probabilities. Flag edges where: `|model_prob - market_prob| > 0.05` (5pp) AND the Bayesian posterior 90% credible interval doesn't overlap the market's implied probability.
+The system runs two parallel pipelines from the same base models:
+
+**Calibration pipeline (primary — used for tournament simulation + dashboard):**
+- Includes market-implied probabilities as a Tier 1 feature in LightGBM
+- Optimizes for lowest RPS — best possible probability estimates regardless of source
+- This is what feeds the Monte Carlo simulation and dashboard probabilities
+
+**Edge detection pipeline (separate — used for market edge identification):**
+- Excludes ALL market odds from features (both Tier 1 market-implied probabilities AND betting line movements from contextual layer)
+- Trained on the same data with the same architecture, minus market inputs
+- Produces "market-blind" probabilities that reflect only the model's own assessment of team strength
+- Edges are flagged where: `|edge_model_prob - market_prob| > 0.05` (5pp) AND the Bayesian posterior 90% credible interval from the edge pipeline doesn't overlap the market's implied probability
+
+**Why separate:** If market odds are a feature, the model learns to trust them (correctly — they're the strongest single predictor). But then "edges" are just noise in the model's reproduction of its own input. Genuine edges require a model that has never seen the market's opinion.
 
 ---
 
@@ -315,12 +336,32 @@ Compare final ensemble probabilities against Polymarket/bookmaker implied probab
 
 **Knockout stage (R32 through Final):**
 - Existing `seed_round_of_32` handles pathway constraints
-- **Per-match contextual injection:** For each knockout match, compute tactical matchup features (TacticalMatchupBuilder) and fatigue features (ScheduleBuilder) dynamically based on the simulation path
+- **Per-match contextual injection:** For each knockout match, compute PPDA difference, fatigue features (rest days, travel distance), and draw pressure dynamically based on the simulation path
 - Draw after 90 min: extra time with adjusted expected goals (x 30/90 x 0.85 fatigue discount)
-- Penalty shootout: weighted coin flip (~50.5/49.5 first-shooter advantage per Apesteguia & Palacios-Huerta 2010)
-- No home advantage in knockout (neutral venue) except reduced host bonus (~0.15 goals for USA/MEX/CAN)
+- Penalty shootout: team-level penalty win rate with Bayesian shrinkage toward 50% (same shrinkage approach as manager pedigree). First-shooter advantage (+0.5pp per Apesteguia & Palacios-Huerta 2010) applied on top
+- No home advantage in knockout (neutral venue) except reduced host bonus for USA/MEX/CAN (tunable parameter, initialized at ~0.15 goals based on literature on home WC advantage; tri-host tournament is unprecedented so this is uncertain — autotuner can adjust)
 
-### 4.2 Simulation Outputs
+**Correlated within-simulation updates:**
+Each simulation run maintains a latent "true strength" adjustment per team that updates as group-stage results are generated. If Team A massively outperforms expectations in Match 1 (e.g., wins 4-0 when expected ~1.5 xG), their latent strength shifts upward for remaining group matches and knockout rounds within that same simulation. Implemented as a lightweight Bayesian update: `posterior_strength = prior_strength + learning_rate * (observed_GD - expected_GD)`. The learning rate is small (~0.05) to avoid overcorrecting from single-match variance. This captures the reality that group-stage results reveal information about a team's true tournament-level form, which should propagate forward through the bracket.
+
+### 4.2 48-Team Format Adaptation
+
+The model trains on 32-team WCs (2010-2022) but predicts a 48-team tournament with fundamentally different structure. Key differences and mitigations:
+
+**Structural changes:**
+- 12 groups of 4 (vs. 8 groups of 4): more groups, same group size. Group dynamics are similar, but best-third-place calculation is more complex (8 of 12 qualify vs. 4 of 8).
+- Round of 32 is new: creates more early mismatches (group winners vs. third-place qualifiers). No historical analogue at WC level, but Euros 2016/2020/2024 (24 teams, best-third qualifying) provide some signal on mismatch dynamics.
+- Wider Elo spread: expanded confederation quotas mean weaker qualifiers. Groups will have larger Elo gaps than 32-team WCs.
+
+**Mitigations:**
+- Group-stage model parameters (home advantage, draw probability baseline) are learned from ALL international tournaments (including Euros, Copa), not just 32-team WCs. This dilutes format-specific overfitting.
+- Correlated within-simulation updates (Section 4.1) handle mismatch revelation naturally — if a weak team overperforms in a mismatch, their strength adjusts.
+- Down-weight group-stage tactical dynamics learned from 32-team WCs: the "dead rubber" effect (teams already qualified playing less intensely) is calibrated from Euros group stages where 3rd place also qualifies.
+- Knockout mismatch handling: for R32 matches with >300 Elo gap, apply a floor on underdog win probability of 8% (based on historical WC upset rate for similar gaps).
+
+**What we cannot model:** Game-theory effects of the new format (e.g., does knowing 3rd place qualifies change team behavior?) are unobservable until the tournament happens. This is accepted uncertainty.
+
+### 4.3 Simulation Outputs
 
 | Output | Description |
 |--------|-------------|
@@ -331,9 +372,19 @@ Compare final ensemble probabilities against Polymarket/bookmaker implied probab
 | Edge report | Matches/outrights where model diverges from market |
 | Contextual adjustment attribution | Per-team breakdown of how much each contextual factor shifted probabilities |
 
-### 4.3 Live Update Behavior
+### 4.4 Live Update Behavior
 
 After each real matchday: lock actual results, re-estimate team strengths (Bayesian posterior update), re-simulate remaining matches. CLI: `polymbappe simulate --tournament 2026 --n-sims 100000 --live`.
+
+### 4.5 Model Staleness Detection
+
+During the live tournament, track cumulative surprise: the running sum of `|actual_outcome - predicted_probability|` across all completed matches. If cumulative surprise exceeds a threshold (calibrated from historical tournaments — roughly: "more surprising than 90% of past matchday sequences"), the system flags that the pre-tournament model assumptions may be fundamentally wrong.
+
+**Trigger levels:**
+- **Yellow (advisory):** Cumulative surprise > 75th percentile of historical baselines. Dashboard displays a warning. No automatic action.
+- **Red (intervention):** Cumulative surprise > 90th percentile. System triggers a full model re-estimation: re-fit Bayesian model using tournament results as additional observations (not just posterior updates on existing parameters, but re-running MCMC with the new data appended). This is computationally expensive (~5-10 min) so only triggered by the red threshold.
+
+**What constitutes "surprise":** A result where the predicted probability was < 15% (e.g., Saudi Arabia beating Argentina when the model gave Saudi Arabia 8% win probability). Single upsets are expected — it's the accumulation of multiple surprises that signals model failure.
 
 ---
 
@@ -360,17 +411,23 @@ A LangGraph state machine with 5 specialized nodes, conditional routing, and per
 ### 5.2 Nodes
 
 **Scan Node:**
-- Pulls from Google News RSS (per team keywords), Reddit r/soccer (new posts), official FIFA/confederation announcements
+- Pulls from BBC Sport RSS, sports news feeds (per team keywords), Reddit r/soccer (new posts), official FIFA/confederation announcements
 - Uses tool-calling to search for each of the 48 teams
 - Output: list of raw news items with source, timestamp, content snippet
 
 **Assess Node:**
-- Classifies each finding via Claude API (structured output):
+- Classifies each finding via Qwen 9B (structured JSON output):
   - Player importance tier (1-3 based on FM25 rating for that national team)
   - Confidence level (confirmed / likely / rumor)
   - Category (injury / suspension / retirement / tactical change / squad selection)
   - Severity (out for tournament / doubt / minor / non-issue)
 - Only passes forward items that are: tier 1-2 player AND confirmed/likely AND severity >= doubt
+
+**False positive mitigation (critical for Qwen 9B reliability):**
+- Confidence threshold: only act on items classified as "confirmed" by the LLM. "Likely" items are logged but require corroboration from a second source within 12h before triggering action.
+- Cooling period: same player cannot be re-assessed within 12h unless a new distinct source appears (prevents flip-flopping on ambiguous cases like "rested from training")
+- Impact threshold: only trigger simulation re-run if the affected player is in the expected starting XI AND their removal shifts cohesion/tactical features by >0.5 standard deviations
+- Post-tournament quality metric: track agent false positive rate (acted on → turned out wrong) to calibrate confidence thresholds for future tournaments
 
 **Cross-Reference Node:**
 - Checks against agent's persistent state (DuckDB table: `agent_player_statuses`)
@@ -405,11 +462,10 @@ Persistent state in DuckDB:
 ### 5.5 Tech Stack
 
 - **LangGraph** — agent orchestration, state machine, conditional routing
-- **Claude API (Haiku)** — Assess and Reflect nodes (cheap, fast classification)
-- **Claude API (Sonnet)** — Cross-Reference node when ambiguity is high
+- **Ollama + Qwen 9B** — local LLM for all agent reasoning (Assess, Cross-Reference, Reflect nodes). Structured JSON output via Ollama's JSON mode. Zero API cost, no rate limits, works offline.
 - **APScheduler** — scheduling triggers
 - **DuckDB** — agent state persistence
-- **Google News RSS + Reddit API** — data sources
+- **BBC Sport RSS + sports news feeds + Reddit API** — data sources
 
 ---
 
@@ -421,21 +477,19 @@ Persistent state in DuckDB:
 - Trophy probability leaderboard (bar chart, sortable table)
 - Group-by-group advancement probabilities (heatmap: team x finish position)
 - Bracket visualization showing most likely paths to the final
-- Key metrics: model RPS on backtests, last simulation timestamp, data freshness
+- Key metrics: model RPS on backtests (with ±SE confidence interval), last simulation timestamp, data freshness
 
 **Page 2: Team Deep Dive**
 - Team selector dropdown
 - Elo trajectory over time (line chart)
-- Feature radar chart: core strength, form, cohesion, fatigue, sentiment, tactical edge
+- Feature radar chart: core strength, form, cohesion, fatigue, xG overperformance, PPDA
 - Contextual adjustments explained: "Base probability: X% → After adjustments: Y% (manager pedigree +0.8%, fatigue -0.3%, ...)"
 - Stage-reaching probability waterfall
-- Key players and their FM25 contribution ratings
 
 **Page 3: Match Predictor**
 - Select two teams
 - H/D/A probability bars
 - Score distribution heatmap (0-0 through 5-5)
-- Tactical matchup analysis: "This is a [style clash type], historically favoring [team] by +X%"
 - Key factors driving the prediction (SHAP-style feature importance for this specific match)
 - Comparison with Polymarket odds (if available)
 
@@ -445,18 +499,12 @@ Persistent state in DuckDB:
 - Historical edge accuracy: "In backtesting, flagged edges hit at X% rate"
 - Filter by: tournament stage, edge direction
 
-**Page 5: What-If Simulator**
-- Toggle player availability (injury/fit)
-- Adjust formation archetype
-- See real-time impact on trophy probabilities across all 48 teams
-- "Impact chain" visualization: player out → feature changes → probability shifts
-
-**Page 6: Upset Watch**
+**Page 5: Upset Watch**
 - Matches where underdog probability is unusually high relative to Elo gap
 - Historical comps: "similar Elo gaps in past WCs produced upsets X% of the time"
-- Risk factors: style clash, team volatility, fatigue asymmetry
+- Risk factors: PPDA mismatch, team volatility, fatigue asymmetry
 
-**Page 7: Agent Activity**
+**Page 6: Agent Activity**
 - Live feed of LangGraph agent cycles
 - Decision trace: scanned → assessed → acted → prediction shifted
 - Node-by-node reasoning transparency (collapsible detail)
@@ -469,8 +517,6 @@ Persistent state in DuckDB:
 DuckDB (source of truth)
     ↓
 Streamlit reads on page load (cached with TTL)
-    ↓
-User interactions (What-If) trigger lightweight re-simulation
     ↓
 Agent writes to DuckDB → Streamlit picks up changes on next refresh
 ```
@@ -504,11 +550,12 @@ Protocol: Train on all international matches before each test tournament. Featur
 ### 7.3 Benchmark Comparisons
 
 For each test tournament, compare ensemble against:
-1. MLE Dixon-Coles alone
+1. **Minimum viable model (MVM):** MLE Dixon-Coles + Elo + market odds + logistic calibration. Built and measured FIRST — this is the baseline everything else must beat. Expected ~0.205-0.215 RPS.
 2. Elo-only logistic regression (simplest baseline)
 3. Uniform prior (33/33/33) — sanity floor
-4. Market odds (2018+ from Football-Data.co.uk) — ceiling to beat
-5. Core ensemble without contextual layer — measures contextual layer's marginal value
+4. Market odds alone (2018+ from Football-Data.co.uk) — ceiling to beat
+5. Full ensemble without contextual layer — measures contextual layer's marginal value
+6. Edge pipeline (market-blind) vs. calibration pipeline — measures market information value
 
 ### 7.4 Ablation Study
 
@@ -519,29 +566,69 @@ For each test tournament, compare ensemble against:
 - Feature tiers: Tier 1 only → +Tier 2 → +Tier 3 → +Contextual → incremental RPS
 - Contextual layer ablation: each feature group toggled independently
 
-### 7.5 Contextual Feature Backtesting Coverage
+### 7.5 Complexity Kill Criteria
+
+Every component beyond the minimum viable model must justify its existence with measurable improvement. No component ships enabled without meeting its threshold.
+
+| Component | Kill criterion | Action if failed |
+|-----------|---------------|-----------------|
+| Contextual layer (entire) | Must improve mean RPS by >0.005 in leave-one-tournament-out CV | Ship disabled. Contextual features still computed and logged for post-tournament analysis, but not applied to predictions |
+| Any individual feature | Must improve RPS by >0.002 when toggled on (all other features held constant) | Remove from feature set. Autotuner will not re-enable |
+| Isotonic meta-learner (vs. logistic) | Must beat logistic regression by >0.003 RPS on held-out data | Keep logistic as default |
+| Bayesian model (vs. MLE-only ensemble) | Must improve RPS by >0.003 vs. ensemble without it | Drop Bayesian model, run 2-model ensemble |
+| Autotuner config acceptance | Must beat current best by >0.003 mean RPS AND improve on ≥3/4 individual tournament backtests | Reject config, keep current best |
+
+**Minimum viable model (baseline to beat):** MLE Dixon-Coles + Elo + market odds + logistic calibration. This is built and measured FIRST. All subsequent components are evaluated as incremental improvements over this baseline. Expected baseline RPS: ~0.205-0.215.
+
+### 7.6 Feature Backtesting Tiers
+
+Features are divided into two tiers based on historical data availability:
+
+**Tier A — Fully backtestable (autotuner operates on these):**
 
 | Feature Group | 2010 WC | 2014 WC | 2018 WC | 2022 WC | Euros 2016-24 |
 |---------------|---------|---------|---------|---------|---------------|
-| Tactical matchups | EA FC only | EA FC only | EA FC + FBref | EA FC + FBref | EA FC + FBref (2020+) |
-| Squad cohesion | Full | Full | Full | Full | Full |
+| Elo, form, H2H, market odds | Full | Full | Full | Full | Full |
+| Squad value (Transfermarkt) | Full | Full | Full | Full | Full |
+| xG + xG overperformance (FBref) | No | No | Full | Full | Full (2018+) |
+| PPDA difference (FBref) | No | No | Full | Full | Full (2018+) |
+| Club cluster index | Full | Full | Full | Full | Full |
+| Median squad age | Full | Full | Full | Full | Full |
 | Manager pedigree | Full | Full | Full | Full | Full |
-| Fatigue/schedule | Full | Full | Full | Full | Full |
-| Sentiment (Reddit) | No | No | Full | Full | No |
-| Sentiment (betting lines) | Full | Full | Full | Full | Full |
-| Sentiment (expert rankings) | Partial | Partial | Full | Full | Full |
-| FM25-exclusive mentals | No | No | Proxy (FM25 data) | Proxy (FM25 data) | No |
+| Fatigue (rest days, travel, season load) | Full | Full | Full | Full | Full |
+| Draw pressure indicators | Full | Full | Full | Full | Full |
 
-The contextual adjuster is trained only on tournaments where all its input features are available (2018+). For pre-2018 backtesting, the contextual layer passes through base predictions unchanged.
+**Tier B — Forward-test only (bounded influence, validated during 2026 WC):**
+
+| Feature | Why not backtestable | Mitigation |
+|---------|---------------------|-----------|
+| Reddit sentiment (additive) | Pushshift shut down 2023. Historical threads not recoverable | Runs alongside xG overperformance (which IS backtestable and permanent). Reddit adds incremental signal; if it adds noise, the model learns to zero its weight |
+| News headline sentiment | BBC Sport RSS is current-only. Historical reconstruction impractical | No proxy. Forward-test only. Bounded by ±3pp cap |
+
+### 7.7 Backtesting Strategy
+
+**Core model (Tier A features):** Full leave-one-tournament-out backtesting on 2010-2022. The autotuner optimizes hyperparameters and feature selection using only Tier A features. This is where RPS < 0.21 is targeted.
+
+**Contextual adjuster:** Trained on Tier A contextual features (xG overperformance, PPDA difference, club cluster, median age, manager pedigree, fatigue, draw pressure) using 2018+2022 data. These are all fully backtestable.
+
+**Tier B features (live only, additive):** During 2026, Reddit sentiment and news sentiment are added as EXTRA features alongside the permanent xG overperformance. The contextual adjuster already learned the structure from Tier A alone; Tier B features provide incremental signal. If they're pure noise, the model's learned Tier A weights still carry the load.
+
+**Bounded adjustment magnitude:** To prevent untested Tier B features from blowing up predictions, the contextual adjuster has a hard constraint: no single contextual feature can shift any probability by more than ±3 percentage points. This means even if Tier B features are pure noise, maximum damage is bounded.
+
+**Post-tournament validation:** After the 2026 WC completes (~64 matches), run ablation:
+- Full system (Tier A + Tier B) vs. Tier A only → did Tier B help?
+- Full system vs. proxy-only version → did real signals beat their proxies?
+- Per-feature attribution: which Tier B features had positive vs. negative contribution?
+
+This is the real validation of the contextual layer. Pre-tournament, we trust the architecture based on proxy backtesting. Post-tournament, we measure whether the real signals delivered.
 
 **Player attribute data strategy:**
-- **EA FC / FIFA (Kaggle):** Primary attribute source for backtesting. FIFA 18 data for 2018 WC, FIFA 22 for 2022 WC, etc. Covers technical, physical, and basic mental attributes with consistent schema across all editions.
-- **FM25:** Supplements EA FC for 2026 live predictions with tournament-pressure attributes (ImportantMatches, Pressure, Consistency, Teamwork, Leadership, Dirtiness, Temperament). These have no EA FC equivalent.
-- **FM25 as backtest proxy:** For 2018/2022 backtesting of FM-exclusive attributes, FM25 ratings are used as a proxy. Rationale: personality attributes (Pressure, Consistency, ImportantMatches) are stable across FM editions for established international players — a player rated 18/20 for ImportantMatches in FM25 was likely similar in the 2022 era. This is imperfect but acceptable for these slow-changing attributes.
+- **EA FC / FIFA (Kaggle):** Not used directly as model features (aggregating player attributes into team-level features proved too abstract). Used only for player importance tiering in the LangGraph agent (which player's injury matters most).
+- **FM25:** Same as EA FC — used for agent player importance classification only, not as model features. The tournament-pressure mental attributes (ImportantMatches, Pressure) inform the agent's severity assessment, not the prediction model.
 
-### 7.6 Backtest Report
+### 7.8 Backtest Report
 
-Jupyter notebook `04_backtest_report.ipynb`: per-tournament metrics, calibration plots, edge analysis, surprise analysis, contextual layer attribution.
+Jupyter notebook `04_backtest_report.ipynb`: per-tournament metrics, calibration plots, edge analysis, surprise analysis, contextual layer attribution, proxy vs. real feature comparison (post-tournament).
 
 ---
 
@@ -549,18 +636,37 @@ Jupyter notebook `04_backtest_report.ipynb`: per-tournament metrics, calibration
 
 Inspired by Karpathy's autoresearch: an autonomous experiment loop that systematically explores the model's configuration space to minimize RPS.
 
-### 8.1 Core Loop
+### 8.1 Two-Phase Loop
 
+**Phase 1 — Structural search (LLM-guided, ~10-15 experiments):**
+
+The LLM proposes qualitatively different modeling decisions that Optuna can't search because they're not in a continuous space:
+- Feature inclusion/exclusion decisions ("try removing market odds from GBM")
+- Training data scope ("try weighting friendlies at 0.0 instead of 0.2")
+- Architecture choices ("try 2-model ensemble without GBM", "try stacking the contextual layer differently")
+- Meta-learner selection ("try weighted average instead of logistic")
+- Novel feature constructions ("try Elo velocity instead of raw Elo")
+
+Each structural experiment runs a full backtest. Results inform the *design* of the system. The LLM receives all prior results and proposes the next structural experiment based on patterns.
+
+**Phase 2 — Numeric tuning (Optuna TPE only, 100-150 trials):**
+
+Once the winning structure is locked from Phase 1, Optuna TPE optimizes numeric hyperparameters within the fixed architecture. No LLM in this loop — TPE handles 30-parameter numeric spaces efficiently.
+
+**Acceptance gate (both phases):**
 ```
-for each experiment in budget:
-    1. Sample a configuration change from the search space
-    2. Run full backtest pipeline (fit models → simulate tournaments → compute RPS)
-    3. If RPS improved: accept change, update best config
-    4. If RPS worsened: revert change
-    5. Log result to leaderboard
+for each experiment:
+    1. Run full backtest pipeline (fit → simulate → compute RPS per tournament)
+    2. Compare against current best:
+       - Must improve mean RPS by >0.003
+       - Must improve on ≥3/4 individual tournament backtests
+       - If both conditions met: accept, update best config
+       - If marginal (<0.003 either direction): log as inconclusive, keep current
+       - If clearly worse (>0.003 degradation): reject
+    3. Top-5 configs re-evaluated 3x with different MCMC seeds to separate real gains from sampling noise
 ```
 
-Each iteration takes ~2-3 minutes. A 2-hour budget yields ~40-60 experiments; overnight (8h) yields ~160-240.
+Each iteration takes ~2-3 minutes. Phase 1 budget: ~30-45 minutes. Phase 2 budget: 2-8 hours (100-150 trials).
 
 ### 8.2 Search Space
 
@@ -592,11 +698,12 @@ Defined in `configs/autotuner_search_space.yaml`:
 **Contextual adjuster:**
 - `context_num_leaves`: [7, 31]
 - `context_n_estimators`: [50, 200]
-- `toggle_tactical`: on/off
-- `toggle_cohesion`: on/off
+- `toggle_ppda`: on/off
+- `toggle_cohesion`: on/off (club cluster + median age)
 - `toggle_manager`: on/off
 - `toggle_fatigue`: on/off
-- `toggle_sentiment`: on/off
+- `toggle_xg_overperformance`: on/off
+- `toggle_draw_pressure`: on/off
 - `enable_contextual_layer`: on/off (entire layer)
 
 **Ensemble:**
@@ -605,10 +712,17 @@ Defined in `configs/autotuner_search_space.yaml`:
 
 ### 8.3 Search Strategy
 
-Sequential model-based optimization (SMBO) via Optuna:
-- Tree-structured Parzen Estimator (TPE) for continuous/integer hyperparameters
-- Random sampling for categorical choices
-- Pruning: if early tournament backtests are significantly worse than baseline, skip remaining
+**Phase 1 — LLM as researcher, not optimizer:**
+
+Qwen 9B (via Ollama) receives the current system architecture, prior experiment results, and proposes the next *structural* experiment. The key insight from Karpathy's autoresearch: the LLM replaces the researcher (proposing qualitatively different directions), NOT the optimizer (sampling numbers from ranges). Structured JSON output specifies what to change and a hypothesis for why it should help.
+
+The LLM is valuable here because structural decisions have unbounded search space — there's no YAML that enumerates "all possible feature engineering ideas." But the LLM should NOT be asked to guess that `num_leaves=23` is better than `num_leaves=31` — that's noise at this sample size, and TPE handles it better.
+
+**Phase 2 — Optuna TPE (numeric optimization):**
+
+Standard TPE with the search space from Section 8.2. Early pruning: if first 2 tournament backtests (2010, 2014) are >0.01 RPS worse than baseline, skip remaining tournaments.
+
+**Repeated evaluation for top configs:** Final top-5 configs from Phase 2 are each re-run 3 times with different MCMC random seeds (Bayesian model) and different GBM random states. Only configs whose improvement survives across seeds are accepted — this separates real signal from MCMC sampling noise.
 
 ### 8.4 CLI
 
@@ -700,11 +814,12 @@ src/polymbappe/
 ├── context/                        # Contextual adjustment layer
 │   ├── __init__.py
 │   ├── adjuster.py                 # LightGBM residual model
-│   ├── tactical.py                 # TacticalMatchupBuilder
-│   ├── cohesion.py                 # Squad cohesion features
+│   ├── ppda.py                     # PPDA difference feature
+│   ├── cohesion.py                 # Club cluster + median age
 │   ├── manager.py                  # Manager pedigree features
-│   ├── fatigue.py                  # Fatigue/schedule features
-│   └── sentiment.py                # Multi-source sentiment aggregator
+│   ├── fatigue.py                  # Rest days, travel, season load
+│   ├── draw_pressure.py            # Draw incentive features
+│   └── sentiment.py                # xG overperformance + Reddit + news
 ├── models/                         # Prediction models
 │   ├── __init__.py
 │   ├── base.py                     # Abstract base model
@@ -740,7 +855,6 @@ src/polymbappe/
     │   ├── team_deep_dive.py
     │   ├── match_predictor.py
     │   ├── market_edges.py
-    │   ├── what_if.py
     │   ├── upset_watch.py
     │   └── agent_activity.py
     └── components/                 # Shared chart/UI components
@@ -789,7 +903,7 @@ dependencies = [
 
 [project.optional-dependencies]
 modeling = ["pymc>=5.17", "lightgbm>=4.5", "scikit-learn>=1.4", "optuna>=3.6", "shap>=0.45"]
-context = ["langgraph>=0.2", "langchain-anthropic>=0.3", "apscheduler>=3.10", "praw>=7.7", "pytrends>=4.9", "vaderSentiment>=3.3"]
+context = ["langgraph>=0.2", "langchain-community>=0.3", "apscheduler>=3.10", "praw>=7.7", "vaderSentiment>=3.3", "ollama>=0.4"]
 dashboard = ["streamlit>=1.38", "plotly>=5.22"]
 dev = ["pytest>=8.0", "ruff>=0.3"]
 ```
@@ -816,7 +930,7 @@ dev = ["pytest>=8.0", "ruff>=0.3"]
 | Brechot & Flepp (2020) | Manager dismissal and performance — evidence manager identity matters |
 | Brown et al. (2018) | Altitude effects on football performance |
 | Alan Turing Institute WorldCupPrediction | Bayesian Dixon-Coles via numpyro, 6th in 2022 Futbolmetrix contest |
-| FiveThirtyEight SPI | Offensive/defensive ratings + Monte Carlo simulation methodology |
+| FiveThirtyEight SPI (archived) | Offensive/defensive ratings + Monte Carlo simulation methodology (site shut down 2024, methodology documented) |
 
 ---
 
@@ -831,10 +945,10 @@ dev = ["pytest>=8.0", "ruff>=0.3"]
 | Gradient boosting | LightGBM 4.5+ |
 | Optimization | SciPy (MLE), Optuna (autotuner) |
 | Agent orchestration | LangGraph |
-| LLM reasoning | Claude API (Haiku + Sonnet) |
+| LLM reasoning | Ollama + Qwen 9B (local, zero cost) |
 | Scheduling | APScheduler |
-| Sentiment NLP | VADER + Claude Haiku |
-| Data ingestion | BeautifulSoup, soccerdata, PRAW, pytrends |
+| Sentiment NLP | VADER + Qwen 9B (local) |
+| Data ingestion | BeautifulSoup, soccerdata, PRAW |
 | Dashboard | Streamlit + Plotly |
 | CLI | Click |
 | Testing | pytest |
