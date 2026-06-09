@@ -23,3 +23,11 @@ class Settings(BaseSettings):
     @property
     def processed_data_dir(self) -> Path:
         return self.data_dir / "processed"
+
+    @property
+    def outputs_data_dir(self) -> Path:
+        return self.data_dir / "outputs"
+
+    @property
+    def configs_dir(self) -> Path:
+        return Path("configs")
