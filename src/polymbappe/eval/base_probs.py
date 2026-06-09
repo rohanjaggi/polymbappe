@@ -83,6 +83,7 @@ def compute_tournament_base_probs(
     tournament: str,
     config: BaseProbConfig | None = None,
     market_odds: pl.DataFrame | None = None,
+    dc_model: DixonColesModel | None = None,
 ) -> pl.DataFrame:
     """Base H/D/A probabilities for every fixture in one tournament.
 
@@ -92,6 +93,7 @@ def compute_tournament_base_probs(
         tournament: Tournament name (carried through for grouping).
         config: Base-probability configuration.
         market_odds: Optional ``market_odds`` table; ``mkt_*`` columns added when present.
+        dc_model: Optional pre-existing model instance for warm-starting.
 
     Returns:
         One row per fixture with ``match_id``, ``tournament``, ``label``, ``dc_*``,
@@ -102,9 +104,8 @@ def compute_tournament_base_probs(
     reference_date = fixtures["date"].min()
     assert isinstance(reference_date, date)
 
-    model = DixonColesModel(config.dixon_coles).fit(
-        matches=matches_to_observations(history, reference_date)
-    )
+    model = dc_model or DixonColesModel(config.dixon_coles)
+    model.fit(matches=matches_to_observations(history, reference_date))
 
     timeline = pl.concat([history, fixtures], how="vertical").unique(
         subset=["match_id"], keep="first"

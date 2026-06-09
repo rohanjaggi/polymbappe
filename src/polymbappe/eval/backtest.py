@@ -17,6 +17,7 @@ import structlog
 
 from polymbappe.eval.base_probs import BaseProbConfig, compute_tournament_base_probs
 from polymbappe.eval.metrics import multiclass_log_loss, ranked_probability_score
+from polymbappe.models.dixon_coles import DixonColesConfig, DixonColesModel
 from polymbappe.models.meta import OUTCOMES, MetaConfig, MetaLearner
 
 logger = structlog.get_logger(__name__)
@@ -118,8 +119,11 @@ def run_leave_one_tournament_out(
 
     base_config = base_config or BaseProbConfig()
 
+    dc_model = DixonColesModel(base_config.dixon_coles)
+    sorted_tournaments = sorted(tournaments, key=lambda t: t.start)
+
     per_tournament_probs: dict[str, pl.DataFrame] = {}
-    for tournament in tournaments:
+    for tournament in sorted_tournaments:
         fixtures = select_fixtures(matches, tournament)
         if fixtures.is_empty():
             continue
@@ -133,6 +137,7 @@ def run_leave_one_tournament_out(
             tournament=tournament.name,
             config=base_config,
             market_odds=market_odds,
+            dc_model=dc_model,
         )
 
     if len(per_tournament_probs) < 2:

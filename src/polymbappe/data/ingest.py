@@ -38,7 +38,7 @@ def ingest_results(
     settings = settings or Settings()
     local = settings.raw_data_dir / "results.csv"
     if local.exists():
-        raw = pl.read_csv(io.BytesIO(local.read_bytes()))
+        raw = pl.read_csv(io.BytesIO(local.read_bytes()), null_values=["NA"])
         logger.info("ingest.results.local", path=str(local), rows=raw.height)
     else:
         raw = sources.fetch_results_csv(url or sources.KAGGLE_RESULTS_RAW_URL)

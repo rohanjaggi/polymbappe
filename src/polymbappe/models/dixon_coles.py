@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from math import exp, log
+from math import exp
 from typing import cast
 
 import numpy as np
@@ -33,6 +33,8 @@ class DixonColesConfig:
     xi: float = 0.0019
     friendly_weight: float = 0.3
     max_goals: int = 10
+    maxiter: int = 5000
+    max_history_days: int = 4000
 
 
 _COMPETITIVE_KEYWORDS = {
@@ -75,6 +77,39 @@ class DixonColesModel(MatchModel):
         self.home_advantage: float = 0.0
         self.rho: float = 0.0
 
+    @staticmethod
+    def _build_initial_params(
+        teams: list[str],
+        n_teams: int,
+        prev_attack: np.ndarray | None,
+        prev_defense: np.ndarray | None,
+        prev_team_to_index: dict[str, int],
+        prev_home_advantage: float,
+        prev_rho: float,
+    ) -> np.ndarray:
+        """Build initial parameter vector, warm-starting from previous fit if available."""
+        if prev_attack is None or prev_defense is None:
+            return np.zeros((2 * (n_teams - 1)) + 2, dtype=float)
+
+        initial = np.zeros((2 * (n_teams - 1)) + 2, dtype=float)
+
+        attack_free = np.zeros(n_teams - 1)
+        defense_free = np.zeros(n_teams - 1)
+        for i, team in enumerate(teams[:-1]):
+            if team in prev_team_to_index:
+                old_idx = prev_team_to_index[team]
+                attack_free[i] = prev_attack[old_idx]
+                defense_free[i] = prev_defense[old_idx]
+
+        attack_free -= attack_free.mean()
+        defense_free -= defense_free.mean()
+
+        initial[: n_teams - 1] = attack_free
+        initial[n_teams - 1 : 2 * (n_teams - 1)] = defense_free
+        initial[-2] = prev_home_advantage
+        initial[-1] = prev_rho
+        return initial
+
     def fit(self, *args: object, **kwargs: object) -> DixonColesModel:
         """Fit model parameters by minimizing weighted negative log-likelihood."""
 
@@ -88,10 +123,38 @@ class DixonColesModel(MatchModel):
         if not matches:
             raise ValueError("At least one match is required to fit the model.")
 
+        if self.config.max_history_days > 0:
+            matches = [m for m in matches if m.days_ago <= self.config.max_history_days]
+
         teams = sorted({m.home_team for m in matches} | {m.away_team for m in matches})
+        n_teams = len(teams)
+        prev_attack = self.attack
+        prev_defense = self.defense
+        prev_team_to_index = self.team_to_index
         self.team_to_index = {team: idx for idx, team in enumerate(teams)}
         self.index_to_team = teams
-        n_teams = len(teams)
+        n_matches = len(matches)
+
+        # Pre-compute match arrays (done once, outside the optimizer loop).
+        home_idx = np.array([self.team_to_index[m.home_team] for m in matches], dtype=np.intp)
+        away_idx = np.array([self.team_to_index[m.away_team] for m in matches], dtype=np.intp)
+        home_goals = np.array([m.home_goals for m in matches], dtype=np.int32)
+        away_goals = np.array([m.away_goals for m in matches], dtype=np.int32)
+        neutral = np.array([m.neutral_site for m in matches], dtype=bool)
+
+        # Weights: time decay * competition weight
+        days_ago = np.array([m.days_ago for m in matches], dtype=np.float64)
+        comp_weight = np.array(
+            [1.0 if _is_competitive(m.competition) else self.config.friendly_weight for m in matches],
+            dtype=np.float64,
+        )
+        weights = np.exp(-self.config.xi * days_ago) * comp_weight
+
+        # Tau correction masks (only applies when both goals <= 1).
+        m00 = (home_goals == 0) & (away_goals == 0)
+        m01 = (home_goals == 0) & (away_goals == 1)
+        m10 = (home_goals == 1) & (away_goals == 0)
+        m11 = (home_goals == 1) & (away_goals == 1)
 
         def unpack(params: np.ndarray) -> tuple[np.ndarray, np.ndarray, float, float]:
             attack_free = params[: n_teams - 1]
@@ -102,36 +165,100 @@ class DixonColesModel(MatchModel):
             defense = np.concatenate([defense_free, np.array([-defense_free.sum()])])
             return attack, defense, home_advantage, rho
 
-        def objective(params: np.ndarray) -> float:
+        def objective_and_grad(params: np.ndarray) -> tuple[float, np.ndarray]:
             attack, defense, home_advantage, rho = unpack(params)
-            neg_log_likelihood = 0.0
-            for match in matches:
-                home_idx = self.team_to_index[match.home_team]
-                away_idx = self.team_to_index[match.away_team]
 
-                home_term = 0.0 if match.neutral_site else home_advantage
-                lam = exp(home_term + attack[home_idx] + defense[away_idx])
-                mu = exp(attack[away_idx] + defense[home_idx])
+            home_term = np.where(neutral, 0.0, home_advantage)
+            lam = np.exp(home_term + attack[home_idx] + defense[away_idx])
+            mu = np.exp(attack[away_idx] + defense[home_idx])
 
-                tau = max(tau_correction(match.home_goals, match.away_goals, lam, mu, rho), 1e-12)
-                base = poisson.pmf(match.home_goals, lam) * poisson.pmf(match.away_goals, mu)
-                likelihood = max(base * tau, 1e-300)
+            log_lik = poisson.logpmf(home_goals, lam) + poisson.logpmf(away_goals, mu)
 
-                decay = exp(-self.config.xi * match.days_ago)
-                match_weight = (
-                    1.0 if _is_competitive(match.competition) else self.config.friendly_weight
-                )
-                neg_log_likelihood -= decay * match_weight * log(likelihood)
+            log_tau = np.zeros(n_matches, dtype=np.float64)
+            tau_val = np.ones(n_matches, dtype=np.float64)
+            tau_val[m00] = np.maximum(1.0 - lam[m00] * mu[m00] * rho, 1e-12)
+            tau_val[m01] = np.maximum(1.0 + lam[m01] * rho, 1e-12)
+            tau_val[m10] = np.maximum(1.0 + mu[m10] * rho, 1e-12)
+            tau_val[m11] = np.maximum(1.0 - rho, 1e-12)
+            log_tau[m00] = np.log(tau_val[m00])
+            log_tau[m01] = np.log(tau_val[m01])
+            log_tau[m10] = np.log(tau_val[m10])
+            log_tau[m11] = np.log(tau_val[m11])
 
-            return neg_log_likelihood
+            nll = -float(np.sum(weights * (log_lik + log_tau)))
 
-        initial = np.zeros((2 * (n_teams - 1)) + 2, dtype=float)
+            # Gradient of Poisson NLL: d(-log P(k|λ))/dλ = 1 - k/λ, times dλ/dparam.
+            # For home goals ~ Poisson(lam): d_nll/d_lam_i = (lam_i - home_goals_i)
+            # For away goals ~ Poisson(mu):  d_nll/d_mu_i  = (mu_i  - away_goals_i)
+            # (these are per-match residuals, pre-multiplied by weights below)
+            dlam = weights * (lam - home_goals)
+            dmu = weights * (mu - away_goals)
+
+            # Tau correction gradients (d(-log tau)/d_param)
+            dtau_dlam = np.zeros(n_matches)
+            dtau_dmu = np.zeros(n_matches)
+            dtau_drho = np.zeros(n_matches)
+            # m00: tau = 1 - lam*mu*rho => d(-log tau)/dlam = mu*rho/tau
+            dtau_dlam[m00] = weights[m00] * mu[m00] * rho / tau_val[m00]
+            dtau_dmu[m00] = weights[m00] * lam[m00] * rho / tau_val[m00]
+            dtau_drho[m00] = weights[m00] * lam[m00] * mu[m00] / tau_val[m00]
+            # m01: tau = 1 + lam*rho => d(-log tau)/dlam = -rho/tau
+            dtau_dlam[m01] = -weights[m01] * rho / tau_val[m01]
+            dtau_drho[m01] = -weights[m01] * lam[m01] / tau_val[m01]
+            # m10: tau = 1 + mu*rho => d(-log tau)/dmu = -rho/tau
+            dtau_dmu[m10] = -weights[m10] * rho / tau_val[m10]
+            dtau_drho[m10] = -weights[m10] * mu[m10] / tau_val[m10]
+            # m11: tau = 1 - rho => d(-log tau)/drho = 1/tau
+            dtau_drho[m11] = weights[m11] / tau_val[m11]
+
+            # Total per-match derivatives w.r.t. lam and mu (chain rule: dlam/dparam = lam * dparam)
+            d_lam_total = dlam + dtau_dlam * lam
+            d_mu_total = dmu + dtau_dmu * mu
+
+            # Accumulate into parameter gradient
+            grad = np.zeros(len(params))
+
+            # Attack parameters: lam depends on attack[home], mu depends on attack[away]
+            grad_attack = np.zeros(n_teams)
+            np.add.at(grad_attack, home_idx, d_lam_total)
+            np.add.at(grad_attack, away_idx, d_mu_total)
+            # Sum-to-zero constraint: free params are attack[0..n-2], attack[n-1] = -sum(free)
+            grad[: n_teams - 1] = grad_attack[:-1] - grad_attack[-1]
+
+            # Defense parameters: lam depends on defense[away], mu depends on defense[home]
+            grad_defense = np.zeros(n_teams)
+            np.add.at(grad_defense, away_idx, d_lam_total)
+            np.add.at(grad_defense, home_idx, d_mu_total)
+            grad[n_teams - 1 : 2 * (n_teams - 1)] = grad_defense[:-1] - grad_defense[-1]
+
+            # Home advantage: lam depends on it (non-neutral only)
+            grad[-2] = float(np.sum(d_lam_total * (~neutral)))
+
+            # Rho
+            grad[-1] = float(np.sum(dtau_drho))
+
+            return nll, grad
+
+        initial = self._build_initial_params(
+            teams, n_teams, prev_attack, prev_defense,
+            prev_team_to_index, self.home_advantage, self.rho,
+        )
         bounds: list[tuple[float | None, float | None]] = [(None, None)] * len(initial)
         bounds[-1] = (-0.25, 0.25)
-        result = minimize(objective, initial, method="L-BFGS-B", bounds=bounds)
+        result = minimize(
+            objective_and_grad,
+            initial,
+            method="L-BFGS-B",
+            jac=True,
+            bounds=bounds,
+            options={"maxiter": self.config.maxiter},
+        )
 
-        if not result.success:
-            raise RuntimeError(f"Dixon-Coles optimization failed: {result.message}")
+        if not result.success and "CONVERGENCE" not in result.message:
+            import structlog
+            structlog.get_logger(__name__).warning(
+                "dixon_coles.partial_convergence", message=result.message, nit=result.nit
+            )
 
         attack, defense, home_advantage, rho = unpack(result.x)
         self.attack = attack

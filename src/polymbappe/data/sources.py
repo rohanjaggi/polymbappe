@@ -36,7 +36,7 @@ def fetch_eloratings_html(url: str, timeout: float = 20.0) -> BeautifulSoup:
 def load_kaggle_results_csv(csv_bytes: bytes) -> pl.DataFrame:
     """Load Kaggle international results CSV bytes into a Polars DataFrame."""
 
-    return pl.read_csv(io.BytesIO(csv_bytes))
+    return pl.read_csv(io.BytesIO(csv_bytes), null_values=["NA"])
 
 
 def fetch_results_csv(url: str = KAGGLE_RESULTS_RAW_URL, timeout: float = 60.0) -> pl.DataFrame:
