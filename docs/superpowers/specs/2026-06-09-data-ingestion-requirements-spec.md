@@ -61,11 +61,11 @@ It also captures cross-cutting requirements that must be implemented before inte
 - **Packages:** `requests` for read-only market-implied probability ingestion. `py-clob-client` only if order placement is needed.
 - **Auth:** None for public read endpoints (Gamma + CLOB market data).
 - **Rate limits (read-only):**
-  - CLOB market-data (`/book`, `/price`, `/midprice`): **1,500 requests / 10 seconds**
+  - CLOB market data (`/book`, `/price`, `/midprice`): **1,500 requests / 10 seconds**
   - Gamma `/markets`: **300 requests / 10 seconds**
   - Gamma `/events`: **500 requests / 10 seconds**
   - Limits are Cloudflare-enforced and over-limit traffic is delayed/queued.
-  - CLOB responses include rate-limit headers; use them for adaptive pacing.
+  - CLOB responses include rate limit headers; use them for adaptive pacing.
 - **Format:** JSON.
 - **Primary gotcha:** Discover markets in Gamma, then query CLOB prices using **token ID** (`clobTokenIds`), not condition ID.
 
