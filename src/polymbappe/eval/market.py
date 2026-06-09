@@ -86,6 +86,71 @@ def compute_edges(
     return pl.DataFrame(rows, schema=schema).sort(pl.col("edge").abs(), descending=True)
 
 
+def compute_credible_edges(
+    model_probs: pl.DataFrame,
+    market_probs: pl.DataFrame,
+    *,
+    threshold: float = 0.05,
+    model_cols: tuple[str, str, str] = ("model_home", "model_draw", "model_away"),
+    low_cols: tuple[str, str, str] = ("ci_home_low", "ci_draw_low", "ci_away_low"),
+    high_cols: tuple[str, str, str] = ("ci_home_high", "ci_draw_high", "ci_away_high"),
+    market_cols: tuple[str, str, str] = ("home_win_prob", "draw_prob", "away_win_prob"),
+    id_col: str = "match_id",
+) -> pl.DataFrame:
+    """Flag market-blind edges that also clear the Bayesian credible-interval test.
+
+    A genuine edge (spec 3.6) requires both: the edge-pipeline model and the market
+    diverge by more than ``threshold`` *and* the model's credible interval for that
+    outcome does not contain the market's implied probability. ``model_probs`` must carry
+    the edge-pipeline point probabilities plus per-outcome credible-interval bounds.
+
+    Returns one row per qualifying (match, outcome) edge sorted by absolute edge.
+    """
+
+    joined = model_probs.join(market_probs, on=id_col, how="inner")
+    rows: list[dict[str, object]] = []
+    for record in joined.iter_rows(named=True):
+        for outcome, m_col, lo_col, hi_col, k_col in zip(
+            OUTCOMES, model_cols, low_cols, high_cols, market_cols, strict=True
+        ):
+            model_p = record.get(m_col)
+            market_p = record.get(k_col)
+            lo = record.get(lo_col)
+            hi = record.get(hi_col)
+            if model_p is None or market_p is None or lo is None or hi is None:
+                continue
+            edge = float(model_p) - float(market_p)
+            ci_excludes_market = not (float(lo) <= float(market_p) <= float(hi))
+            if abs(edge) <= threshold or not ci_excludes_market:
+                continue
+            rows.append(
+                {
+                    "match_id": record[id_col],
+                    "outcome": outcome,
+                    "model_prob": float(model_p),
+                    "market_prob": float(market_p),
+                    "ci_low": float(lo),
+                    "ci_high": float(hi),
+                    "edge": edge,
+                    "edge_bps": edge * 10_000.0,
+                    "kelly_fraction": kelly_fraction(float(model_p), float(market_p)),
+                }
+            )
+
+    schema = {
+        "match_id": pl.Utf8,
+        "outcome": pl.Utf8,
+        "model_prob": pl.Float64,
+        "market_prob": pl.Float64,
+        "ci_low": pl.Float64,
+        "ci_high": pl.Float64,
+        "edge": pl.Float64,
+        "edge_bps": pl.Float64,
+        "kelly_fraction": pl.Float64,
+    }
+    return pl.DataFrame(rows, schema=schema).sort(pl.col("edge").abs(), descending=True)
+
+
 def compare_model_to_market() -> None:
     """CLI entrypoint: load stored predictions + market odds and print the edge table."""
 

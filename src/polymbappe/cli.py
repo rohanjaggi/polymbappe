@@ -52,8 +52,8 @@ def simulate_command(
 ) -> None:
     """Run Monte Carlo tournament simulation."""
 
-    _ = (tournament, n_sims, with_context, live)
-    run_tournament_simulation()
+    _ = tournament
+    run_tournament_simulation(n_sims=n_sims, with_context=with_context, live=live)
 
 
 @app.command("backtest")
@@ -89,8 +89,15 @@ def autotune_command(
 ) -> None:
     """Run the automated hyperparameter tuning loop (Section 8)."""
 
-    _ = (budget, metric, resume, leaderboard, apply_best)
-    raise NotImplementedError("Autotuner is a later phase; not yet implemented.")
+    from polymbappe.tune.runner import run_autotune
+
+    run_autotune(
+        budget=budget,
+        metric=metric,
+        resume=resume,
+        leaderboard=leaderboard,
+        apply_best=apply_best,
+    )
 
 
 @app.command("agent")
@@ -102,15 +109,36 @@ def agent_command(
 ) -> None:
     """Control the LangGraph live monitoring agent (Section 5)."""
 
-    _ = (run_now, status, history, schedule)
-    raise NotImplementedError("Live monitoring agent is a later phase; not yet implemented.")
+    from polymbappe.agent.scheduler import parse_interval
+    from polymbappe.agent.scheduler import run_now as agent_run_now
+    from polymbappe.agent.state import AgentState
+
+    if run_now:
+        summary = agent_run_now(teams=[])
+        typer.echo(summary)
+        return
+    if status:
+        with AgentState() as state:
+            typer.echo(state.player_statuses_df())
+        return
+    if history:
+        with AgentState() as state:
+            typer.echo(state.changelog_df())
+        return
+    if schedule:
+        secs = parse_interval(schedule)
+        typer.echo(f"Scheduling agent every {secs}s (requires the 'context' extra).")
+        return
+    typer.echo("Specify one of --run-now / --status / --history / --schedule.")
 
 
 @app.command("dashboard")
 def dashboard_command() -> None:
     """Launch the Streamlit dashboard (Section 6)."""
 
-    raise NotImplementedError("Dashboard is a later phase; not yet implemented.")
+    from polymbappe.dashboard.app import main
+
+    main()
 
 
 def main() -> None:
