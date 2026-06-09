@@ -73,7 +73,7 @@ strict = true
 packages = ["polymbappe"]
 
 [[tool.mypy.overrides]]
-module = ["requests", "scipy", "scipy.*", "soccerdata", "soccerdata.*"]
+module = ["requests", "scipy", "scipy.*", "soccerdata", "soccerdata.*", "sklearn", "sklearn.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]
