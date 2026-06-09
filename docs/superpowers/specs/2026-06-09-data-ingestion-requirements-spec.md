@@ -15,7 +15,7 @@ It also captures cross-cutting requirements that must be implemented before inte
 - **Auth:** None via GitHub raw. If using Kaggle dataset pages directly, require `kaggle`/`kagglehub` and API token at `~/.kaggle/kaggle.json` with `chmod 600`.
 - **Headers / rate limit:** No meaningful constraints on `raw.githubusercontent.com`.
 - **Format:** UTF-8 CSV files: `results.csv`, `shootouts.csv`, `goalscorers.csv`.
-- **Primary gotcha:** Historical team names (for example, `West Germany`) must be normalized to a current-name map before joins.
+- **Primary gotcha:** Historical team names (for example, `West Germany`) must be normalized to a canonical key before joins. Preserve original source names in raw data for historical traceability, and store normalized names in standardized columns used for cross-source joins.
 
 ### EloRatings.net
 - **Packages:** `requests`, `beautifulsoup4`, `lxml`.
@@ -115,7 +115,7 @@ It also captures cross-cutting requirements that must be implemented before inte
 - **Packages:** `requests` + `beautifulsoup4`, or MediaWiki API (`.../w/api.php`), or `wikipedia-api`.
 - **Auth:** None.
 - **Headers:** MediaWiki expects a descriptive `User-Agent` with application/contact context.
-- **Rate limit:** Follow etiquette (≤1 request/second).
+- **Rate limit:** Follow etiquette with a minimum 1-second delay between requests (no bursts).
 - **Format:** HTML or JSON (API).
 - **Primary gotcha:** No canonical knockout-record field exists; derive from manager tenure windows joined against match results.
 
