@@ -1,4 +1,10 @@
-"""Persistence layer for parquet and DuckDB."""
+"""Persistence layer for parquet and DuckDB.
+
+Normalized tables live as parquet under ``data/processed`` (one file per
+:class:`~polymbappe.data.tables.Table`) and are exposed to DuckDB as views via
+:func:`connect`, satisfying "all data lands in DuckDB" while staying file-backed
+and trivially inspectable.
+"""
 
 from __future__ import annotations
 
@@ -6,6 +12,9 @@ from pathlib import Path
 
 import duckdb
 import polars as pl
+
+from polymbappe.config import Settings
+from polymbappe.data.tables import Table, table_path
 
 
 def write_parquet(df: pl.DataFrame, path: Path) -> None:
@@ -19,6 +28,61 @@ def read_parquet(path: Path) -> pl.DataFrame:
     """Read a dataframe from parquet."""
 
     return pl.read_parquet(path)
+
+
+def write_table(
+    table: Table, df: pl.DataFrame, *, mode: str = "overwrite", settings: Settings | None = None
+) -> Path:
+    """Persist a normalized table to its canonical parquet path.
+
+    Args:
+        table: Canonical table to write.
+        df: Normalized frame.
+        mode: ``"overwrite"`` (default) or ``"append"``. Append concatenates with the
+            existing table (if any), then de-duplicates on identical rows.
+        settings: Optional settings override (path resolution).
+
+    Returns:
+        The path written to.
+    """
+
+    path = table_path(table, settings)
+    if mode == "append" and path.exists():
+        existing = pl.read_parquet(path)
+        df = pl.concat([existing, df.select(existing.columns)], how="vertical").unique()
+    elif mode not in {"overwrite", "append"}:
+        raise ValueError(f"Unknown write mode: {mode!r}")
+    write_parquet(df, path)
+    return path
+
+
+def read_table(table: Table, settings: Settings | None = None) -> pl.DataFrame:
+    """Read a normalized table from its canonical parquet path."""
+
+    return pl.read_parquet(table_path(table, settings))
+
+
+def table_exists(table: Table, settings: Settings | None = None) -> bool:
+    """Whether a normalized table has been materialized."""
+
+    return table_path(table, settings).exists()
+
+
+def connect(settings: Settings | None = None) -> duckdb.DuckDBPyConnection:
+    """Open a DuckDB connection with every materialized table registered as a view.
+
+    View names match :class:`~polymbappe.data.tables.Table` values, e.g. ``matches``.
+    Missing tables are simply not registered.
+    """
+
+    con = duckdb.connect()
+    for table in Table:
+        path = table_path(table, settings)
+        if path.exists():
+            con.execute(
+                f"CREATE VIEW {table.value} AS SELECT * FROM read_parquet('{path.as_posix()}')"
+            )
+    return con
 
 
 def query_duckdb(sql: str, parquet_paths: list[Path]) -> pl.DataFrame:
