@@ -99,3 +99,31 @@ def build_elo_features(
         records,
         schema={"match_id": pl.Utf8, "team": pl.Utf8, "date": pl.Date, "elo_pre": pl.Float64},
     )
+
+
+def build_elo_snapshots(
+    matches: pl.DataFrame,
+    config: EloConfig | None = None,
+) -> pl.DataFrame:
+    """Self-computed post-match Elo time series for every team appearance.
+
+    Walks matches chronologically, updating ratings from each result and recording each
+    team's rating *after* the match. This materializes the ``elo_snapshots`` table
+    (``team, date, rating``) consumed by the dashboard's Elo-trajectory view and as a
+    queryable artifact — distinct from :func:`build_elo_features`, which records the
+    pre-match rating for leakage-safe modelling.
+    """
+
+    df = matches.sort(["date", "match_id"])
+    elo = EloRatings(config)
+    records: list[dict[str, object]] = []
+    for row in df.iter_rows(named=True):
+        home, away = row["home_team"], row["away_team"]
+        elo.update(home, away, int(row["home_goals"]), int(row["away_goals"]))
+        records.append({"team": home, "date": row["date"], "rating": elo.rating(home)})
+        records.append({"team": away, "date": row["date"], "rating": elo.rating(away)})
+
+    return pl.DataFrame(
+        records,
+        schema={"team": pl.Utf8, "date": pl.Date, "rating": pl.Float64},
+    )

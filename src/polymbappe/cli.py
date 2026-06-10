@@ -21,8 +21,8 @@ app = typer.Typer(help="polymbappe forecasting CLI")
 def ingest_command(live: bool = False) -> None:
     """Ingest source datasets."""
 
-    _ = live
-    ingest_all_sources()
+    report = ingest_all_sources(live=live)
+    typer.echo(report)
 
 
 @app.command("features")
