@@ -5,3 +5,12 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 .claude/
+
+# Data artifacts — keep directory placeholders, ignore contents
+data/raw/*
+data/processed/*
+data/outputs/*
+!data/**/.gitkeep
+
+# Autotuner-generated best config (search space is tracked)
+configs/best_config.yaml
