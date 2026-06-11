@@ -77,6 +77,22 @@ CHANGELOG_SCHEMA: dict[str, pl.DataType] = {
     "prob_shift": pl.Float64,
 }
 
+#: Recorded-results schema — the subset of the ``matches`` normalized table (spec 11)
+#: the Match Predictor page needs to mark a scheduled fixture as played and show its
+#: scoreline. Mirrors ``polymbappe.data.tables.TABLE_COLUMNS[Table.MATCHES]``.
+RESULTS_SCHEMA: dict[str, pl.DataType] = {
+    "match_id": pl.Utf8,
+    "date": pl.Date,
+    "home_team": pl.Utf8,
+    "away_team": pl.Utf8,
+    "home_goals": pl.Int64,
+    "away_goals": pl.Int64,
+    "competition": pl.Utf8,
+    "is_knockout": pl.Boolean,
+    "neutral_site": pl.Boolean,
+    "group": pl.Utf8,
+}
+
 #: Stage-reaching column order, broadest to narrowest (mirrors simulate.tournament.STAGES).
 STAGE_COLUMNS: tuple[str, ...] = ("R32", "R16", "QF", "SF", "FINAL", "champion")
 
@@ -156,6 +172,19 @@ def load_agent_changelog(settings: Settings) -> pl.DataFrame:
     return _read_or_empty(_output_path(settings, "agent_changelog.parquet"), CHANGELOG_SCHEMA)
 
 
+def load_recorded_results(settings: Settings) -> pl.DataFrame:
+    """Load played-match results from the ``matches`` normalized table (spec 11).
+
+    Unlike the other loaders this reads ``data/processed`` (ingested results), not
+    ``data/outputs`` (simulation artifacts). Returns a typed empty frame when no
+    matches have been ingested yet, so the Match Predictor page degrades gracefully.
+    """
+
+    from polymbappe.data.tables import Table, table_path
+
+    return _read_or_empty(table_path(Table.MATCHES, settings), RESULTS_SCHEMA)
+
+
 # -- helpers ------------------------------------------------------------------
 
 
@@ -213,6 +242,113 @@ def match_row(match_df: pl.DataFrame, home_team: str, away_team: str) -> dict[st
     if hit.is_empty():
         return None
     return hit.row(0, named=True)
+
+
+def _model_pick_expr() -> pl.Expr:
+    """Polars expression for the model's most-likely outcome (``home``/``draw``/``away``).
+
+    Ties break toward the home win, then the away win — matching how the H/D/A bar is
+    read. Operates on the ``model_home``/``model_draw``/``model_away`` columns.
+    """
+
+    return (
+        pl.when(
+            (pl.col("model_home") >= pl.col("model_draw"))
+            & (pl.col("model_home") >= pl.col("model_away"))
+        )
+        .then(pl.lit("home"))
+        .when(
+            (pl.col("model_away") >= pl.col("model_draw"))
+            & (pl.col("model_away") >= pl.col("model_home"))
+        )
+        .then(pl.lit("away"))
+        .otherwise(pl.lit("draw"))
+    )
+
+
+def tournament_results(
+    results_df: pl.DataFrame,
+    *,
+    year: int = 2026,
+    competition_substr: str | None = None,
+) -> pl.DataFrame:
+    """Narrow recorded results to the tournament currently being forecast.
+
+    A scheduled fixture (e.g. group-stage ``Brazil vs Serbia``) shares its team pair
+    with decades of historical friendlies, so we must restrict recorded results to the
+    tournament before treating a match as "played". The discriminator is the match
+    ``date`` year (``>= year``); an optional case-insensitive ``competition`` substring
+    narrows further when the source labels the competition reliably.
+
+    Returns the (possibly empty) filtered frame; an empty input passes through unchanged.
+    """
+
+    if results_df.is_empty():
+        return results_df
+    df = results_df
+    if "date" in df.columns:
+        df = df.filter(pl.col("date").dt.year() >= year)
+    if competition_substr and "competition" in df.columns:
+        df = df.filter(
+            pl.col("competition").cast(pl.Utf8).str.contains(f"(?i){competition_substr}")
+        )
+    return df
+
+
+def split_fixtures(
+    match_df: pl.DataFrame, results_df: pl.DataFrame
+) -> tuple[pl.DataFrame, pl.DataFrame]:
+    """Split scheduled fixtures into ``(upcoming, finished)`` using recorded results.
+
+    Powers the Match Predictor page (spec 6.1, page 3): the page only forecasts real
+    fixtures, so we partition the predictions table by whether a recorded result exists
+    for the same ``(home_team, away_team)`` pairing in ``results_df`` (which the caller
+    should first narrow with :func:`tournament_results`). When a pairing has multiple
+    recorded results the most recent by ``date`` wins.
+
+    Both frames carry a ``model_pick`` column (the model's favoured outcome). The
+    ``finished`` frame additionally carries ``home_goals``, ``away_goals``, ``date``,
+    ``actual_outcome`` and ``model_correct`` (whether the model's pick matched reality).
+    Returns the input frame for both halves when there are no fixtures.
+    """
+
+    if match_df.is_empty():
+        return match_df, match_df
+
+    fixtures = match_df.with_columns(_model_pick_expr().alias("model_pick"))
+
+    result_cols = ["home_team", "away_team", "home_goals", "away_goals", "date"]
+    if results_df.is_empty():
+        results_slim = pl.DataFrame(
+            schema={c: RESULTS_SCHEMA[c] for c in result_cols}
+        )
+    else:
+        results_slim = (
+            results_df.select(result_cols)
+            .sort("date")
+            .group_by(["home_team", "away_team"], maintain_order=True)
+            .last()
+        )
+
+    joined = fixtures.join(results_slim, on=["home_team", "away_team"], how="left")
+    played = pl.col("home_goals").is_not_null()
+
+    upcoming = joined.filter(~played).select(fixtures.columns)
+    finished = (
+        joined.filter(played)
+        .with_columns(
+            pl.when(pl.col("home_goals") > pl.col("away_goals"))
+            .then(pl.lit("home"))
+            .when(pl.col("home_goals") < pl.col("away_goals"))
+            .then(pl.lit("away"))
+            .otherwise(pl.lit("draw"))
+            .alias("actual_outcome")
+        )
+        .with_columns(
+            (pl.col("model_pick") == pl.col("actual_outcome")).alias("model_correct")
+        )
+    )
+    return upcoming, finished
 
 
 def upset_candidates(

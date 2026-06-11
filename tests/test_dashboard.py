@@ -7,6 +7,7 @@ graceful empty-frame-on-missing-file contract and the helper functions.
 
 from __future__ import annotations
 
+from datetime import date
 from pathlib import Path
 
 import polars as pl
@@ -204,3 +205,99 @@ def test_data_freshness_reports_missing_and_present(tmp_path: Path) -> None:
     freshness = data.data_freshness(settings)
     assert freshness["edges.parquet"] == "missing"
     assert freshness["stage_probabilities.parquet"] != "missing"
+
+
+# -- recorded results & fixture splitting -------------------------------------
+
+
+def test_load_recorded_results_empty_schema(tmp_path: Path) -> None:
+    df = data.load_recorded_results(_settings(tmp_path))
+    assert df.is_empty()
+    assert df.columns == list(data.RESULTS_SCHEMA.keys())
+
+
+def _fixtures() -> pl.DataFrame:
+    return pl.DataFrame(
+        {
+            "match_id": ["2026__BRA__SRB", "2026__ARG__MEX", "2026__FRA__CAN"],
+            "group": ["A", "B", "C"],
+            "home_team": ["BRA", "ARG", "FRA"],
+            "away_team": ["SRB", "MEX", "CAN"],
+            "model_home": [0.6, 0.5, 0.7],
+            "model_draw": [0.25, 0.3, 0.2],
+            "model_away": [0.15, 0.2, 0.1],
+        }
+    )
+
+
+def _results() -> pl.DataFrame:
+    return pl.DataFrame(
+        {
+            "home_team": ["BRA", "BRA", "FRA"],
+            "away_team": ["SRB", "SRB", "CAN"],
+            # An old friendly (2018) plus the actual 2026 fixture for BRA-SRB.
+            "date": [date(2018, 6, 27), date(2026, 6, 12), date(2026, 6, 13)],
+            "home_goals": [2, 1, 0],
+            "away_goals": [0, 1, 1],
+            "competition": ["Friendly", "FIFA World Cup", "FIFA World Cup"],
+        }
+    )
+
+
+def test_tournament_results_filters_by_year() -> None:
+    filtered = data.tournament_results(_results(), year=2026)
+    assert filtered.height == 2
+    assert set(filtered["date"].dt.year().to_list()) == {2026}
+
+
+def test_tournament_results_competition_substr() -> None:
+    filtered = data.tournament_results(_results(), year=2026, competition_substr="world cup")
+    assert filtered.height == 2
+    assert all("World Cup" in c for c in filtered["competition"].to_list())
+
+
+def test_tournament_results_empty_passthrough() -> None:
+    empty = data.load_recorded_results(Settings(data_dir=Path("/nonexistent-xyz")))
+    assert data.tournament_results(empty).is_empty()
+
+
+def test_split_fixtures_partitions_upcoming_and_finished() -> None:
+    results = data.tournament_results(_results(), year=2026)
+    upcoming, finished = data.split_fixtures(_fixtures(), results)
+
+    # ARG-MEX has no recorded result -> upcoming; BRA-SRB and FRA-CAN played -> finished.
+    assert upcoming["match_id"].to_list() == ["2026__ARG__MEX"]
+    assert set(finished["match_id"]) == {"2026__BRA__SRB", "2026__FRA__CAN"}
+    assert "model_pick" in upcoming.columns
+
+
+def test_split_fixtures_uses_latest_result_and_flags_correctness() -> None:
+    results = data.tournament_results(_results(), year=2026)
+    _, finished = data.split_fixtures(_fixtures(), results)
+
+    bra = finished.filter(pl.col("match_id") == "2026__BRA__SRB").row(0, named=True)
+    # The 2026 result (1-1 draw) is used, not the 2018 friendly (2-0).
+    assert bra["home_goals"] == 1 and bra["away_goals"] == 1
+    assert bra["actual_outcome"] == "draw"
+    # Model favoured BRA (home) but it was a draw -> incorrect.
+    assert bra["model_pick"] == "home"
+    assert bra["model_correct"] is False
+
+    fra = finished.filter(pl.col("match_id") == "2026__FRA__CAN").row(0, named=True)
+    # FRA lost 0-1 -> away; model favoured FRA -> incorrect.
+    assert fra["actual_outcome"] == "away"
+    assert fra["model_correct"] is False
+
+
+def test_split_fixtures_no_results_all_upcoming() -> None:
+    empty = data.load_recorded_results(Settings(data_dir=Path("/nonexistent-xyz")))
+    upcoming, finished = data.split_fixtures(_fixtures(), empty)
+    assert upcoming.height == 3
+    assert finished.is_empty()
+
+
+def test_split_fixtures_empty_fixtures_passthrough() -> None:
+    empty = data.load_match_predictions(Settings(data_dir=Path("/nonexistent-xyz")))
+    upcoming, finished = data.split_fixtures(empty, empty)
+    assert upcoming.is_empty()
+    assert finished.is_empty()
