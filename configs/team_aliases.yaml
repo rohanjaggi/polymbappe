@@ -1,0 +1,12 @@
+# Team-name aliases: alternate spelling -> canonical (Kaggle/martj42) name.
+#
+# Extends/overrides polymbappe.data.aliases.DEFAULT_ALIASES. Keys are matched
+# case-insensitively (lowercased) after trimming whitespace; values are the canonical
+# spelling used in the matches table. Add entries when a source (Polymarket, a bookmaker
+# CSV) spells a national team differently and its odds fail to join the fixtures.
+
+# Examples (uncomment / extend as needed):
+# "USMNT": "United States"
+# "Czechia": "Czech Republic"
+# "Korea Republic": "South Korea"
+# "Türkiye": "Turkey"

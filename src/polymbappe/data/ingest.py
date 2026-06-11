@@ -5,7 +5,8 @@ ingested independently and failures are isolated: a missing optional source or a
 network error logs a warning and is skipped rather than aborting the whole run.
 
 Sources prefer a local raw file under ``data/raw`` when present (reproducible,
-offline-friendly), falling back to a network fetch otherwise.
+offline-friendly), falling back to a network fetch (or, for Elo, a self-computation from
+the already-ingested ``matches`` table) otherwise.
 """
 
 from __future__ import annotations
@@ -17,9 +18,9 @@ import structlog
 
 from polymbappe.config import Settings
 from polymbappe.data import sources
-from polymbappe.data.normalize import normalize_kaggle_results
-from polymbappe.data.store import write_table
-from polymbappe.data.tables import Table
+from polymbappe.data.normalize import normalize_kaggle_results, normalize_odds_frame
+from polymbappe.data.store import read_table, table_exists, write_table
+from polymbappe.data.tables import TABLE_COLUMNS, Table
 
 logger = structlog.get_logger(__name__)
 
@@ -52,32 +53,232 @@ def ingest_results(
     return normalized.height
 
 
+def ingest_elo(settings: Settings | None = None) -> int:
+    """Materialize the ``elo_snapshots`` table by self-computing Elo from ``matches``.
+
+    Requires the ``matches`` table (run :func:`ingest_results` first). Walks results
+    chronologically and records each team's post-match rating, producing the time series
+    the dashboard's Elo-trajectory view reads. No network access.
+
+    Returns the number of snapshot rows written.
+    """
+
+    from polymbappe.features.elo import build_elo_snapshots
+
+    settings = settings or Settings()
+    if not table_exists(Table.MATCHES, settings):
+        raise FileNotFoundError("Elo ingestion needs the matches table; run ingest_results first.")
+
+    matches = read_table(Table.MATCHES, settings)
+    snapshots = build_elo_snapshots(matches)
+    write_table(Table.ELO_SNAPSHOTS, snapshots, mode="overwrite", settings=settings)
+    logger.info("ingest.elo.stored", rows=snapshots.height)
+    return snapshots.height
+
+
+_MARKET_ODDS_COLUMNS = TABLE_COLUMNS[Table.MARKET_ODDS]
+
+
+def _local_odds(settings: Settings) -> pl.DataFrame | None:
+    """Normalized decimal-odds CSV at ``data/raw/odds.csv`` (manual / fallback source)."""
+
+    local = settings.raw_data_dir / "odds.csv"
+    if not local.exists():
+        return None
+    raw = pl.read_csv(io.BytesIO(local.read_bytes()))
+    required = {"date", "home_team", "away_team", "home_odds", "draw_odds", "away_odds"}
+    missing = required - set(raw.columns)
+    if missing:
+        raise ValueError(f"odds.csv missing columns: {sorted(missing)}")
+    raw = raw.with_columns(
+        pl.col("date").cast(pl.Utf8).str.to_date(strict=False).alias("date")
+    ).with_columns(
+        pl.format("{}__{}__{}", pl.col("date"), pl.col("home_team"), pl.col("away_team"))
+        .alias("match_id")
+    )
+    return normalize_odds_frame(
+        raw, source="local-csv", home_col="home_odds", draw_col="draw_odds",
+        away_col="away_odds", timestamp_col="timestamp" if "timestamp" in raw.columns else None,
+    )
+
+
+def _footballdata_odds(settings: Settings) -> pl.DataFrame | None:
+    """Football-Data.co.uk bookmaker odds from local CSVs and/or configured URLs.
+
+    Local CSVs: ``data/raw/football_data/*.csv``. Remote: one URL per line in
+    ``data/raw/football_data_urls.txt``. Each is parsed by
+    :func:`~polymbappe.data.normalize.normalize_footballdata_odds`; network failures are
+    isolated per URL.
+    """
+
+    from polymbappe.data.normalize import normalize_footballdata_odds
+
+    frames: list[pl.DataFrame] = []
+    local_dir = settings.raw_data_dir / "football_data"
+    if local_dir.is_dir():
+        for csv_path in sorted(local_dir.glob("*.csv")):
+            raw = pl.read_csv(io.BytesIO(csv_path.read_bytes()), ignore_errors=True)
+            frames.append(normalize_footballdata_odds(raw))
+    url_file = settings.raw_data_dir / "football_data_urls.txt"
+    if url_file.exists():
+        for url in url_file.read_text().splitlines():
+            url = url.strip()
+            if not url or url.startswith("#"):
+                continue
+            try:
+                raw = sources.fetch_football_data_csv(url)
+                frames.append(normalize_footballdata_odds(raw))
+            except Exception as exc:  # noqa: BLE001 - isolate per-URL fetch/parse failure
+                logger.warning("ingest.odds.footballdata_url_failed", url=url, error=str(exc))
+    if not frames:
+        return None
+    return pl.concat(frames, how="vertical_relaxed")
+
+
+def _polymarket_odds(settings: Settings) -> pl.DataFrame | None:
+    """Polymarket three-way match odds, aligned to the 2026 fixtures in match_predictions.
+
+    Requires ``data/outputs/match_predictions.parquet`` (run ``simulate`` once) to orient
+    each market to a fixture's home/away and key it as ``2026__home__away``. The query slug
+    is read from ``data/raw/polymarket_query.txt`` when present. Network/auth failures are
+    isolated and return ``None``.
+    """
+
+    from polymbappe.polymarket import adapter
+
+    preds_path = settings.outputs_data_dir / "match_predictions.parquet"
+    if not preds_path.exists():
+        logger.info("ingest.odds.polymarket_skip", reason="no match_predictions fixtures")
+        return None
+    fixtures = pl.read_parquet(preds_path).select("match_id", "home_team", "away_team")
+    query_file = settings.raw_data_dir / "polymarket_query.txt"
+    query = query_file.read_text().strip() if query_file.exists() else None
+    try:
+        long_prices = adapter.fetch_polymarket_prices(query=query)
+    except Exception as exc:  # noqa: BLE001 - network/auth isolated
+        logger.warning("ingest.odds.polymarket_failed", error=str(exc))
+        return None
+    three_way = adapter.normalize_polymarket_three_way(long_prices)
+    unmatched = adapter.unmatched_market_teams(three_way, fixtures)
+    if unmatched:
+        logger.warning(
+            "ingest.odds.polymarket_unmatched",
+            teams=unmatched,
+            hint="add these spellings to configs/team_aliases.yaml so their odds join",
+        )
+    aligned = adapter.align_polymarket_to_fixtures(three_way, fixtures)
+    return aligned if aligned.height > 0 else None
+
+
+def ingest_market_odds(settings: Settings | None = None, *, live: bool = False) -> int:
+    """Ingest market odds into ``market_odds`` from all available sources.
+
+    Gathers from (1) a local normalized ``odds.csv``, (2) Football-Data.co.uk CSVs/URLs,
+    and (3) Polymarket (aligned to the 2026 fixtures). Each source is isolated; sources
+    with no input are skipped. Frames are concatenated and de-duplicated on
+    ``(match_id, source)``. Match ids follow ``date__home__away`` (Football-Data / local)
+    or ``2026__home__away`` (Polymarket) so odds join the matches / predictions tables.
+
+    Returns the number of odds rows written (0 if no source produced any).
+    """
+
+    settings = settings or Settings()
+    gathered: list[pl.DataFrame] = []
+    for name, fetch in (
+        ("local", _local_odds),
+        ("football-data", _footballdata_odds),
+        ("polymarket", _polymarket_odds),
+    ):
+        try:
+            frame = fetch(settings)
+        except Exception as exc:  # noqa: BLE001 - isolate per-source failure
+            logger.warning("ingest.odds.source_failed", source=name, error=str(exc))
+            frame = None
+        if frame is not None and frame.height > 0:
+            gathered.append(frame.select(_MARKET_ODDS_COLUMNS))
+            logger.info("ingest.odds.source", source=name, rows=frame.height)
+
+    if not gathered:
+        logger.info("ingest.odds.skip", reason="no odds source produced data")
+        return 0
+
+    combined = pl.concat(gathered, how="vertical_relaxed").unique(subset=["match_id", "source"])
+    write_table(
+        Table.MARKET_ODDS, combined, mode="append" if live else "overwrite", settings=settings
+    )
+    logger.info("ingest.odds.stored", rows=combined.height, live=live)
+    return combined.height
+
+
+def ingest_team_xg(settings: Settings | None = None) -> int:
+    """Ingest team-level xG into the ``team_xg`` table from ``data/raw/team_xg.csv``.
+
+    Expects columns ``team, date, xg, xga`` (FBref team-match xG, 2018+). Live FBref
+    scraping via :func:`~polymbappe.data.sources.get_fbref_matches` is available but heavy
+    and network-dependent, so the default path is the reproducible local file. Skips
+    (returns 0) when the file is absent.
+    """
+
+    settings = settings or Settings()
+    local = settings.raw_data_dir / "team_xg.csv"
+    if not local.exists():
+        logger.info("ingest.xg.skip", reason="no data/raw/team_xg.csv")
+        return 0
+
+    raw = pl.read_csv(io.BytesIO(local.read_bytes()))
+    required = {"team", "date", "xg", "xga"}
+    missing = required - set(raw.columns)
+    if missing:
+        raise ValueError(f"team_xg.csv missing columns: {sorted(missing)}")
+
+    normalized = raw.select(
+        pl.col("team").cast(pl.Utf8),
+        pl.col("date").cast(pl.Utf8).str.to_date(strict=False),
+        pl.col("xg").cast(pl.Float64),
+        pl.col("xga").cast(pl.Float64),
+    ).select(TABLE_COLUMNS[Table.TEAM_XG])
+    write_table(Table.TEAM_XG, normalized, mode="overwrite", settings=settings)
+    logger.info("ingest.xg.stored", rows=normalized.height)
+    return normalized.height
+
+
 def ingest_all_sources(live: bool = False, settings: Settings | None = None) -> dict[str, int]:
     """Ingest all configured upstream datasets into normalized storage.
+
+    Runs results first (the others depend on it or are optional overlays), then Elo
+    (self-computed from results), market odds, and team xG. Each source is isolated:
+    a failure or a skipped optional source is recorded rather than aborting the run.
 
     Args:
         live: Incremental mode — append latest results/odds rather than overwrite.
         settings: Optional settings override.
 
     Returns:
-        Mapping of source name to rows ingested. Sources that were skipped or failed
-        are recorded with a count of ``-1``.
+        Mapping of source name to rows ingested. Sources that failed are recorded as
+        ``-1``; optional sources with no input return ``0``.
     """
 
     settings = settings or Settings()
     logger.info("ingest.start", live=live)
     report: dict[str, int] = {}
 
-    for name, fn in (("results", ingest_results),):
+    # (name, callable, passes-live-flag). Order matters: Elo reads the matches table.
+    steps: tuple[tuple[str, object, bool], ...] = (
+        ("results", ingest_results, True),
+        ("elo", ingest_elo, False),
+        ("market_odds", ingest_market_odds, True),
+        ("team_xg", ingest_team_xg, False),
+    )
+    for name, fn, takes_live in steps:
         try:
-            report[name] = fn(settings, live=live)
+            report[name] = fn(settings, live=live) if takes_live else fn(settings)  # type: ignore[operator]
         except Exception as exc:  # noqa: BLE001 — isolate per-source failure
             logger.warning("ingest.source_failed", source=name, error=str(exc))
             report[name] = -1
 
-    # Elo, market odds, Transfermarkt squad value, and FBref xG ingestion are wired in
-    # later phases (they are not on the minimum-viable-model critical path). Their
-    # fetchers/normalizers already exist in `sources`, `normalize`, and `polymarket`.
+    # Transfermarkt squad valuations and FBref live scraping remain manual/optional:
+    # their fetchers exist in `sources` but require auth/heavy network and are off the
+    # minimum-viable-model critical path.
 
     logger.info("ingest.done", report=report)
     return report

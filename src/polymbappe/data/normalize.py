@@ -54,10 +54,12 @@ def normalize_kaggle_results(raw: pl.DataFrame) -> pl.DataFrame:
     present = {k: v for k, v in _KAGGLE_RENAME.items() if k in raw.columns}
     df = raw.rename(present)
 
+    from polymbappe.data.aliases import normalize_team_expr
+
     df = df.with_columns(
         pl.col("date").cast(pl.Utf8).str.to_date(strict=False).alias("date"),
-        pl.col("home_team").cast(pl.Utf8),
-        pl.col("away_team").cast(pl.Utf8),
+        normalize_team_expr("home_team").alias("home_team"),
+        normalize_team_expr("away_team").alias("away_team"),
         pl.col("home_goals").cast(pl.Int64, strict=False),
         pl.col("away_goals").cast(pl.Int64, strict=False),
         pl.col("competition").cast(pl.Utf8),
@@ -147,6 +149,68 @@ def implied_probabilities(
     raw_h, raw_d, raw_a = 1.0 / home_odds, 1.0 / draw_odds, 1.0 / away_odds
     overround = raw_h + raw_d + raw_a
     return raw_h / overround, raw_d / overround, raw_a / overround
+
+
+#: Bookmaker odds-column prefixes in Football-Data.co.uk CSVs, best first: Bet365,
+#: market average, Pinnacle, then the older Bet&Win / average columns.
+_FOOTBALLDATA_PREFIXES: tuple[str, ...] = ("B365", "Avg", "PS", "P", "BW", "BbAv")
+
+
+def normalize_footballdata_odds(
+    raw: pl.DataFrame, *, source: str = "football-data"
+) -> pl.DataFrame:
+    """Normalize a Football-Data.co.uk CSV into the ``market_odds`` schema.
+
+    Picks the first available bookmaker odds triple (``{prefix}H/D/A`` for a prefix in
+    :data:`_FOOTBALLDATA_PREFIXES`), builds the ``date__home__away`` match id (matching the
+    matches table convention so odds join by id), and removes the overround. Football-Data
+    covers club leagues, so these odds join any match sharing that id convention. Rows
+    missing the chosen odds, date, or teams are dropped.
+    """
+
+    required = {"Date", "HomeTeam", "AwayTeam"}
+    missing = required - set(raw.columns)
+    if missing:
+        raise ValueError(f"Football-Data CSV missing columns: {sorted(missing)}")
+
+    prefix = next(
+        (
+            p
+            for p in _FOOTBALLDATA_PREFIXES
+            if {f"{p}H", f"{p}D", f"{p}A"}.issubset(raw.columns)
+        ),
+        None,
+    )
+    if prefix is None:
+        raise ValueError("Football-Data CSV has no recognized H/D/A odds columns.")
+
+    from polymbappe.data.aliases import normalize_team_expr
+
+    iso_date = pl.coalesce(
+        pl.col("Date").cast(pl.Utf8).str.to_date("%d/%m/%Y", strict=False),
+        pl.col("Date").cast(pl.Utf8).str.to_date("%d/%m/%y", strict=False),
+    )
+    prepared = (
+        raw.with_columns(
+            iso_date.alias("_date"),
+            normalize_team_expr("HomeTeam").alias("HomeTeam"),
+            normalize_team_expr("AwayTeam").alias("AwayTeam"),
+        )
+        .drop_nulls("_date")
+        .with_columns(
+            pl.format("{}__{}__{}", pl.col("_date"), pl.col("HomeTeam"), pl.col("AwayTeam"))
+            .alias("match_id")
+        )
+    )
+    return normalize_odds_frame(
+        prepared,
+        source=source,
+        home_col=f"{prefix}H",
+        draw_col=f"{prefix}D",
+        away_col=f"{prefix}A",
+        match_id_col="match_id",
+        timestamp_col=None,
+    )
 
 
 def normalize_odds_frame(

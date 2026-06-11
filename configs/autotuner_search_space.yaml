@@ -1,0 +1,46 @@
+# Autotuner search space (spec section 8.2).
+#
+# Phase 2 (Optuna TPE) samples the numeric/categorical ranges below within the structure
+# fixed by Phase 1. Each parameter declares a type and bounds/choices; the sampler in
+# polymbappe.tune.search_space interprets them. Parameters are grouped by component.
+
+dixon_coles:
+  xi: {type: float, low: 0.0005, high: 0.005}
+  friendly_weight: {type: float, low: 0.1, high: 0.5}
+  max_goals: {type: categorical, choices: [8, 10, 12]}
+
+bayesian:
+  confederation_sigma_prior: {type: float, low: 0.1, high: 1.0}
+  sigma_walk: {type: float, low: 0.001, high: 0.05, log: true}
+  home_advantage_prior_mean: {type: float, low: 0.1, high: 0.4}
+  n_tune: {type: categorical, choices: [1000, 2000, 4000]}
+  n_draws: {type: categorical, choices: [1000, 2000, 4000]}
+
+features:
+  elo_k_factor: {type: float, low: 10.0, high: 40.0}
+  xg_window: {type: int, low: 5, high: 20}
+  draw_max: {type: float, low: 0.20, high: 0.32}
+
+gbm:
+  num_leaves: {type: int, low: 15, high: 63}
+  learning_rate: {type: float, low: 0.01, high: 0.1, log: true}
+  n_estimators: {type: int, low: 100, high: 500}
+  min_child_samples: {type: int, low: 10, high: 50}
+
+contextual:
+  context_num_leaves: {type: int, low: 7, high: 31}
+  context_n_estimators: {type: int, low: 50, high: 200}
+  toggle_ppda: {type: categorical, choices: [true, false]}
+  toggle_cohesion: {type: categorical, choices: [true, false]}
+  toggle_manager: {type: categorical, choices: [true, false]}
+  toggle_fatigue: {type: categorical, choices: [true, false]}
+  toggle_xg_overperformance: {type: categorical, choices: [true, false]}
+  toggle_draw_pressure: {type: categorical, choices: [true, false]}
+  enable_contextual_layer: {type: categorical, choices: [true, false]}
+
+ensemble:
+  meta_C: {type: float, low: 0.1, high: 10.0, log: true}
+  meta_learner: {type: categorical, choices: [logistic, isotonic, weighted_average]}
+
+# Phase 1 (LLM structural search) operates outside this numeric space — see
+# polymbappe.tune.llm_search for the structural-experiment proposals.

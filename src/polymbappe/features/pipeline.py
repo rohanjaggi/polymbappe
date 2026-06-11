@@ -148,30 +148,77 @@ class FeaturePipeline:
         return matrix
 
 
-def build_feature_matrix(as_of: date | None = None, contextual: bool = False) -> None:
-    """CLI entrypoint: build the core feature matrix from stored matches.
+def build_contextual_matrix(
+    matches: pl.DataFrame,
+    as_of_date: date | None = None,
+    team_xg: pl.DataFrame | None = None,
+    team_ppda: pl.DataFrame | None = None,
+) -> pl.DataFrame:
+    """Assemble the match-level contextual feature matrix (spec 2.2, Tier A).
 
-    Reads the ``matches`` table, assembles the core matrix (joining market odds when
-    available), and writes it to ``data/processed/core_features.parquet``.
+    Joins the team-date contextual builders (xG overperformance, PPDA) onto both match
+    sides and derives the ``ppda_diff`` match-pair feature. Richer inputs (squad cohesion,
+    manager pedigree, fatigue, draw pressure) are joined here when their source tables are
+    materialized; absent inputs are simply skipped so the matrix always builds.
+
+    Returns one row per match with ``home_*``/``away_*`` contextual columns, ``ppda_diff``,
+    and the H/D/A ``label``.
     """
 
-    if contextual:
-        raise NotImplementedError("Contextual feature table is built in a later phase.")
+    from polymbappe.context.ppda import build_ppda_features
+    from polymbappe.context.sentiment import build_xg_overperformance
+
+    matrix = matches.select(*_ID_COLUMNS, pl.col("home_goals"), pl.col("away_goals"))
+    overperf = build_xg_overperformance(matches, team_xg, as_of_date)
+    ppda = build_ppda_features(matches, team_ppda, as_of_date).select(
+        ["match_id", "team", "date", "ppda"]
+    )
+    for team_table in (overperf, ppda):
+        matrix = _join_team_table(matrix, team_table)
+
+    matrix = matrix.with_columns(
+        (pl.col("home_ppda") - pl.col("away_ppda")).alias("ppda_diff")
+    )
+    matrix = matrix.with_columns(
+        pl.when(pl.col("home_goals") > pl.col("away_goals"))
+        .then(pl.lit("H"))
+        .when(pl.col("home_goals") < pl.col("away_goals"))
+        .then(pl.lit("A"))
+        .otherwise(pl.lit("D"))
+        .alias("label")
+    )
+    return matrix
+
+
+def build_feature_matrix(as_of: date | None = None, contextual: bool = False) -> None:
+    """CLI entrypoint: build the core (or contextual) feature matrix from stored matches.
+
+    Reads the ``matches`` table, assembles the requested matrix (joining market odds /
+    team xG when available), and writes it to ``data/processed/{core,contextual}_features.parquet``.
+    """
 
     from polymbappe.data.store import read_table, table_exists, write_parquet
     from polymbappe.data.tables import Table
 
     settings = Settings()
     matches = read_table(Table.MATCHES, settings)
-    market_odds = (
-        read_table(Table.MARKET_ODDS, settings)
-        if table_exists(Table.MARKET_ODDS, settings)
-        else None
+    team_xg = (
+        read_table(Table.TEAM_XG, settings) if table_exists(Table.TEAM_XG, settings) else None
     )
 
-    matrix = FeaturePipeline().build_core_matrix(
-        matches, as_of_date=as_of, market_odds=market_odds
-    )
-    out_path = settings.processed_data_dir / "core_features.parquet"
+    if contextual:
+        matrix = build_contextual_matrix(matches, as_of_date=as_of, team_xg=team_xg)
+        out_path = settings.processed_data_dir / "contextual_features.parquet"
+    else:
+        market_odds = (
+            read_table(Table.MARKET_ODDS, settings)
+            if table_exists(Table.MARKET_ODDS, settings)
+            else None
+        )
+        matrix = FeaturePipeline().build_core_matrix(
+            matches, as_of_date=as_of, team_xg=team_xg, market_odds=market_odds
+        )
+        out_path = settings.processed_data_dir / "core_features.parquet"
+
     write_parquet(matrix, out_path)
     logger.info("features.built", rows=matrix.height, cols=len(matrix.columns), path=str(out_path))
