@@ -85,6 +85,90 @@ def fetch_polymarket_prices(
     )
 
 
+#: Live 2026 World Cup *futures* markets (gamma event slugs) -> the simulation output
+#: column they price. Per-match H/D/A markets do not exist until fixtures are scheduled;
+#: these futures are what is tradeable pre-tournament. ``normalize`` de-vigs mutually
+#: exclusive markets (one champion / one group winner) but not the reach-stage markets
+#: (a team can clear several stages, so their Yes prices are independent).
+WORLD_CUP_FUTURES: dict[str, dict[str, Any]] = {
+    "world-cup-winner": {"output": "stage_probabilities", "column": "champion", "normalize": True},
+    "world-cup-nation-to-reach-final": {
+        "output": "stage_probabilities", "column": "FINAL", "normalize": False
+    },
+    "world-cup-nation-to-reach-semifinals": {
+        "output": "stage_probabilities", "column": "SF", "normalize": False
+    },
+    "world-cup-nation-to-reach-quarterfinals": {
+        "output": "stage_probabilities", "column": "QF", "normalize": False
+    },
+    "world-cup-nation-to-reach-round-of-16": {
+        "output": "stage_probabilities", "column": "R16", "normalize": False
+    },
+    "world-cup-team-to-advance-to-knockout-stages": {
+        "output": "stage_probabilities", "column": "R32", "normalize": False
+    },
+}
+
+#: Outcome labels that are placeholders rather than real teams.
+_NON_TEAM_LABELS = {"other", "team am", "field", "any other team"}
+
+
+def fetch_polymarket_event(slug: str, timeout: float = 30.0) -> dict[str, Any]:
+    """Fetch one gamma-API event (with its per-team sub-markets) by slug."""
+
+    response = requests.get(
+        "https://gamma-api.polymarket.com/events",
+        params={"slug": slug},
+        headers=_HEADERS,
+        timeout=timeout,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    events = payload if isinstance(payload, list) else payload.get("data", [payload])
+    if not events:
+        raise ValueError(f"No Polymarket event for slug {slug!r}.")
+    return dict(events[0])
+
+
+def parse_team_yes_prices(event: dict[str, Any], *, normalize: bool = False) -> pl.DataFrame:
+    """Per-team implied probabilities from a grouped Yes/No futures event.
+
+    Each sub-market is a team's Yes/No market (``groupItemTitle`` = team, prices the
+    [Yes, No] pair). Returns ``[team, market_prob]`` with team names canonicalized via the
+    alias table. Placeholder outcomes (``Other``/``Field``) and price-less markets are
+    dropped. ``normalize=True`` rescales to sum 1 (de-vig) for mutually-exclusive markets.
+    """
+
+    from polymbappe.data.aliases import normalize_team_name
+
+    rows: list[dict[str, Any]] = []
+    for market in event.get("markets", []):
+        team_raw = market.get("groupItemTitle") or ""
+        outcomes_raw = market.get("outcomes")
+        prices_raw = market.get("outcomePrices")
+        if not team_raw or outcomes_raw is None or prices_raw is None:
+            continue
+        if team_raw.strip().lower() in _NON_TEAM_LABELS:
+            continue
+        outcomes = json.loads(outcomes_raw) if isinstance(outcomes_raw, str) else outcomes_raw
+        prices = json.loads(prices_raw) if isinstance(prices_raw, str) else prices_raw
+        lowered = [str(o).strip().lower() for o in outcomes]
+        if "yes" not in lowered or len(prices) != len(outcomes):
+            continue
+        rows.append(
+            {
+                "team": normalize_team_name(team_raw),
+                "market_prob": float(prices[lowered.index("yes")]),
+            }
+        )
+    frame = pl.DataFrame(rows, schema={"team": pl.Utf8, "market_prob": pl.Float64})
+    if normalize and frame.height > 0:
+        total = float(frame["market_prob"].sum())
+        if total > 0:
+            frame = frame.with_columns((pl.col("market_prob") / total).alias("market_prob"))
+    return frame
+
+
 def normalize_polymarket_three_way(
     long_prices: pl.DataFrame, draw_label: str = "Draw"
 ) -> pl.DataFrame:

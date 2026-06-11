@@ -204,6 +204,36 @@ def test_write_edges_with_market(tmp_path) -> None:
     assert "H" in edges["outcome"].to_list()  # 12pp home edge flagged
 
 
+def test_refresh_market_odds_pulls_local(tmp_path) -> None:
+    import structlog
+
+    from polymbappe.config import Settings
+    from polymbappe.data.store import read_table, table_exists
+    from polymbappe.data.tables import Table
+    from polymbappe.simulate.tournament import refresh_market_odds
+
+    settings = Settings(data_dir=tmp_path)
+    settings.raw_data_dir.mkdir(parents=True, exist_ok=True)
+    (settings.raw_data_dir / "odds.csv").write_text(
+        "date,home_team,away_team,home_odds,draw_odds,away_odds\n"
+        "2026-06-14,Spain,Brazil,2.0,3.3,3.7\n"
+    )
+    n = refresh_market_odds(settings, structlog.get_logger())
+    assert n == 1
+    assert table_exists(Table.MARKET_ODDS, settings)
+    assert read_table(Table.MARKET_ODDS, settings).height == 1
+
+
+def test_refresh_market_odds_no_sources_is_zero(tmp_path) -> None:
+    import structlog
+
+    from polymbappe.config import Settings
+    from polymbappe.simulate.tournament import refresh_market_odds
+
+    settings = Settings(data_dir=tmp_path)
+    assert refresh_market_odds(settings, structlog.get_logger()) == 0
+
+
 def test_staleness_monitor_levels() -> None:
     assert surprise_increment(0.1, True) == 0.9
     mon = StalenessMonitor(yellow=1.0, red=2.0)

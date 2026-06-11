@@ -49,11 +49,16 @@ def simulate_command(
     n_sims: int = 50_000,
     with_context: bool = False,
     live: bool = False,
+    refresh_odds: bool = typer.Option(
+        False, "--refresh-odds", help="Re-pull market odds before computing edges (live updates)."
+    ),
 ) -> None:
     """Run Monte Carlo tournament simulation."""
 
     _ = tournament
-    run_tournament_simulation(n_sims=n_sims, with_context=with_context, live=live)
+    run_tournament_simulation(
+        n_sims=n_sims, with_context=with_context, live=live, refresh_odds=refresh_odds
+    )
 
 
 @app.command("backtest")
@@ -65,11 +70,24 @@ def backtest_command(format_version: int = 2026) -> None:
 
 
 @app.command("edges")
-def edges_command(tournament: int = 2026) -> None:
-    """Print model-vs-market edge table."""
+def edges_command(
+    tournament: int = 2026,
+    outright: bool = typer.Option(
+        False, help="Show outright/futures edges (e.g. champion) vs a Polymarket market."
+    ),
+    market: str = typer.Option(
+        "world-cup-winner", help="Polymarket futures slug for --outright."
+    ),
+) -> None:
+    """Print model-vs-market edge table (per-match by default, or --outright futures)."""
 
     _ = tournament
-    compare_model_to_market()
+    if outright:
+        from polymbappe.eval.market import compare_outright_to_market
+
+        compare_outright_to_market(market)
+    else:
+        compare_model_to_market()
 
 
 @app.command("report")

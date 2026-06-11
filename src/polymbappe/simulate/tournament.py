@@ -406,16 +406,38 @@ class StalenessMonitor:
         return "green"
 
 
+def refresh_market_odds(settings: object, logger: object) -> int:
+    """Re-pull the latest market odds before edge computation (live-agent hook).
+
+    Calls :func:`polymbappe.data.ingest.ingest_market_odds` in append mode so each
+    simulation run can incorporate fresh Polymarket / Football-Data odds. Isolated: a
+    network/source failure logs and returns -1 rather than aborting the simulation.
+    """
+
+    from polymbappe.data.ingest import ingest_market_odds
+
+    try:
+        n = ingest_market_odds(settings, live=True)  # type: ignore[arg-type]
+        logger.info("simulate.odds_refreshed", rows=n)  # type: ignore[attr-defined]
+        return n
+    except Exception as exc:  # noqa: BLE001 - odds refresh must never break the sim
+        logger.warning("simulate.odds_refresh_failed", error=str(exc))  # type: ignore[attr-defined]
+        return -1
+
+
 def run_tournament_simulation(
-    n_sims: int = 100_000, with_context: bool = False, live: bool = False
+    n_sims: int = 100_000,
+    with_context: bool = False,
+    live: bool = False,
+    refresh_odds: bool = False,
 ) -> None:
     """CLI entrypoint: load fitted artifacts + 2026 structure and simulate.
 
     Requires a trained Dixon-Coles artifact (``polymbappe train``); writes per-team
-    stage-reaching and group-finish probabilities to ``data/outputs``.
+    stage-reaching and group-finish probabilities to ``data/outputs``. When ``refresh_odds``
+    (or ``live``) is set, the latest market odds are re-pulled after fixtures are written so
+    the edge artifact reflects the current market — the hook the live agent uses on re-runs.
     """
-
-    _ = live  # reserved: live re-estimation hook
 
     import structlog
 
@@ -479,6 +501,9 @@ def run_tournament_simulation(
     result.stage_probabilities().write_parquet(out / "stage_probabilities.parquet")
     result.group_probabilities().write_parquet(out / "group_probabilities.parquet")
     predictions.write_parquet(out / "match_predictions.parquet")
+    # Refresh odds AFTER fixtures are written so Polymarket can align to them, then edges.
+    if refresh_odds or live:
+        refresh_market_odds(settings, logger)
     _write_edges(predictions, settings, logger).write_parquet(out / "edges.parquet")
     print(result.stage_probabilities().head(15))
 
