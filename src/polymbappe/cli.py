@@ -7,7 +7,7 @@ from datetime import date
 import typer
 
 from polymbappe.data.ingest import ingest_all_sources
-from polymbappe.eval.backtest import run_walk_forward_backtest
+from polymbappe.eval.backtest import run_bayesian_ab, run_walk_forward_backtest
 from polymbappe.eval.market import compare_model_to_market
 from polymbappe.eval.report import generate_report
 from polymbappe.features.pipeline import build_feature_matrix
@@ -37,10 +37,15 @@ def features_command(
 
 
 @app.command("train")
-def train_command(model: str | None = typer.Option(None, help="Fit a single model only.")) -> None:
+def train_command(
+    model: str | None = typer.Option(None, help="Fit a single model only."),
+    bayesian: bool = typer.Option(
+        False, "--bayesian", help="Also fit/stack the (expensive) Bayesian hierarchical DC model."
+    ),
+) -> None:
     """Train forecasting models."""
 
-    train_models(model=model)
+    train_models(model=model, bayesian=bayesian)
 
 
 @app.command("simulate")
@@ -67,6 +72,13 @@ def backtest_command(format_version: int = 2026) -> None:
 
     _ = format_version
     run_walk_forward_backtest()
+
+
+@app.command("bayesian-ab")
+def bayesian_ab_command() -> None:
+    """Run the Bayesian kill-criterion A/B (LOTO backtest with vs without Bayesian)."""
+
+    run_bayesian_ab()
 
 
 @app.command("edges")

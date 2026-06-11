@@ -38,6 +38,7 @@ logger = structlog.get_logger(__name__)
 
 _ARTIFACT_FILES = {
     "dixon_coles": "model_dixon_coles.pkl",
+    "bayesian": "model_bayesian.pkl",
     "ensemble_calibration": "ensemble_calibration.pkl",
     "ensemble_edge": "ensemble_edge.pkl",
     "contextual_adjuster": "contextual_adjuster.pkl",
@@ -52,6 +53,7 @@ class TrainArtifacts:
     calibration: Ensemble
     edge: Ensemble
     adjuster: object | None = None
+    bayesian: object | None = None
     stacked_frame: pl.DataFrame = field(default_factory=pl.DataFrame)
 
 
@@ -135,6 +137,23 @@ def _all_history_dixon_coles(
     return DixonColesModel(base_config.dixon_coles).fit(matches=obs)
 
 
+def _all_history_bayesian(matches: pl.DataFrame, base_config: BaseProbConfig) -> object:
+    """Fit the Bayesian hierarchical DC model on *all* history (the simulator's CI source).
+
+    Forward-looking (2026), not a backtest fold, so — like ``_all_history_dixon_coles`` —
+    there is no leakage concern. Persisted as ``model_bayesian.pkl`` so the simulator can
+    emit per-fixture credible intervals for the edge pipeline.
+    """
+
+    from polymbappe.eval.base_probs import matches_to_observations
+    from polymbappe.models.bayesian_dc import BayesianDixonColesModel
+
+    reference = matches["date"].max()
+    assert isinstance(reference, date)
+    obs = matches_to_observations(matches, reference)
+    return BayesianDixonColesModel(base_config.bayesian).fit(matches=obs)
+
+
 def _fit_contextual_adjuster(
     frame: pl.DataFrame, calibration: Ensemble, context_features: pl.DataFrame
 ) -> object | None:
@@ -177,12 +196,21 @@ def train_full_stack(
         int(frame.select(["mkt_home", "mkt_draw", "mkt_away"]).null_count().sum_horizontal()[0])
         == 0
     )
+    has_bay = (
+        base_config.use_bayesian
+        and all(c in frame.columns for c in BASE_GROUPS["bay"])
+        and int(frame.select(list(BASE_GROUPS["bay"])).null_count().sum_horizontal()[0]) == 0
+    )
 
     # Attach core features and stack a GBM over them + the base-probability groups. The
     # edge pipeline drops market columns (see ``Ensemble._gbm_columns``) for a true
     # market-blind GBM. Falls back to the linear stack if lightgbm is unavailable.
     frame, core_cols = _attach_core_features(frame, matches, team_xg)
-    base_groups = ("dc", "elo", "mkt") if has_market else ("dc", "elo")
+    base_groups = tuple(
+        g
+        for g, present in (("dc", True), ("bay", has_bay), ("elo", True), ("mkt", has_market))
+        if present
+    )
     gbm_cols = [c for g in base_groups for c in BASE_GROUPS[g] if c in frame.columns] + core_cols
     gbm_available = importlib.util.find_spec("lightgbm") is not None
     if core_cols and not gbm_available:
@@ -196,6 +224,7 @@ def train_full_stack(
     calibration.fit(frame)
     edge.fit(frame)
     dc = _all_history_dixon_coles(matches, base_config)
+    bayesian = _all_history_bayesian(matches, base_config) if base_config.use_bayesian else None
 
     adjuster: object | None = None
     if fit_contextual:
@@ -208,7 +237,12 @@ def train_full_stack(
             logger.warning("train.context_skip", error=str(exc))
 
     return TrainArtifacts(
-        dixon_coles=dc, calibration=calibration, edge=edge, adjuster=adjuster, stacked_frame=frame
+        dixon_coles=dc,
+        calibration=calibration,
+        edge=edge,
+        adjuster=adjuster,
+        bayesian=bayesian,
+        stacked_frame=frame,
     )
 
 
@@ -224,6 +258,8 @@ def persist_artifacts(artifacts: TrainArtifacts, settings: Settings | None = Non
     }
     if artifacts.adjuster is not None:
         mapping["contextual_adjuster"] = artifacts.adjuster
+    if artifacts.bayesian is not None:
+        mapping["bayesian"] = artifacts.bayesian
     for key, obj in mapping.items():
         path = settings.processed_data_dir / _ARTIFACT_FILES[key]
         with path.open("wb") as fh:
@@ -240,12 +276,14 @@ def load_artifact(name: str, settings: Settings | None = None) -> object:
         return pickle.load(fh)
 
 
-def train_models(model: str | None = None) -> None:
+def train_models(model: str | None = None, *, bayesian: bool = False) -> None:
     """CLI entrypoint: fit the full stack over stored matches and persist artifacts.
 
     Args:
         model: Optional single model to fit (currently ``"dixon_coles"`` only); when
             ``None`` the full dual-pipeline stack is fit.
+        bayesian: Opt-in to fit and stack the (expensive) Bayesian hierarchical DC model,
+            persisting ``model_bayesian.pkl`` so the simulator can emit credible intervals.
     """
 
     from polymbappe.data.store import read_table, table_exists
@@ -272,6 +310,9 @@ def train_models(model: str | None = None) -> None:
         logger.info("train.persisted", artifact="dixon_coles", path=str(path))
         return
 
-    artifacts = train_full_stack(matches, market_odds=market_odds, team_xg=team_xg)
+    base_config = BaseProbConfig(use_bayesian=bayesian)
+    artifacts = train_full_stack(
+        matches, base_config=base_config, market_odds=market_odds, team_xg=team_xg
+    )
     persist_artifacts(artifacts, settings)
-    logger.info("train.done", rows=artifacts.stacked_frame.height)
+    logger.info("train.done", rows=artifacts.stacked_frame.height, bayesian=bayesian)

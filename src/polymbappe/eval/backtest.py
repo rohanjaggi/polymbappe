@@ -27,6 +27,7 @@ logger = structlog.get_logger(__name__)
 _LABEL_TO_IDX = {label: idx for idx, label in enumerate(OUTCOMES)}
 
 _DC_COLS = ["dc_home", "dc_draw", "dc_away"]
+_BAY_COLS = ["bay_home", "bay_draw", "bay_away"]
 _ELO_COLS = ["elo_home", "elo_draw", "elo_away"]
 _MKT_COLS = ["mkt_home", "mkt_draw", "mkt_away"]
 
@@ -91,6 +92,14 @@ def _has_market(df: pl.DataFrame) -> bool:
     if not set(_MKT_COLS).issubset(df.columns):
         return False
     return int(df.select(_MKT_COLS).null_count().sum_horizontal()[0]) == 0
+
+
+def _has_bay(df: pl.DataFrame) -> bool:
+    """Whether a base-prob frame carries complete (non-null) Bayesian columns."""
+
+    if not set(_BAY_COLS).issubset(df.columns):
+        return False
+    return int(df.select(_BAY_COLS).null_count().sum_horizontal()[0]) == 0
 
 
 def _metrics(labels: list[str], y_prob: np.ndarray) -> dict[str, float]:
@@ -158,10 +167,23 @@ def run_leave_one_tournament_out(
             f"found {len(per_tournament_probs)}."
         )
 
-    # Use the market features only if every tournament has non-null market odds.
+    # Use the market features only if every tournament has non-null market odds; likewise
+    # stack the Bayesian group only when ``use_bayesian`` produced complete bay_* columns.
     use_market = all(_has_market(df) for df in per_tournament_probs.values())
-    feature_cols = _DC_COLS + _ELO_COLS + (_MKT_COLS if use_market else [])
-    base_groups = ("dc", "elo", "mkt") if use_market else ("dc", "elo")
+    use_bay = base_config.use_bayesian and all(
+        _has_bay(df) for df in per_tournament_probs.values()
+    )
+    feature_cols = (
+        _DC_COLS
+        + (_BAY_COLS if use_bay else [])
+        + _ELO_COLS
+        + (_MKT_COLS if use_market else [])
+    )
+    base_groups = tuple(
+        g
+        for g, present in (("dc", True), ("bay", use_bay), ("elo", True), ("mkt", use_market))
+        if present
+    )
     # GBM stacks over the base-model H/D/A outputs (the only features the base-prob frame
     # carries); its OOF predictions then enter the meta-learner.
     ensemble_config = replace(ensemble_config, base_groups=base_groups, market_blind=False)
@@ -248,3 +270,112 @@ def run_walk_forward_backtest() -> None:
     print(f"Features: {', '.join(result.feature_columns)}")
     print(result.to_frame().sort("tournament"))
     print(f"Mean RPS: {result.mean_rps:.4f}")
+
+
+@dataclass(slots=True)
+class BayesianABResult:
+    """Outcome of the Bayesian-vs-MLE-only kill-criterion A/B (spec 8.1 table)."""
+
+    without_bayesian: BacktestResult
+    with_bayesian: BacktestResult
+    delta: float  # positive => Bayesian improves mean RPS
+    min_delta: float
+    wins: int  # tournaments where the Bayesian ensemble beats the MLE-only one
+    n_tournaments: int
+    keep_bayesian: bool  # spec rule: improves mean RPS by > min_delta
+    gate_decision: str  # stricter autotuner gate (delta AND >=3 tournament wins)
+
+
+def compare_bayesian_ab(
+    matches: pl.DataFrame,
+    tournaments: tuple[Tournament, ...] = DEFAULT_TOURNAMENTS,
+    *,
+    base_config: BaseProbConfig | None = None,
+    ensemble_config: EnsembleConfig | None = None,
+    contextual_config: ContextualAdjusterConfig | None = None,
+    market_odds: pl.DataFrame | None = None,
+    gate: object | None = None,
+) -> BayesianABResult:
+    """Measure the Bayesian kill criterion: run the LOTO backtest with and without it.
+
+    Runs the leave-one-tournament-out backtest exactly twice — ``use_bayesian=False`` then
+    ``True`` — and applies the +0.003-RPS acceptance gate (the single source of truth in
+    :class:`~polymbappe.tune.leaderboard.AcceptanceGate`). ``keep_bayesian`` implements the
+    spec 8.1 rule directly (drop the Bayesian model unless it improves mean RPS by more than
+    ``min_delta``); ``gate_decision`` reports the stricter autotuner gate that also requires
+    winning >=3 individual tournaments. This is a standalone harness and never runs inside
+    the autotuner's per-trial TPE loop, so the 2 h budget is untouched.
+    """
+
+    from polymbappe.tune.leaderboard import AcceptanceGate
+    from polymbappe.tune.objective import ExperimentMetrics
+
+    base_config = base_config or BaseProbConfig()
+    gate = gate or AcceptanceGate()
+
+    without = run_leave_one_tournament_out(
+        matches,
+        tournaments,
+        base_config=replace(base_config, use_bayesian=False),
+        ensemble_config=ensemble_config,
+        contextual_config=contextual_config,
+        market_odds=market_odds,
+    )
+    with_bay = run_leave_one_tournament_out(
+        matches,
+        tournaments,
+        base_config=replace(base_config, use_bayesian=True),
+        ensemble_config=ensemble_config,
+        contextual_config=contextual_config,
+        market_odds=market_odds,
+    )
+
+    delta = without.mean_rps - with_bay.mean_rps  # positive => Bayesian is better
+    wins = sum(
+        1
+        for name, metrics in with_bay.per_tournament.items()
+        if name in without.per_tournament
+        and metrics["rps"] < without.per_tournament[name]["rps"]
+    )
+
+    def _metrics_of(result: BacktestResult) -> ExperimentMetrics:
+        return ExperimentMetrics(
+            mean_rps=result.mean_rps,
+            per_tournament={k: v["rps"] for k, v in result.per_tournament.items()},
+            feature_columns=result.feature_columns,
+        )
+
+    decision = gate.decide(_metrics_of(with_bay), _metrics_of(without))
+    return BayesianABResult(
+        without_bayesian=without,
+        with_bayesian=with_bay,
+        delta=delta,
+        min_delta=gate.min_delta,
+        wins=wins,
+        n_tournaments=len(with_bay.per_tournament),
+        keep_bayesian=delta > gate.min_delta,
+        gate_decision=decision,
+    )
+
+
+def run_bayesian_ab() -> None:
+    """CLI entrypoint: run the Bayesian kill-criterion A/B over stored matches and report."""
+
+    from polymbappe.config import Settings
+    from polymbappe.data.store import read_table, table_exists
+    from polymbappe.data.tables import Table
+
+    settings = Settings()
+    matches = read_table(Table.MATCHES, settings)
+    market_odds = (
+        read_table(Table.MARKET_ODDS, settings)
+        if table_exists(Table.MARKET_ODDS, settings)
+        else None
+    )
+    ab = compare_bayesian_ab(matches, market_odds=market_odds)
+    print(f"Mean RPS without Bayesian: {ab.without_bayesian.mean_rps:.4f}")
+    print(f"Mean RPS with Bayesian:    {ab.with_bayesian.mean_rps:.4f}")
+    print(f"Delta (improvement):       {ab.delta:+.4f}  (threshold > {ab.min_delta})")
+    print(f"Tournament wins:           {ab.wins}/{ab.n_tournaments}")
+    print(f"Keep Bayesian (spec 8.1):  {ab.keep_bayesian}")
+    print(f"Autotuner gate decision:   {ab.gate_decision}")

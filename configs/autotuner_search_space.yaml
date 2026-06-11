@@ -9,8 +9,11 @@
 # exercise are deliberately *omitted* so TPE never wastes trials on inert dimensions:
 #   * bayesian.*        - the PyMC hierarchical model is NUTS-sampled per tournament; fit
 #                         per-trial across the leave-one-tournament-out loop it would turn
-#                         a 2 h run into days. It is exercised via models.train /
-#                         standalone evaluation, not the TPE loop.
+#                         a 2 h run into days. It is deliberately excluded from the TPE loop
+#                         and instead exercised via `models.train --bayesian` (stacks bay_*
+#                         into the ensemble, persists model_bayesian.pkl) and the standalone
+#                         `polymbappe bayesian-ab` kill-criterion A/B (eval.backtest.
+#                         compare_bayesian_ab), which measures the +0.003 RPS gate.
 #   * features.xg_window - only feeds the core FeaturePipeline; the base-probability path
 #                         the backtest stacks on does not build rolling-xG features.
 #   * contextual.toggle_{ppda,cohesion,manager,fatigue} - not in the runtime contextual

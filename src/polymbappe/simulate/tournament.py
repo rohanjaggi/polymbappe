@@ -330,6 +330,8 @@ def compute_match_predictions(
     structure: TournamentStructure,
     model: StrengthModel,
     context_hook: ContextHook | None = None,
+    bayesian_model: object | None = None,
+    credible_level: float = 0.9,
 ) -> pl.DataFrame:
     """Per group-stage fixture H/D/A probabilities and expected scoreline (spec 11).
 
@@ -338,8 +340,14 @@ def compute_match_predictions(
     ``2026__home__away`` convention so externally-ingested 2026 market odds keyed the same
     way join cleanly for edge detection.
 
+    When ``bayesian_model`` is supplied, six ``ci_*_low``/``ci_*_high`` credible-interval
+    columns are appended from its posterior, feeding the edge pipeline's credible-interval
+    test (spec 3.6). The point ``model_*`` probabilities stay the production point estimate;
+    the credible band is the Bayesian base model's posterior uncertainty — a principled
+    model-based proxy, not a literal interval around the point estimate.
+
     Returns columns ``match_id, group, home_team, away_team, model_home, model_draw,
-    model_away, exp_home_goals, exp_away_goals``.
+    model_away, exp_home_goals, exp_away_goals`` (plus ``ci_*`` when Bayesian is supplied).
     """
 
     grid = np.arange(model.max_goals + 1)
@@ -351,19 +359,32 @@ def compute_match_predictions(
                 model.score_matrix(home, away, neutral=True), home, away, context_hook
             )
             h, d, a = hda_marginals(matrix)
-            rows.append(
-                {
-                    "match_id": f"2026__{home}__{away}",
-                    "group": group,
-                    "home_team": home,
-                    "away_team": away,
-                    "model_home": h,
-                    "model_draw": d,
-                    "model_away": a,
-                    "exp_home_goals": float((matrix.sum(axis=1) * grid).sum()),
-                    "exp_away_goals": float((matrix.sum(axis=0) * grid).sum()),
-                }
-            )
+            row: dict[str, object] = {
+                "match_id": f"2026__{home}__{away}",
+                "group": group,
+                "home_team": home,
+                "away_team": away,
+                "model_home": h,
+                "model_draw": d,
+                "model_away": a,
+                "exp_home_goals": float((matrix.sum(axis=1) * grid).sum()),
+                "exp_away_goals": float((matrix.sum(axis=0) * grid).sum()),
+            }
+            if bayesian_model is not None:
+                ci = bayesian_model.credible_interval(
+                    home, away, neutral_site=True, level=credible_level
+                )
+                row.update(
+                    {
+                        "ci_home_low": ci["home_win"][0],
+                        "ci_home_high": ci["home_win"][1],
+                        "ci_draw_low": ci["draw"][0],
+                        "ci_draw_high": ci["draw"][1],
+                        "ci_away_low": ci["away_win"][0],
+                        "ci_away_high": ci["away_win"][1],
+                    }
+                )
+            rows.append(row)
     return pl.DataFrame(rows)
 
 
@@ -488,13 +509,24 @@ def run_tournament_simulation(
 
     model = StrengthModel.from_dixon_coles(dc, hosts=HOSTS_2026)
 
+    # Optional Bayesian credible intervals for the edge pipeline (spec 3.6): used when a
+    # ``model_bayesian.pkl`` artifact exists (written by `train --bayesian`).
+    bayesian_model: object | None = None
+    try:
+        bayesian_model = load_artifact("bayesian", settings)
+        logger.info("simulate.bayesian", status="loaded; emitting credible intervals")
+    except FileNotFoundError:
+        logger.info("simulate.bayesian", status="no artifact; point edges only")
+
     # Optional contextual injection: load the fitted adjuster and build a per-match hook.
     context_hook: ContextHook | None = None
     if with_context:
         context_hook = _load_context_hook(settings, structure, elo, logger)
 
     result = simulate_tournament(structure, model, n_sims=n_sims, context_hook=context_hook)
-    predictions = compute_match_predictions(structure, model, context_hook)
+    predictions = compute_match_predictions(
+        structure, model, context_hook, bayesian_model=bayesian_model
+    )
 
     settings.outputs_data_dir.mkdir(parents=True, exist_ok=True)
     out = settings.outputs_data_dir
@@ -556,22 +588,43 @@ def _load_context_hook(
     return hook
 
 
+_CI_COLS = (
+    "ci_home_low", "ci_home_high", "ci_draw_low", "ci_draw_high", "ci_away_low", "ci_away_high",
+)
+
+
 def _write_edges(
     predictions: pl.DataFrame, settings: object, logger: object
 ) -> pl.DataFrame:
-    """Compute market edges for the fixtures, or an empty edge table if no market odds."""
+    """Compute market edges for the fixtures, or an empty edge table if no market odds.
+
+    When the predictions carry Bayesian credible-interval columns, the stricter
+    credible-interval edge test (spec 3.6) is applied — a divergence is flagged only if the
+    Bayesian credible interval also excludes the market probability — and the output gains
+    ``ci_low``/``ci_high`` columns. Otherwise the point-only edge test is used.
+    """
 
     from polymbappe.data.store import read_table, table_exists
     from polymbappe.data.tables import Table
-    from polymbappe.eval.market import compute_edges
+    from polymbappe.eval.market import compute_credible_edges, compute_edges
 
-    empty = pl.DataFrame(
-        schema={
-            "match_id": pl.Utf8, "outcome": pl.Utf8, "model_prob": pl.Float64,
-            "market_prob": pl.Float64, "edge": pl.Float64, "edge_bps": pl.Float64,
-            "kelly_fraction": pl.Float64,
-        }
-    )
+    has_ci = all(c in predictions.columns for c in _CI_COLS)
+    if has_ci:
+        empty = pl.DataFrame(
+            schema={
+                "match_id": pl.Utf8, "outcome": pl.Utf8, "model_prob": pl.Float64,
+                "market_prob": pl.Float64, "ci_low": pl.Float64, "ci_high": pl.Float64,
+                "edge": pl.Float64, "edge_bps": pl.Float64, "kelly_fraction": pl.Float64,
+            }
+        )
+    else:
+        empty = pl.DataFrame(
+            schema={
+                "match_id": pl.Utf8, "outcome": pl.Utf8, "model_prob": pl.Float64,
+                "market_prob": pl.Float64, "edge": pl.Float64, "edge_bps": pl.Float64,
+                "kelly_fraction": pl.Float64,
+            }
+        )
     if not table_exists(Table.MARKET_ODDS, settings):  # type: ignore[arg-type]
         logger.info("simulate.edges", status="no market_odds ingested; empty edges")  # type: ignore[attr-defined]
         return empty
@@ -585,8 +638,14 @@ def _write_edges(
         matched_fixtures=matched.height,
         hint=hint,
     )
-    edges = compute_edges(
-        predictions.select("match_id", "model_home", "model_draw", "model_away"), market
-    )
-    logger.info("simulate.edges", status="computed", n=edges.height)  # type: ignore[attr-defined]
+    if has_ci:
+        edges = compute_credible_edges(
+            predictions.select("match_id", "model_home", "model_draw", "model_away", *_CI_COLS),
+            market,
+        )
+    else:
+        edges = compute_edges(
+            predictions.select("match_id", "model_home", "model_draw", "model_away"), market
+        )
+    logger.info("simulate.edges", status="computed", n=edges.height, credible=has_ci)  # type: ignore[attr-defined]
     return edges
