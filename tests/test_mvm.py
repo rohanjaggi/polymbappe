@@ -1,4 +1,5 @@
 from datetime import date, timedelta
+from pathlib import Path
 
 import numpy as np
 import polars as pl
@@ -138,6 +139,96 @@ def test_backtest_full_stack_gbm_and_contextual() -> None:
     assert set(result.per_tournament) == {"WC2016", "EU2018", "CA2020"}
     for metrics in result.per_tournament.values():
         assert 0.0 <= metrics["rps"] <= 1.2
+    assert np.isfinite(result.mean_rps)
+
+
+def _write_backtest_context_tables(settings) -> None:
+    """Squads + manager records for the three backtest tournaments (every team)."""
+
+    from polymbappe.data.store import write_table
+    from polymbappe.data.tables import Table
+
+    squad_rows: list[dict[str, object]] = []
+    record_rows: list[dict[str, object]] = []
+    for order, t in enumerate(TOURNAMENTS, start=1):
+        for team in TEAMS:
+            for p, club in enumerate(("City", "City", "Madrid")):
+                squad_rows.append(
+                    {
+                        "team": team, "tournament": t.name, "player": f"{team}p{p}",
+                        "club": club, "age": 27.0 + p,
+                    }
+                )
+            record_rows.append(
+                {
+                    "manager": f"mgr{team}", "team": team, "tournament": t.name,
+                    "stage_reached": "FINAL", "knockout_matches": 6, "knockout_wins": 5,
+                    "tournament_order": order,
+                }
+            )
+    write_table(Table.SQUADS, pl.DataFrame(squad_rows), settings=settings)
+    write_table(Table.MANAGER_RECORDS, pl.DataFrame(record_rows), settings=settings)
+
+
+def test_prepare_contextual_wires_cohesion_and_manager_groups(tmp_path, monkeypatch) -> None:
+    """Contextual-on smoke over real squads/manager data: groups wired + columns joined.
+
+    ``_prepare_contextual`` / ``run_leave_one_tournament_out`` read the ``squads`` /
+    ``manager_records`` tables through the *default* ``Settings`` (relative ``data/``), so
+    we ``chdir`` into a tmp dir and materialize the tables there. Asserts the contextual
+    layer engages, the returned ``feature_groups`` include cohesion + manager, those
+    columns are actually joined onto the per-tournament frames with real non-zero data, and
+    the full backtest runs without crashing.
+    """
+
+    from polymbappe.config import Settings
+    from polymbappe.eval.backtest import _prepare_contextual
+
+    monkeypatch.chdir(tmp_path)
+    settings = Settings()
+    assert settings.data_dir == Path("data")  # relative -> resolves under cwd (tmp)
+    _write_backtest_context_tables(settings)
+
+    configs = config_to_configs(
+        {
+            "contextual.enable_contextual_layer": True,
+            "contextual.toggle_cohesion": True,
+            "contextual.toggle_manager": True,
+        }
+    )
+    matches = _make_matches()
+    sorted_tournaments = sorted(TOURNAMENTS, key=lambda t: t.start)
+    per_tournament_probs = {
+        t.name: compute_tournament_base_probs(
+            matches.filter(pl.col("date") < t.start),
+            select_fixtures(matches, t),
+            tournament=t.name,
+            config=configs.base,
+        )
+        for t in sorted_tournaments
+    }
+
+    enabled, feature_groups = _prepare_contextual(
+        matches, sorted_tournaments, per_tournament_probs, configs.contextual
+    )
+    assert enabled is True
+    assert "cohesion" in feature_groups
+    assert "manager" in feature_groups
+    # The cohesion/manager columns are joined with real non-zero data (not just present).
+    joined = per_tournament_probs[sorted_tournaments[1].name]
+    assert "home_club_cluster_index" in joined.columns
+    assert joined.filter(pl.col("home_club_cluster_index") != 0.0).height > 0
+    assert joined.filter(pl.col("home_knockout_win_rate") != 0.0).height > 0
+
+    # End-to-end backtest with the contextual layer on runs and scores finitely.
+    result = run_leave_one_tournament_out(
+        matches,
+        TOURNAMENTS,
+        base_config=configs.base,
+        ensemble_config=configs.ensemble,
+        contextual_config=configs.contextual,
+    )
+    assert set(result.per_tournament) == {"WC2016", "EU2018", "CA2020"}
     assert np.isfinite(result.mean_rps)
 
 

@@ -277,8 +277,186 @@ def _parse_transfermarkt_squad(
     return rows
 
 
+#: Wikipedia "<tournament> squads" article per internal ``Tournament.name``. These pages
+#: list every nation's call-up (player, club, date-of-birth/age) and are the **fallback**
+#: squad source when Transfermarkt is unavailable (blocked / no ``tm_id``). Extend as new
+#: tournaments are added; an entry can also be overridden per-team via the squads manifest.
+WIKIPEDIA_SQUADS_PAGES: dict[str, str] = {
+    "WC2010": "2010 FIFA World Cup squads",
+    "WC2014": "2014 FIFA World Cup squads",
+    "WC2018": "2018 FIFA World Cup squads",
+    "WC2022": "2022 FIFA World Cup squads",
+    "WC2026": "2026 FIFA World Cup squads",
+    "EU2016": "UEFA Euro 2016 squads",
+    "EU2020": "UEFA Euro 2020 squads",
+    "EU2024": "UEFA Euro 2024 squads",
+    "CA2016": "Copa América Centenario squads",
+    "CA2019": "2019 Copa América squads",
+    "CA2021": "2021 Copa América squads",
+    "CA2024": "2024 Copa América squads",
+}
+
 #: MediaWiki API endpoint used to pull a manager's article wikitext for tenure parsing.
 WIKIPEDIA_API_URL = "https://en.wikipedia.org/w/api.php"
+
+
+def fetch_wikipedia_squad(
+    tournament: str,
+    team: str,
+    *,
+    settings: Settings | None = None,
+    page: str | None = None,
+    api_url: str = WIKIPEDIA_API_URL,
+    min_interval: float = 1.0,
+    timeout: float = 20.0,
+) -> list[dict[str, object]]:
+    """Fetch one team's call-up from the Wikipedia "<tournament> squads" page.
+
+    Fallback squad source for :func:`fetch_transfermarkt_squad` — same output shape
+    (``{"player", "club", "age", "team", "tournament"}`` rows). The rendered article HTML
+    (MediaWiki ``action=parse``) is fetched through :func:`cached_get`, then the section
+    whose heading matches ``team`` and its squad table are parsed. Any fetch/parse failure
+    logs and returns ``[]`` (graceful degrade), so a layout change or a missing page degrades
+    to "no rows" rather than raising.
+
+    Args:
+        tournament: ``Tournament.name`` (e.g. ``"WC2022"``); selects the page via
+            :data:`WIKIPEDIA_SQUADS_PAGES` unless ``page`` is given.
+        team: Section heading to match (English Wikipedia name; canonicalized at ingest).
+        page: Explicit article title override (e.g. from the squads manifest).
+        min_interval: Per-host throttle seconds (pass ``0`` in tests).
+    """
+
+    from urllib.parse import urlencode
+
+    page = page or WIKIPEDIA_SQUADS_PAGES.get(tournament)
+    if not page:
+        logger.warning(
+            "sources.wikipedia_squad.no_page", team=team, tournament=tournament,
+            reason="no page override and tournament not in WIKIPEDIA_SQUADS_PAGES",
+        )
+        return []
+
+    params = {
+        "action": "parse",
+        "page": page,
+        "prop": "text",
+        "format": "json",
+        "formatversion": "2",
+        "redirects": "1",
+    }
+    url = f"{api_url}?{urlencode(params)}"
+    try:
+        body = cached_get(
+            url, settings=settings, timeout=timeout, min_interval=min_interval
+        ).decode("utf-8", errors="replace")
+    except Exception as exc:  # noqa: BLE001 - network isolated, degrade to empty
+        logger.warning("sources.wikipedia_squad.fetch_failed", team=team, page=page, error=str(exc))
+        return []
+
+    try:
+        import json
+
+        html = json.loads(body).get("parse", {}).get("text", "")
+        if isinstance(html, dict):  # formatversion=1 shape: {"*": "<html>"}
+            html = html.get("*", "")
+        return _parse_wikipedia_squad(str(html), team=team, tournament=tournament)
+    except Exception as exc:  # noqa: BLE001 - brittle parse isolated
+        logger.warning("sources.wikipedia_squad.parse_failed", team=team, page=page, error=str(exc))
+        return []
+
+
+def _norm_heading(text: str) -> str:
+    """Lowercase + collapse whitespace, for loose squad-section heading matching."""
+
+    return " ".join(text.split()).strip().lower()
+
+
+def _cell_text(cells: list, idx: int | None) -> str:
+    """Meaningful text of ``cells[idx]``, or ``""`` when out of range.
+
+    Wikipedia squad cells often lead with a flag-icon anchor whose text is empty (e.g. the
+    Club cell is ``<flag link><club link>``), so the LAST non-empty, non-reference anchor is
+    taken; cells with no usable anchor fall back to their full stripped text.
+    """
+
+    if idx is None or idx >= len(cells):
+        return ""
+    cell = cells[idx]
+    texts = [
+        t
+        for a in cell.find_all("a")
+        if (t := a.get_text(strip=True)) and not t.startswith("[")
+    ]
+    return texts[-1] if texts else cell.get_text(" ", strip=True)
+
+
+def _parse_wikipedia_squad(
+    html: str, *, team: str, tournament: str
+) -> list[dict[str, object]]:
+    """Parse one team's squad table out of a Wikipedia "squads" page's rendered HTML.
+
+    Selector-isolated helper for :func:`fetch_wikipedia_squad`. Finds the heading whose text
+    matches ``team``, takes the following squad table, locates the ``Player`` / ``Club`` /
+    date-of-birth columns from the header row, and reads each player row. ``age`` comes from
+    the ``(aged NN)`` annotation in the date-of-birth cell (``None`` when absent).
+    """
+
+    import re
+
+    soup = BeautifulSoup(html, "html.parser")
+
+    target = _norm_heading(team)
+    heading = next(
+        (
+            h
+            for h in soup.find_all(["h2", "h3", "h4"])
+            if _norm_heading(h.get_text()) == target
+        ),
+        None,
+    )
+    if heading is None:
+        return []
+    table = heading.find_next("table")
+    if table is None:
+        return []
+
+    header_cells = table.find("tr")
+    if header_cells is None:
+        return []
+    headers = [c.get_text(" ", strip=True).lower() for c in header_cells.find_all(["th", "td"])]
+
+    def _col(*needles: str) -> int | None:
+        for i, head in enumerate(headers):
+            if any(n in head for n in needles):
+                return i
+        return None
+
+    player_idx = _col("player")
+    club_idx = _col("club")
+    dob_idx = _col("date of birth", "birth")
+
+    rows: list[dict[str, object]] = []
+    for tr in header_cells.find_next_siblings("tr"):
+        cells = tr.find_all(["th", "td"])
+        if len(cells) != len(headers):
+            continue  # skip sub-rows / spanning rows that don't align to the header
+
+        player = _cell_text(cells, player_idx)
+        if not player:
+            continue
+        club = _cell_text(cells, club_idx) or None
+
+        age: float | None = None
+        if dob_idx is not None and dob_idx < len(cells):
+            match = re.search(r"aged\s*(\d{1,2})", cells[dob_idx].get_text(" ", strip=True))
+            if match:
+                age = float(match.group(1))
+
+        rows.append(
+            {"player": player, "club": club, "age": age, "team": team, "tournament": tournament}
+        )
+    return rows
 
 
 def fetch_wikipedia_manager_history(
@@ -357,13 +535,15 @@ def _parse_wikipedia_manager_history(
     rows: list[dict[str, object]] = []
     # Infobox managerial-career rows pair a years field with a club/team field, e.g.
     # | manageryears3 = 2018–2022 | managerclubs3 = [[England national football team|England]]
+    # The club value must capture the WHOLE wikilink (its display name follows a ``|``), so it
+    # runs to end-of-line rather than stopping at the first pipe.
     years = dict(re.findall(r"manageryears(\d*)\s*=\s*([^\n|]+)", wikitext))
-    clubs = dict(re.findall(r"managerclubs(\d*)\s*=\s*([^\n|]+)", wikitext))
+    clubs = dict(re.findall(r"managerclubs(\d*)\s*=\s*([^\n]+)", wikitext))
     for key, raw_years in years.items():
         raw_team = clubs.get(key)
         if not raw_team:
             continue
-        team = _wikilink_text(raw_team)
+        team = _clean_national_team(_wikilink_text(raw_team))
         span = re.search(r"(\d{4})\s*[–\-]\s*(\d{4})?", raw_years)
         if span is None:
             continue
@@ -391,6 +571,23 @@ def _wikilink_text(raw: str) -> str:
         inner = match.group(1)
         return inner.split("|")[-1].strip() if "|" in inner else inner.strip()
     return cleaned
+
+
+def _clean_national_team(name: str) -> str:
+    """Reduce a Wikipedia team link to the bare nation, e.g. ``France national football
+    team`` → ``France``, so it joins the ``matches`` table (canonicalized again at ingest).
+    An unpiped wikilink yields the long article title; a piped one already gives the nation.
+    """
+
+    import re
+
+    cleaned = re.sub(
+        r"\s+national\s+(football|soccer|association football)?\s*team$",
+        "",
+        name.strip(),
+        flags=re.IGNORECASE,
+    )
+    return cleaned.strip()
 
 
 def get_fbref_matches(
