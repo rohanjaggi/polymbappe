@@ -8,9 +8,12 @@ import polars as pl
 
 from polymbappe.config import Settings
 from polymbappe.data.ingest import (
+    derive_manager_records,
     ingest_all_sources,
     ingest_elo,
+    ingest_manager_records,
     ingest_market_odds,
+    ingest_squads,
     ingest_team_xg,
 )
 from polymbappe.data.store import read_table, table_exists
@@ -97,6 +100,194 @@ def test_ingest_team_xg_from_local(tmp_path: Path) -> None:
     xg = read_table(Table.TEAM_XG, settings)
     assert set(xg.columns) == set(TABLE_COLUMNS[Table.TEAM_XG])
     assert xg.row(0, named=True)["xg"] == 2.7
+
+
+def test_ingest_squads_from_local(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    (settings.raw_data_dir / "squads.csv").write_text(
+        "team,tournament,player,club,age\n"
+        "USA,WC2018,Christian Pulisic, Borussia Dortmund ,19\n"
+        "USA,WC2018,Weston McKennie,Schalke 04,20\n"
+        "Brazil,WC2018,Neymar,Paris Saint-Germain,26\n"
+    )
+    n = ingest_squads(settings)
+    assert n == 3
+    squads = read_table(Table.SQUADS, settings)
+    assert tuple(squads.columns) == TABLE_COLUMNS[Table.SQUADS]
+    assert squads.schema["age"] == pl.Float64
+    # team normalized via alias (USA -> United States) and club trimmed.
+    usa = squads.filter(pl.col("player") == "Christian Pulisic").row(0, named=True)
+    assert usa["team"] == "United States"
+    assert usa["club"] == "Borussia Dortmund"
+    assert "USA" not in set(squads["team"].to_list())
+
+
+def test_ingest_squads_skips_when_absent(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    assert ingest_squads(settings) == 0
+    assert not table_exists(Table.SQUADS, settings)
+
+
+# A trimmed-down clone of the Wikipedia "<tournament> squads" rendered-HTML shape: a team
+# heading followed by a squad table whose header row names the Player / Date of birth / Club
+# columns, plus a spanning sub-row that must be skipped.
+_WIKI_SQUADS_HTML = """
+<h3 id="Brazil"><span class="mw-headline">Brazil</span></h3>
+<p>Head coach: Someone</p>
+<table class="wikitable">
+  <tr><th>No.</th><th>Pos.</th><th>Player</th><th>Date of birth (age)</th>
+      <th>Caps</th><th>Club</th></tr>
+  <tr><td>1</td><td>GK</td><td><a href="/wiki/Alisson">Alisson</a></td>
+      <td>(1992-10-02) 2 October 1992 (aged 29)</td><td>50</td>
+      <td><span class="flagicon"><a href="/wiki/England"></a></span>
+          <a href="/wiki/Liverpool_F.C.">Liverpool</a></td></tr>
+  <tr><td colspan="6">Coach note spanning the whole row</td></tr>
+  <tr><td>10</td><td>FW</td><td><a href="/wiki/Neymar">Neymar</a></td>
+      <td>(1992-02-05) 5 February 1992 (aged 30)</td><td>120</td>
+      <td><a href="/wiki/Al_Hilal">Al Hilal</a></td></tr>
+</table>
+<h3 id="Serbia"><span class="mw-headline">Serbia</span></h3>
+<table class="wikitable">
+  <tr><th>No.</th><th>Player</th><th>Date of birth (age)</th><th>Club</th></tr>
+  <tr><td>1</td><td><a href="/wiki/Goalkeeper">Someone Else</a></td>
+      <td>(1990-01-01) 1 January 1990 (aged 32)</td>
+      <td><a href="/wiki/Club">Other Club</a></td></tr>
+</table>
+"""
+
+
+def test_parse_wikipedia_squad_extracts_player_club_age() -> None:
+    from polymbappe.data.sources import _parse_wikipedia_squad
+
+    rows = _parse_wikipedia_squad(_WIKI_SQUADS_HTML, team="Brazil", tournament="WC2022")
+    # Only Brazil's two players (the spanning sub-row is skipped; Serbia is a different section).
+    assert [r["player"] for r in rows] == ["Alisson", "Neymar"]
+    alisson = rows[0]
+    assert alisson["club"] == "Liverpool"
+    assert alisson["age"] == 29.0
+    assert alisson["team"] == "Brazil" and alisson["tournament"] == "WC2022"
+
+
+def test_fetch_wikipedia_squad_unknown_tournament_returns_empty() -> None:
+    from polymbappe.data import sources
+
+    # No page override and the tournament isn't in WIKIPEDIA_SQUADS_PAGES -> no network, [].
+    assert sources.fetch_wikipedia_squad("NOPE2099", "Brazil", min_interval=0) == []
+
+
+def test_scrape_squads_falls_back_to_wikipedia(tmp_path: Path, monkeypatch) -> None:
+    """When Transfermarkt yields nothing for a manifest team, Wikipedia is used instead."""
+
+    from polymbappe.data import ingest as ingest_mod
+
+    settings = _settings(tmp_path)
+    (settings.raw_data_dir / "squads_manifest.csv").write_text(
+        "tournament,team\nWC2022,Brazil\n"
+    )
+
+    tm_calls: list[tuple[str, str]] = []
+    wiki_calls: list[tuple[str, str]] = []
+
+    def _fake_tm(tournament, team, **kwargs):
+        tm_calls.append((tournament, team))
+        return []  # Transfermarkt unavailable
+
+    def _fake_wiki(tournament, team, **kwargs):
+        wiki_calls.append((tournament, team))
+        return [{"player": "Neymar", "club": "Al Hilal", "age": 30.0,
+                 "team": team, "tournament": tournament}]
+
+    monkeypatch.setattr(ingest_mod.sources, "fetch_transfermarkt_squad", _fake_tm)
+    monkeypatch.setattr(ingest_mod.sources, "fetch_wikipedia_squad", _fake_wiki)
+
+    n = ingest_squads(settings)
+    assert n == 1
+    assert tm_calls == [("WC2022", "Brazil")]  # tried Transfermarkt first
+    assert wiki_calls == [("WC2022", "Brazil")]  # then fell back to Wikipedia
+    squads = read_table(Table.SQUADS, settings)
+    assert squads.row(0, named=True)["player"] == "Neymar"
+
+
+def test_scrape_squads_prefers_transfermarkt(tmp_path: Path, monkeypatch) -> None:
+    """When Transfermarkt returns rows, Wikipedia is not consulted."""
+
+    from polymbappe.data import ingest as ingest_mod
+
+    settings = _settings(tmp_path)
+    (settings.raw_data_dir / "squads_manifest.csv").write_text(
+        "tournament,team,tm_id\nWC2022,Brazil,3439\n"
+    )
+    wiki_called = False
+
+    def _fake_tm(tournament, team, **kwargs):
+        return [{"player": "Casemiro", "club": "Manchester United", "age": 30.0,
+                 "team": team, "tournament": tournament}]
+
+    def _fake_wiki(*args, **kwargs):
+        nonlocal wiki_called
+        wiki_called = True
+        return []
+
+    monkeypatch.setattr(ingest_mod.sources, "fetch_transfermarkt_squad", _fake_tm)
+    monkeypatch.setattr(ingest_mod.sources, "fetch_wikipedia_squad", _fake_wiki)
+
+    assert ingest_squads(settings) == 1
+    assert wiki_called is False
+
+
+def test_ingest_manager_records_from_local(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    (settings.raw_data_dir / "manager_records.csv").write_text(
+        "manager,team,tournament,stage_reached,knockout_matches,knockout_wins,tournament_order\n"
+        "Gregg Berhalter,USA,WC2022,R16,1,0,3\n"
+        "Tite,Brazil,WC2018,QF,2,1,2\n"
+    )
+    n = ingest_manager_records(settings)
+    assert n == 2
+    records = read_table(Table.MANAGER_RECORDS, settings)
+    assert tuple(records.columns) == TABLE_COLUMNS[Table.MANAGER_RECORDS]
+    assert records.schema["knockout_matches"] == pl.Int64
+    assert records.schema["tournament_order"] == pl.Int64
+    usa = records.filter(pl.col("manager") == "Gregg Berhalter").row(0, named=True)
+    assert usa["team"] == "United States"  # alias normalized
+    assert "USA" not in set(records["team"].to_list())
+
+
+def test_ingest_manager_records_skips_when_absent(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    assert ingest_manager_records(settings) == 0
+    assert not table_exists(Table.MANAGER_RECORDS, settings)
+
+
+def test_derive_manager_records_from_matches() -> None:
+    from datetime import date
+
+    from polymbappe.eval.backtest import Tournament
+
+    tours = (Tournament("WC2018", "FIFA World Cup", date(2018, 6, 14), date(2018, 7, 15)),)
+    matches = pl.DataFrame(
+        {
+            "home_team": ["Brazil", "Brazil"],
+            "away_team": ["Mexico", "Belgium"],
+            "home_goals": [2, 1],
+            "away_goals": [0, 2],
+            "competition": ["FIFA World Cup", "FIFA World Cup"],
+            "is_knockout": [True, True],
+            "date": [date(2018, 7, 2), date(2018, 7, 6)],
+        }
+    )
+    out = derive_manager_records(
+        [{"manager": "Tite", "team": "Brazil", "start_year": 2016, "end_year": 2022}],
+        matches,
+        tournaments=tours,
+    )
+    assert tuple(out.columns) == TABLE_COLUMNS[Table.MANAGER_RECORDS]
+    row = out.row(0, named=True)
+    assert row["tournament"] == "WC2018"
+    assert row["knockout_matches"] == 2  # won R16, lost QF
+    assert row["knockout_wins"] == 1
+    assert row["stage_reached"] == "QF"  # 2 knockout matches reached -> QF
+    assert row["tournament_order"] == 0
 
 
 def test_normalize_footballdata_odds() -> None:
@@ -195,5 +386,7 @@ def test_ingest_all_sources_orchestration(tmp_path: Path) -> None:
     assert report["elo"] == 6
     assert report["market_odds"] == 1
     assert report["team_xg"] == 0  # optional, no file -> skipped cleanly
+    assert report["squads"] == 0  # optional, no file/scraper -> skipped cleanly
+    assert report["manager_records"] == 0  # optional, no file/scraper -> skipped cleanly
     for table in (Table.MATCHES, Table.ELO_SNAPSHOTS, Table.MARKET_ODDS):
         assert table_exists(table, settings)

@@ -13,7 +13,7 @@
 #                         standalone evaluation, not the TPE loop.
 #   * features.xg_window - only feeds the core FeaturePipeline; the base-probability path
 #                         the backtest stacks on does not build rolling-xG features.
-#   * contextual.toggle_{ppda,cohesion,manager,fatigue} - not in the runtime contextual
+#   * contextual.toggle_{ppda,fatigue} - not in the runtime contextual
 #                         feature set (context.runtime.FEATURE_GROUPS), so they are inert
 #                         at both backtest and simulation time.
 
@@ -39,6 +39,8 @@ contextual:
   context_n_estimators: {type: int, low: 50, high: 200}
   toggle_xg_overperformance: {type: categorical, choices: [true, false]}
   toggle_draw_pressure: {type: categorical, choices: [true, false]}
+  toggle_cohesion: {type: categorical, choices: [true, false]}
+  toggle_manager: {type: categorical, choices: [true, false]}
   enable_contextual_layer: {type: categorical, choices: [true, false]}
 
 ensemble:

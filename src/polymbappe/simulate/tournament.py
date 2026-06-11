@@ -27,11 +27,15 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import date
 from math import exp
+from typing import TYPE_CHECKING
 
 import numpy as np
 import polars as pl
 
 from polymbappe.data.schema import GroupStanding, Match
+
+if TYPE_CHECKING:
+    from polymbappe.context.runtime import FixtureContext
 from polymbappe.simulate.bracket import seed_round_of_32
 from polymbappe.simulate.group import resolve_group_table
 from polymbappe.simulate.match import (
@@ -77,6 +81,13 @@ STAGES: tuple[str, ...] = ("R32", "R16", "QF", "SF", "FINAL", "champion")
 #: 48-team mitigation: floor on the underdog's R32 win probability for >300 Elo gaps.
 R32_UPSET_FLOOR: float = 0.08
 R32_ELO_GAP: float = 300.0
+
+#: The live 2026 World Cup, used by the contextual hook to build point-in-time
+#: cohesion / manager lookups (see :func:`_load_context_hook`). ``name`` is the data
+#: contract: the ``squads`` / ``manager_records`` tables carry their 2026 rows under
+#: ``tournament == "WC2026"``. ``start`` bounds the match history used for those lookups.
+WC2026_NAME: str = "WC2026"
+WC2026_START: date = date(2026, 6, 11)
 
 
 @dataclass(slots=True)
@@ -508,6 +519,93 @@ def run_tournament_simulation(
     print(result.stage_probabilities().head(15))
 
 
+class _LiveTournament:
+    """Minimal ``Tournament``-shaped object for the live 2026 cohesion / manager lookups.
+
+    The runtime lookups only need ``.name`` (to select the 2026 snapshot / derive the
+    leakage cutoff) and ``.start`` (to bound the match history). A tiny local shim avoids
+    importing the heavier :class:`~polymbappe.eval.backtest.Tournament` into the hot path.
+    """
+
+    __slots__ = ("name", "start")
+
+    def __init__(self, name: str = WC2026_NAME, start: date = WC2026_START) -> None:
+        self.name = name
+        self.start = start
+
+
+def _live_fixture_context(
+    settings: object,
+    elo: dict[str, float] | None,
+    logger: object,
+) -> FixtureContext:
+    """Build the per-pair :class:`FixtureContext` bundle for the live 2026 simulation.
+
+    **Live data contract.** Cohesion / manager features 0-fill gracefully unless their
+    2026 rows are present (the hook never hard-requires these tables):
+
+    * ``squads`` must contain the 2026 pre-tournament call-up snapshot under
+      ``tournament == "WC2026"`` (per-player ``team``/``club``/``age`` rows). Absent → all
+      cohesion columns 0-fill.
+    * ``manager_records`` must contain a 2026 row per nation identifying that nation's
+      *current* manager (knockout stats may be 0). The leakage cutoff comes from the records'
+      own ``tournament_order``; since ``"WC2026"`` is not among the historical
+      ``tournament_order`` values, the cutoff falls back to ``+inf`` and every (strictly
+      pre-2026) record is used for pedigree. Absent 2026 identity rows → manager columns
+      0-fill.
+
+    The bundle is built from history only via the same ``cohesion_lookup`` /
+    ``manager_lookup`` the fit path uses, so the live per-pair frame is column-identical to
+    the fit frame.
+    """
+
+    from polymbappe.context.runtime import (
+        FixtureContext,
+        cohesion_lookup,
+        latest_overperformance,
+        manager_lookup,
+    )
+    from polymbappe.data.store import read_table, table_exists
+    from polymbappe.data.tables import Table
+
+    matches = read_table(Table.MATCHES, settings)  # type: ignore[arg-type]
+    team_xg = read_table(Table.TEAM_XG, settings) if table_exists(Table.TEAM_XG, settings) else None  # type: ignore[arg-type]
+    overperf = latest_overperformance(matches, team_xg)
+
+    tournament = _LiveTournament()
+    cohesion: dict[str, tuple[float, float]] = {}
+    if table_exists(Table.SQUADS, settings):  # type: ignore[arg-type]
+        squads = read_table(Table.SQUADS, settings)  # type: ignore[arg-type]
+        cohesion = cohesion_lookup(squads, tournament)
+    manager: dict[str, dict[str, float]] = {}
+    if table_exists(Table.MANAGER_RECORDS, settings):  # type: ignore[arg-type]
+        records = read_table(Table.MANAGER_RECORDS, settings)  # type: ignore[arg-type]
+        manager = manager_lookup(records, tournament)
+    logger.info(  # type: ignore[attr-defined]
+        "simulate.context.tables",
+        squads_teams=len(cohesion),
+        manager_teams=len(manager),
+    )
+    return FixtureContext(overperf=overperf, elo=elo or {}, cohesion=cohesion, manager=manager)
+
+
+def _context_feature_frame(
+    teams: list[str], ctx: FixtureContext
+) -> tuple[list[tuple[str, str]], pl.DataFrame]:
+    """Per-ordered-pair contextual feature frame for the live teams (testable seam).
+
+    Returns the ordered ``(home, away)`` pairs and the matching feature frame whose columns
+    are exactly :data:`~polymbappe.context.runtime.SIM_CONTEXT_FEATURES`, built through the
+    same :func:`~polymbappe.context.runtime.fixture_feature_row` the fit path uses.
+    """
+
+    from polymbappe.context.runtime import fixture_feature_row
+
+    pairs = [(h, a) for h in teams for a in teams if h != a]
+    rows = [fixture_feature_row(h, a, ctx) for h, a in pairs]
+    return pairs, pl.DataFrame(rows)
+
+
 def _load_context_hook(
     settings: object, structure: TournamentStructure, elo: dict[str, float] | None, logger: object
 ) -> ContextHook | None:
@@ -517,11 +615,15 @@ def _load_context_hook(
     in-sim state, so the raw adjustment is precomputed once per ordered team pair in a
     single batched prediction. The returned hook is then an O(1) lookup plus a cheap capped
     re-projection — fast enough for 100K sims.
+
+    Cohesion / manager features are assembled from point-in-time lookups for the 2026
+    tournament (``WC2026``) via :func:`_live_fixture_context`; see its docstring for the
+    live data contract. They 0-fill when the ``squads`` / ``manager_records`` tables (or
+    their 2026 rows) are absent, so the hook never hard-requires them.
     """
 
     from polymbappe.context.adjuster import apply_adjustment
-    from polymbappe.context.runtime import fixture_feature_row, latest_overperformance
-    from polymbappe.data.store import read_table, table_exists
+    from polymbappe.data.store import table_exists
     from polymbappe.data.tables import Table
     from polymbappe.models.train import load_artifact
 
@@ -534,15 +636,9 @@ def _load_context_hook(
         logger.warning("simulate.context", status="no matches table for features")  # type: ignore[attr-defined]
         return None
 
-    matches = read_table(Table.MATCHES, settings)  # type: ignore[arg-type]
-    team_xg = read_table(Table.TEAM_XG, settings) if table_exists(Table.TEAM_XG, settings) else None  # type: ignore[arg-type]
-    overperf = latest_overperformance(matches, team_xg)
-    elo_map = elo or {}
-
-    teams = structure.teams
-    pairs = [(h, a) for h in teams for a in teams if h != a]
-    rows = [fixture_feature_row(h, a, overperf, elo_map) for h, a in pairs]
-    raw = adjuster.predict_adjustment(pl.DataFrame(rows))  # type: ignore[attr-defined]  # one batched call
+    ctx = _live_fixture_context(settings, elo, logger)
+    pairs, frame = _context_feature_frame(structure.teams, ctx)
+    raw = adjuster.predict_adjustment(frame)  # type: ignore[attr-defined]  # one batched call
     cache = {pair: raw[i] for i, pair in enumerate(pairs)}
     cap = adjuster.config.cap  # type: ignore[attr-defined]
     logger.info("simulate.context", status="applied", pairs=len(pairs))  # type: ignore[attr-defined]
