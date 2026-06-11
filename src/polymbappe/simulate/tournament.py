@@ -520,7 +520,11 @@ def _load_context_hook(
     """
 
     from polymbappe.context.adjuster import apply_adjustment
-    from polymbappe.context.runtime import fixture_feature_row, latest_overperformance
+    from polymbappe.context.runtime import (
+        FixtureContext,
+        fixture_feature_row,
+        latest_overperformance,
+    )
     from polymbappe.data.store import read_table, table_exists
     from polymbappe.data.tables import Table
     from polymbappe.models.train import load_artifact
@@ -541,7 +545,10 @@ def _load_context_hook(
 
     teams = structure.teams
     pairs = [(h, a) for h in teams for a in teams if h != a]
-    rows = [fixture_feature_row(h, a, overperf, elo_map) for h, a in pairs]
+    # Phase C compile-shim: cohesion/manager are 0-filled here; Phase E builds the real
+    # cohesion_lookup/manager_lookup for the 2026 snapshot and passes them in the bundle.
+    ctx = FixtureContext(overperf=overperf, elo=elo_map)
+    rows = [fixture_feature_row(h, a, ctx) for h, a in pairs]
     raw = adjuster.predict_adjustment(pl.DataFrame(rows))  # type: ignore[attr-defined]  # one batched call
     cache = {pair: raw[i] for i, pair in enumerate(pairs)}
     cap = adjuster.config.cap  # type: ignore[attr-defined]
