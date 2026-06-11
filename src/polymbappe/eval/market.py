@@ -152,21 +152,44 @@ def compute_credible_edges(
 
 
 def compare_model_to_market() -> None:
-    """CLI entrypoint: load stored predictions + market odds and print the edge table."""
+    """CLI entrypoint: print the model-vs-market edge table.
+
+    Prefers the precomputed ``edges.parquet`` written by ``simulate``. If that is absent,
+    recomputes from ``match_predictions.parquet`` + the ``market_odds`` table when both
+    exist, naming precisely which prerequisite is missing otherwise.
+    """
 
     from polymbappe.config import Settings
     from polymbappe.data.store import read_table, table_exists
     from polymbappe.data.tables import Table
 
     settings = Settings()
+    edges_path = settings.outputs_data_dir / "edges.parquet"
     predictions_path = settings.outputs_data_dir / "match_predictions.parquet"
-    if not predictions_path.exists() or not table_exists(Table.MARKET_ODDS, settings):
-        raise FileNotFoundError(
-            "Edge detection needs match predictions (run `polymbappe simulate`/`report`) "
-            "and an ingested market_odds table."
-        )
+
+    # Preferred: the edges artifact already produced by `simulate`.
+    if edges_path.exists():
+        edges = pl.read_parquet(edges_path)
+        if edges.is_empty():
+            print(
+                "No market edges found. Either no market_odds were ingested, or none of "
+                "the fixtures' match_ids joined the odds (check `polymbappe ingest` odds "
+                "sources and configs/team_aliases.yaml). Re-run `polymbappe simulate` after "
+                "ingesting odds."
+            )
+        else:
+            print(edges)
+        return
+
+    # Fallback: recompute, but say exactly what is missing.
+    missing: list[str] = []
+    if not predictions_path.exists():
+        missing.append("match_predictions.parquet (run `polymbappe simulate`)")
+    if not table_exists(Table.MARKET_ODDS, settings):
+        missing.append("market_odds table (run `polymbappe ingest` with odds sources)")
+    if missing:
+        raise FileNotFoundError("Edge detection is missing: " + "; ".join(missing))
 
     model_probs = pl.read_parquet(predictions_path)
     market_probs = read_table(Table.MARKET_ODDS, settings)
-    edges = compute_edges(model_probs, market_probs)
-    print(edges)
+    print(compute_edges(model_probs, market_probs))
