@@ -10,8 +10,8 @@ from __future__ import annotations
 import hashlib
 import io
 import time
+from collections.abc import Callable
 from pathlib import Path
-from typing import Callable
 from urllib.parse import urlsplit
 
 import polars as pl
