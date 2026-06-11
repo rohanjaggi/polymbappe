@@ -55,6 +55,43 @@ def score_matrix_from_rates(lam: float, mu: float, rho: float, max_goals: int) -
     return np.asarray(matrix / matrix.sum(), dtype=float)
 
 
+def hda_marginals(matrix: np.ndarray) -> tuple[float, float, float]:
+    """Home/draw/away marginal probabilities of a normalized score matrix."""
+
+    home = float(np.tril(matrix, k=-1).sum())
+    draw = float(np.trace(matrix))
+    away = float(np.triu(matrix, k=1).sum())
+    return home, draw, away
+
+
+def reweight_matrix_to_hda(matrix: np.ndarray, target_hda: np.ndarray) -> np.ndarray:
+    """Rescale a score matrix so its H/D/A marginals match ``target_hda``.
+
+    Scales the three outcome regions (home-win lower triangle, draw diagonal, away-win
+    upper triangle) by the ratio of target to current marginal, preserving the *shape* of
+    the scoreline distribution within each region, then renormalizes. Used to inject a
+    contextual H/D/A adjustment into scoreline sampling (spec 4.1 per-match injection).
+    Regions with no current mass are left untouched.
+    """
+
+    target = np.asarray(target_hda, dtype=float)
+    target = target / target.sum()
+    cur_h, cur_d, cur_a = hda_marginals(matrix)
+    out = matrix.copy()
+    n = matrix.shape[0]
+    tri_low = np.tril(np.ones((n, n), dtype=bool), k=-1)
+    tri_up = np.triu(np.ones((n, n), dtype=bool), k=1)
+    diag = np.eye(n, dtype=bool)
+    if cur_h > 1e-12:
+        out[tri_low] *= target[0] / cur_h
+    if cur_d > 1e-12:
+        out[diag] *= target[1] / cur_d
+    if cur_a > 1e-12:
+        out[tri_up] *= target[2] / cur_a
+    total = out.sum()
+    return np.asarray(out / total, dtype=float) if total > 0 else matrix
+
+
 def sample_scoreline(matrix: np.ndarray, rng: np.random.Generator) -> tuple[int, int]:
     """Sample a (home_goals, away_goals) pair from a normalized score matrix."""
 

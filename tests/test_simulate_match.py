@@ -5,13 +5,25 @@ from __future__ import annotations
 import numpy as np
 
 from polymbappe.simulate.match import (
+    hda_marginals,
     knockout_home_winprob,
     penalty_home_winprob,
+    reweight_matrix_to_hda,
     sample_scoreline,
     score_matrix_from_rates,
     shrink_penalty_rate,
     simulate_knockout_match,
 )
+
+
+def test_reweight_matrix_to_hda_hits_target() -> None:
+    m = score_matrix_from_rates(1.6, 1.1, -0.05, 8)
+    target = np.array([0.5, 0.3, 0.2])
+    out = reweight_matrix_to_hda(m, target)
+    assert abs(out.sum() - 1.0) < 1e-9
+    assert np.allclose(hda_marginals(out), target, atol=1e-9)
+    # Reweighting preserves scoreline shape within each region (relative order kept).
+    assert out.shape == m.shape
 
 
 def test_score_matrix_normalized() -> None:

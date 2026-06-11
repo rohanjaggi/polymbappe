@@ -80,3 +80,28 @@ def test_train_full_stack_and_persist(tmp_path) -> None:
     persist_artifacts(artifacts, settings)
     loaded = load_artifact("dixon_coles", settings)
     assert loaded.predict_match("A", "D")["home_win"] > 0.0
+
+
+def test_contextual_adjuster_fit_and_persisted(tmp_path) -> None:
+    import numpy as np
+
+    from polymbappe.config import Settings
+
+    artifacts = train_full_stack(_make_matches(), tournaments=_TOURNAMENTS)
+    # The adjuster is fit on the per-fixture contextual features (36 rows >= 20 threshold).
+    assert artifacts.adjuster is not None
+
+    settings = Settings(data_dir=tmp_path)
+    persist_artifacts(artifacts, settings)
+    adj = load_artifact("contextual_adjuster", settings)
+    # It applies as a capped, simplex-preserving adjustment.
+    base = np.tile([0.4, 0.3, 0.3], (artifacts.stacked_frame.height, 1))
+    # Build the same contextual feature columns the adjuster expects.
+    from polymbappe.context.runtime import SIM_CONTEXT_FEATURES
+
+    feat = artifacts.stacked_frame.with_columns(
+        [__import__("polars").lit(0.0).alias(c) for c in SIM_CONTEXT_FEATURES]
+    )
+    out = adj.adjust(feat, base)
+    assert np.allclose(out.sum(axis=1), 1.0, atol=1e-6)
+    assert np.all(np.abs(out - base) <= 0.03 + 1e-9)

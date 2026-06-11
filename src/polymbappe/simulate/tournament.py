@@ -23,6 +23,7 @@ staleness detection (spec 4.5) is provided separately by :class:`StalenessMonito
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import date
 from math import exp
@@ -35,11 +36,30 @@ from polymbappe.simulate.bracket import seed_round_of_32
 from polymbappe.simulate.group import resolve_group_table
 from polymbappe.simulate.match import (
     ET_GOAL_SCALE,
+    hda_marginals,
     knockout_home_winprob,
+    reweight_matrix_to_hda,
     sample_scoreline,
     score_matrix_from_rates,
 )
 from polymbappe.simulate.third_place import select_best_third_placed
+
+#: Per-match contextual hook: ``(home, away, base_hda) -> adjusted_hda`` (both length-3
+#: H/D/A vectors). Returned by the contextual adjuster wiring; reweights the score matrix.
+ContextHook = Callable[[str, str, np.ndarray], np.ndarray]
+
+
+def _contextualize(
+    matrix: np.ndarray, home: str, away: str, hook: ContextHook | None
+) -> np.ndarray:
+    """Apply a contextual H/D/A adjustment to a score matrix via reweighting."""
+
+    if hook is None:
+        return matrix
+    base_hda = np.array(hda_marginals(matrix))
+    adjusted = hook(home, away, base_hda)
+    return reweight_matrix_to_hda(matrix, adjusted)
+
 
 #: Round-robin pairings for a 4-team group; matchday 3 (last two) is the "final matchday".
 _GROUP_SCHEDULE: tuple[tuple[int, int, int], ...] = (
@@ -160,6 +180,7 @@ def _simulate_group(
     model: StrengthModel,
     latent: _LatentStrength,
     rng: np.random.Generator,
+    context_hook: ContextHook | None = None,
 ) -> list[GroupStanding]:
     """Play one group's six matches and return the resolved standings."""
 
@@ -167,7 +188,9 @@ def _simulate_group(
     for k, (i, j, _matchday) in enumerate(_GROUP_SCHEDULE):
         home, away = teams[i], teams[j]
         dh, da = latent.get(home), latent.get(away)
-        matrix = model.score_matrix(home, away, neutral=True, dh=dh, da=da)
+        matrix = _contextualize(
+            model.score_matrix(home, away, neutral=True, dh=dh, da=da), home, away, context_hook
+        )
         hg, ag = sample_scoreline(matrix, rng)
         lam, mu = model.rates(home, away, neutral=True, dh=dh, da=da)
         latent.update(home, hg - ag, lam - mu)
@@ -196,12 +219,15 @@ def _knockout_winner(
     structure: TournamentStructure,
     rng: np.random.Generator,
     apply_upset_floor: bool,
+    context_hook: ContextHook | None = None,
 ) -> str:
     """Resolve one knockout tie, returning the advancing team."""
 
     dh, da = latent.get(home), latent.get(away)
     lam, mu = model.rates(home, away, neutral=True, dh=dh, da=da)
-    matrix_reg = score_matrix_from_rates(lam, mu, model.rho, model.max_goals)
+    matrix_reg = _contextualize(
+        score_matrix_from_rates(lam, mu, model.rho, model.max_goals), home, away, context_hook
+    )
     matrix_et = score_matrix_from_rates(
         lam * ET_GOAL_SCALE, mu * ET_GOAL_SCALE, model.rho, model.max_goals
     )
@@ -230,8 +256,13 @@ def simulate_tournament(
     n_sims: int = 100_000,
     rng: np.random.Generator | None = None,
     learning_rate: float = 0.05,
+    context_hook: ContextHook | None = None,
 ) -> SimulationResult:
-    """Run the full Monte Carlo tournament simulation."""
+    """Run the full Monte Carlo tournament simulation.
+
+    ``context_hook`` (optional) applies a per-match contextual H/D/A adjustment by
+    reweighting each score matrix (spec 4.1 per-match contextual injection).
+    """
 
     rng = rng or np.random.default_rng()
     teams = structure.teams
@@ -246,7 +277,7 @@ def simulate_tournament(
         runners_up: list[str] = []
         thirds: list[GroupStanding] = []
         for group, members in structure.groups.items():
-            standings = _simulate_group(group, members, model, latent, rng)
+            standings = _simulate_group(group, members, model, latent, rng, context_hook)
             for rank, row in enumerate(standings, start=1):
                 group_finish[row.team][rank] = group_finish[row.team].get(rank, 0) + 1
             winners.append(standings[0])
@@ -270,7 +301,8 @@ def simulate_tournament(
         # R32 round: winners reach R16. The upset floor applies only here (spec 4.2).
         current = [
             _knockout_winner(
-                tie.home_team, tie.away_team, model, latent, structure, rng, apply_upset_floor=True
+                tie.home_team, tie.away_team, model, latent, structure, rng,
+                apply_upset_floor=True, context_hook=context_hook,
             )
             for tie in ties
         ]
@@ -283,7 +315,7 @@ def simulate_tournament(
             for i in range(0, len(current), 2):
                 winner = _knockout_winner(
                     current[i], current[i + 1], model, latent, structure, rng,
-                    apply_upset_floor=False,
+                    apply_upset_floor=False, context_hook=context_hook,
                 )
                 stage_counts[winner][stage_name] = stage_counts[winner].get(stage_name, 0) + 1
                 winners_next.append(winner)
@@ -292,6 +324,47 @@ def simulate_tournament(
     return SimulationResult(
         n_sims=n_sims, stage_counts=stage_counts, group_finish_counts=group_finish
     )
+
+
+def compute_match_predictions(
+    structure: TournamentStructure,
+    model: StrengthModel,
+    context_hook: ContextHook | None = None,
+) -> pl.DataFrame:
+    """Per group-stage fixture H/D/A probabilities and expected scoreline (spec 11).
+
+    Iterates each group's round-robin pairings, deriving the contextually-adjusted score
+    matrix and its H/D/A marginals plus expected goals. ``match_id`` follows the
+    ``2026__home__away`` convention so externally-ingested 2026 market odds keyed the same
+    way join cleanly for edge detection.
+
+    Returns columns ``match_id, group, home_team, away_team, model_home, model_draw,
+    model_away, exp_home_goals, exp_away_goals``.
+    """
+
+    grid = np.arange(model.max_goals + 1)
+    rows: list[dict[str, object]] = []
+    for group, members in structure.groups.items():
+        for i, j, _matchday in _GROUP_SCHEDULE:
+            home, away = members[i], members[j]
+            matrix = _contextualize(
+                model.score_matrix(home, away, neutral=True), home, away, context_hook
+            )
+            h, d, a = hda_marginals(matrix)
+            rows.append(
+                {
+                    "match_id": f"2026__{home}__{away}",
+                    "group": group,
+                    "home_team": home,
+                    "away_team": away,
+                    "model_home": h,
+                    "model_draw": d,
+                    "model_away": a,
+                    "exp_home_goals": float((matrix.sum(axis=1) * grid).sum()),
+                    "exp_away_goals": float((matrix.sum(axis=0) * grid).sum()),
+                }
+            )
+    return pl.DataFrame(rows)
 
 
 # -- staleness detection (spec 4.5) -------------------------------------------
@@ -342,7 +415,7 @@ def run_tournament_simulation(
     stage-reaching and group-finish probabilities to ``data/outputs``.
     """
 
-    _ = (with_context, live)  # reserved: contextual injection / live re-estimation hooks
+    _ = live  # reserved: live re-estimation hook
 
     import structlog
 
@@ -392,13 +465,94 @@ def run_tournament_simulation(
         logger.warning("simulate.structure", source="placeholder", reason="<48 trained teams")
 
     model = StrengthModel.from_dixon_coles(dc, hosts=HOSTS_2026)
-    result = simulate_tournament(structure, model, n_sims=n_sims)
+
+    # Optional contextual injection: load the fitted adjuster and build a per-match hook.
+    context_hook: ContextHook | None = None
+    if with_context:
+        context_hook = _load_context_hook(settings, structure, elo, logger)
+
+    result = simulate_tournament(structure, model, n_sims=n_sims, context_hook=context_hook)
+    predictions = compute_match_predictions(structure, model, context_hook)
 
     settings.outputs_data_dir.mkdir(parents=True, exist_ok=True)
-    result.stage_probabilities().write_parquet(
-        settings.outputs_data_dir / "stage_probabilities.parquet"
-    )
-    result.group_probabilities().write_parquet(
-        settings.outputs_data_dir / "group_probabilities.parquet"
-    )
+    out = settings.outputs_data_dir
+    result.stage_probabilities().write_parquet(out / "stage_probabilities.parquet")
+    result.group_probabilities().write_parquet(out / "group_probabilities.parquet")
+    predictions.write_parquet(out / "match_predictions.parquet")
+    _write_edges(predictions, settings, logger).write_parquet(out / "edges.parquet")
     print(result.stage_probabilities().head(15))
+
+
+def _load_context_hook(
+    settings: object, structure: TournamentStructure, elo: dict[str, float] | None, logger: object
+) -> ContextHook | None:
+    """Build a per-match contextual hook from the fitted adjuster artifact, if present.
+
+    The contextual adjustment depends only on the matchup (team features), not on the
+    in-sim state, so the raw adjustment is precomputed once per ordered team pair in a
+    single batched prediction. The returned hook is then an O(1) lookup plus a cheap capped
+    re-projection — fast enough for 100K sims.
+    """
+
+    from polymbappe.context.adjuster import apply_adjustment
+    from polymbappe.context.runtime import fixture_feature_row, latest_overperformance
+    from polymbappe.data.store import read_table, table_exists
+    from polymbappe.data.tables import Table
+    from polymbappe.models.train import load_artifact
+
+    try:
+        adjuster = load_artifact("contextual_adjuster", settings)  # type: ignore[arg-type]
+    except FileNotFoundError:
+        logger.warning("simulate.context", status="no adjuster artifact; run `train`")  # type: ignore[attr-defined]
+        return None
+    if not table_exists(Table.MATCHES, settings):  # type: ignore[arg-type]
+        logger.warning("simulate.context", status="no matches table for features")  # type: ignore[attr-defined]
+        return None
+
+    matches = read_table(Table.MATCHES, settings)  # type: ignore[arg-type]
+    team_xg = read_table(Table.TEAM_XG, settings) if table_exists(Table.TEAM_XG, settings) else None  # type: ignore[arg-type]
+    overperf = latest_overperformance(matches, team_xg)
+    elo_map = elo or {}
+
+    teams = structure.teams
+    pairs = [(h, a) for h in teams for a in teams if h != a]
+    rows = [fixture_feature_row(h, a, overperf, elo_map) for h, a in pairs]
+    raw = adjuster.predict_adjustment(pl.DataFrame(rows))  # type: ignore[attr-defined]  # one batched call
+    cache = {pair: raw[i] for i, pair in enumerate(pairs)}
+    cap = adjuster.config.cap  # type: ignore[attr-defined]
+    logger.info("simulate.context", status="applied", pairs=len(pairs))  # type: ignore[attr-defined]
+
+    def hook(home: str, away: str, base_hda: np.ndarray) -> np.ndarray:
+        adjustment = cache.get((home, away))
+        if adjustment is None:
+            return base_hda
+        return apply_adjustment(base_hda.reshape(1, 3), adjustment.reshape(1, 3), cap)[0]
+
+    return hook
+
+
+def _write_edges(
+    predictions: pl.DataFrame, settings: object, logger: object
+) -> pl.DataFrame:
+    """Compute market edges for the fixtures, or an empty edge table if no market odds."""
+
+    from polymbappe.data.store import read_table, table_exists
+    from polymbappe.data.tables import Table
+    from polymbappe.eval.market import compute_edges
+
+    empty = pl.DataFrame(
+        schema={
+            "match_id": pl.Utf8, "outcome": pl.Utf8, "model_prob": pl.Float64,
+            "market_prob": pl.Float64, "edge": pl.Float64, "edge_bps": pl.Float64,
+            "kelly_fraction": pl.Float64,
+        }
+    )
+    if not table_exists(Table.MARKET_ODDS, settings):  # type: ignore[arg-type]
+        logger.info("simulate.edges", status="no market_odds ingested; empty edges")  # type: ignore[attr-defined]
+        return empty
+    market = read_table(Table.MARKET_ODDS, settings)  # type: ignore[arg-type]
+    edges = compute_edges(
+        predictions.select("match_id", "model_home", "model_draw", "model_away"), market
+    )
+    logger.info("simulate.edges", status="computed", n=edges.height)  # type: ignore[attr-defined]
+    return edges

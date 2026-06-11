@@ -34,6 +34,7 @@ _ARTIFACT_FILES = {
     "dixon_coles": "model_dixon_coles.pkl",
     "ensemble_calibration": "ensemble_calibration.pkl",
     "ensemble_edge": "ensemble_edge.pkl",
+    "contextual_adjuster": "contextual_adjuster.pkl",
 }
 
 
@@ -44,6 +45,7 @@ class TrainArtifacts:
     dixon_coles: DixonColesModel
     calibration: Ensemble
     edge: Ensemble
+    adjuster: object | None = None
     stacked_frame: pl.DataFrame = field(default_factory=pl.DataFrame)
 
 
@@ -95,6 +97,60 @@ def _all_history_dixon_coles(
     return DixonColesModel(base_config.dixon_coles).fit(matches=obs)
 
 
+def _tournament_context_features(
+    matches: pl.DataFrame, tournaments: tuple[Tournament, ...]
+) -> pl.DataFrame:
+    """Per-fixture contextual features (keyed by match_id) for the training tournaments.
+
+    For each tournament, computes xG-overperformance and Elo as of its start (history
+    only), then the per-fixture feature row — the same columns the simulation builds at
+    prediction time (:mod:`polymbappe.context.runtime`).
+    """
+
+    from polymbappe.context.runtime import (
+        SIM_CONTEXT_FEATURES,
+        fixture_feature_row,
+        latest_overperformance,
+    )
+    from polymbappe.features.elo import build_elo_snapshots
+
+    rows: list[dict[str, object]] = []
+    for tournament in tournaments:
+        fixtures = select_fixtures(matches, tournament)
+        if fixtures.is_empty():
+            continue
+        history = matches.filter(pl.col("date") < tournament.start)
+        if history.is_empty():
+            continue
+        overperf = latest_overperformance(history)
+        snaps = build_elo_snapshots(history).sort(["team", "date"]).group_by("team").agg(
+            pl.col("rating").last()
+        )
+        elo = {r["team"]: float(r["rating"]) for r in snaps.iter_rows(named=True)}
+        for fx in fixtures.iter_rows(named=True):
+            feats = fixture_feature_row(fx["home_team"], fx["away_team"], overperf, elo)
+            rows.append({"match_id": fx["match_id"], **feats})
+    cols = {"match_id": pl.Utf8, **{c: pl.Float64 for c in SIM_CONTEXT_FEATURES}}
+    return pl.DataFrame(rows, schema=cols)
+
+
+def _fit_contextual_adjuster(
+    frame: pl.DataFrame, calibration: Ensemble, context_features: pl.DataFrame
+) -> object | None:
+    """Fit the contextual adjuster on per-fixture context features vs base residuals."""
+
+    from polymbappe.context.adjuster import ContextualAdjuster, ContextualAdjusterConfig
+    from polymbappe.context.runtime import FEATURE_GROUPS
+
+    joined = frame.join(context_features, on="match_id", how="inner")
+    if joined.height < 20:  # too few labeled rows to learn a residual signal
+        return None
+    base_probs = calibration.predict_proba(joined)
+    adjuster = ContextualAdjuster(FEATURE_GROUPS, ContextualAdjusterConfig())
+    adjuster.fit(joined, base_probs)
+    return adjuster
+
+
 def train_full_stack(
     matches: pl.DataFrame,
     *,
@@ -102,8 +158,9 @@ def train_full_stack(
     base_config: BaseProbConfig | None = None,
     ensemble_config: EnsembleConfig | None = None,
     market_odds: pl.DataFrame | None = None,
+    fit_contextual: bool = True,
 ) -> TrainArtifacts:
-    """Fit the Dixon-Coles engine and the dual calibration/edge ensembles."""
+    """Fit the Dixon-Coles engine, the dual ensembles, and the contextual adjuster."""
 
     base_config = base_config or BaseProbConfig()
     frame = assemble_stacked_frame(
@@ -122,8 +179,17 @@ def train_full_stack(
     calibration.fit(frame)
     edge.fit(frame)
     dc = _all_history_dixon_coles(matches, base_config)
+
+    adjuster: object | None = None
+    if fit_contextual:
+        try:
+            context_features = _tournament_context_features(matches, tournaments)
+            adjuster = _fit_contextual_adjuster(frame, calibration, context_features)
+        except Exception as exc:  # noqa: BLE001 - contextual layer is optional, never fatal
+            logger.warning("train.context_skip", error=str(exc))
+
     return TrainArtifacts(
-        dixon_coles=dc, calibration=calibration, edge=edge, stacked_frame=frame
+        dixon_coles=dc, calibration=calibration, edge=edge, adjuster=adjuster, stacked_frame=frame
     )
 
 
@@ -137,6 +203,8 @@ def persist_artifacts(artifacts: TrainArtifacts, settings: Settings | None = Non
         "ensemble_calibration": artifacts.calibration,
         "ensemble_edge": artifacts.edge,
     }
+    if artifacts.adjuster is not None:
+        mapping["contextual_adjuster"] = artifacts.adjuster
     for key, obj in mapping.items():
         path = settings.processed_data_dir / _ARTIFACT_FILES[key]
         with path.open("wb") as fh:

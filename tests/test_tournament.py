@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import numpy as np
+import polars as pl
 
 from polymbappe.simulate.structure import (
     build_structure,
@@ -15,6 +16,7 @@ from polymbappe.simulate.tournament import (
     STAGES,
     StalenessMonitor,
     StrengthModel,
+    compute_match_predictions,
     simulate_tournament,
     surprise_increment,
 )
@@ -120,6 +122,86 @@ def test_structure_from_strengths_requires_48() -> None:
         pass
     else:  # pragma: no cover
         raise AssertionError("expected ValueError with fewer than 48 teams")
+
+
+def test_compute_match_predictions_schema_and_simplex() -> None:
+    structure = placeholder_structure_2026()
+    model = _model(structure.teams)
+    preds = compute_match_predictions(structure, model)
+    assert preds.height == 12 * 6  # 12 groups x 6 round-robin fixtures
+    hda = preds.select("model_home", "model_draw", "model_away").to_numpy()
+    assert np.allclose(hda.sum(axis=1), 1.0, atol=1e-9)
+    assert preds["match_id"].to_list()[0].startswith("2026__")
+    assert (preds["exp_home_goals"] > 0).all()
+
+
+def test_context_hook_shifts_predictions() -> None:
+    structure = placeholder_structure_2026()
+    model = _model(structure.teams)
+    base = compute_match_predictions(structure, model)
+
+    # Hook that pushes 3pp of mass from away onto home for every match.
+    def hook(home, away, base_hda):
+        adj = base_hda + np.array([0.03, 0.0, -0.03])
+        return adj / adj.sum()
+
+    ctx = compute_match_predictions(structure, model, context_hook=hook)
+    # Home probability should rise on average once context nudges it up.
+    assert ctx["model_home"].mean() > base["model_home"].mean()
+    hda = ctx.select("model_home", "model_draw", "model_away").to_numpy()
+    assert np.allclose(hda.sum(axis=1), 1.0, atol=1e-9)
+
+
+def test_simulate_with_context_hook_runs() -> None:
+    structure = placeholder_structure_2026()
+    model = _model(structure.teams)
+
+    def hook(home, away, base_hda):
+        return base_hda  # identity hook: must not change invariants
+
+    result = simulate_tournament(
+        structure, model, n_sims=100, rng=np.random.default_rng(3), context_hook=hook
+    )
+    sp = result.stage_probabilities()
+    assert abs(sp["champion"].sum() - 1.0) < 1e-6
+
+
+def test_write_edges_graceful_without_market(tmp_path) -> None:
+    import structlog
+
+    from polymbappe.config import Settings
+    from polymbappe.simulate.tournament import _write_edges
+
+    preds = pl.DataFrame({
+        "match_id": ["2026__A__B"], "model_home": [0.6], "model_draw": [0.25], "model_away": [0.15],
+    })
+    settings = Settings(data_dir=tmp_path)
+    edges = _write_edges(preds, settings, structlog.get_logger())
+    assert edges.is_empty()  # no market_odds table -> empty (right schema)
+    assert "edge" in edges.columns
+
+
+def test_write_edges_with_market(tmp_path) -> None:
+    import structlog
+
+    from polymbappe.config import Settings
+    from polymbappe.data.store import write_table
+    from polymbappe.data.tables import Table
+    from polymbappe.simulate.tournament import _write_edges
+
+    settings = Settings(data_dir=tmp_path)
+    preds = pl.DataFrame({
+        "match_id": ["2026__A__B"],
+        "model_home": [0.62], "model_draw": [0.23], "model_away": [0.15],
+    })
+    market = pl.DataFrame({
+        "match_id": ["2026__A__B"], "source": ["x"],
+        "home_win_prob": [0.50], "draw_prob": [0.27], "away_win_prob": [0.23],
+        "timestamp": [None],
+    }).with_columns(pl.col("timestamp").cast(pl.Datetime))
+    write_table(Table.MARKET_ODDS, market, settings=settings)
+    edges = _write_edges(preds, settings, structlog.get_logger())
+    assert "H" in edges["outcome"].to_list()  # 12pp home edge flagged
 
 
 def test_staleness_monitor_levels() -> None:
