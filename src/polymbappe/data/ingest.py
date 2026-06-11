@@ -18,6 +18,7 @@ import structlog
 
 from polymbappe.config import Settings
 from polymbappe.data import sources
+from polymbappe.data.aliases import normalize_team_expr
 from polymbappe.data.normalize import normalize_kaggle_results, normalize_odds_frame
 from polymbappe.data.store import read_table, table_exists, write_table
 from polymbappe.data.tables import TABLE_COLUMNS, Table
@@ -242,12 +243,317 @@ def ingest_team_xg(settings: Settings | None = None) -> int:
     return normalized.height
 
 
+def ingest_squads(settings: Settings | None = None) -> int:
+    """Ingest per-player squad call-ups into the ``squads`` table (cohesion inputs).
+
+    Prefers ``data/raw/squads.csv`` (reproducible, offline); else scrapes each manifest team
+    Transfermarkt-first (:func:`~polymbappe.data.sources.fetch_transfermarkt_squad`) with a
+    Wikipedia fallback (:func:`~polymbappe.data.sources.fetch_wikipedia_squad`) when
+    Transfermarkt is unavailable. Either way expects/produces columns
+    ``team, tournament, player, club, age``. ``team`` is
+    canonicalized via :func:`normalize_team_expr`; ``club`` is trimmed; ``tournament`` must
+    already equal a ``Tournament.name`` (e.g. ``"WC2018"``) and is passed through as-is;
+    ``age`` is cast to ``Float64``. Market value is NOT ingested here (cohesion needs only
+    player/club/age — see ``SQUAD_VALUATIONS`` for valuations).
+
+    Skips (returns 0) when the local file is absent AND the scraper yields nothing.
+    """
+
+    settings = settings or Settings()
+    required = {"team", "tournament", "player", "club", "age"}
+    local = settings.raw_data_dir / "squads.csv"
+    if local.exists():
+        raw = pl.read_csv(io.BytesIO(local.read_bytes()))
+        logger.info("ingest.squads.local", path=str(local), rows=raw.height)
+    else:
+        rows = _scrape_squads(settings)
+        if not rows:
+            logger.info("ingest.squads.skip", reason="no data/raw/squads.csv and scraper empty")
+            return 0
+        raw = pl.DataFrame(rows)
+        logger.info("ingest.squads.scraped", rows=raw.height)
+
+    missing = required - set(raw.columns)
+    if missing:
+        raise ValueError(f"squads source missing columns: {sorted(missing)}")
+
+    normalized = raw.select(
+        normalize_team_expr("team").alias("team"),
+        pl.col("tournament").cast(pl.Utf8),
+        pl.col("player").cast(pl.Utf8),
+        pl.col("club").cast(pl.Utf8).str.strip_chars(),
+        pl.col("age").cast(pl.Float64),
+    ).select(TABLE_COLUMNS[Table.SQUADS])
+    write_table(Table.SQUADS, normalized, mode="overwrite", settings=settings)
+    logger.info("ingest.squads.stored", rows=normalized.height)
+    return normalized.height
+
+
+def _scrape_squads(settings: Settings) -> list[dict[str, object]]:
+    """Scrape each ``(tournament, team, ...)`` in the manifest, Transfermarkt-first.
+
+    Reads optional ``data/raw/squads_manifest.csv`` (columns ``tournament, team`` plus
+    optional ``tm_id, saison_id, url, wiki_page``) and fetches each team's squad,
+    Transfermarkt-first with a **Wikipedia fallback** (see :func:`_scrape_one_squad`).
+    Returns the concatenated raw rows (``[]`` when no manifest or nothing fetched). Keeping
+    the manifest out of code lets the local-CSV path stay the default and tests stay offline.
+    """
+
+    manifest_path = settings.raw_data_dir / "squads_manifest.csv"
+    if not manifest_path.exists():
+        return []
+    manifest = pl.read_csv(io.BytesIO(manifest_path.read_bytes()))
+    rows: list[dict[str, object]] = []
+    for entry in manifest.iter_rows(named=True):
+        rows.extend(_scrape_one_squad(entry, settings))
+    return rows
+
+
+def _scrape_one_squad(
+    entry: dict[str, object], settings: Settings
+) -> list[dict[str, object]]:
+    """Fetch one team's squad: Transfermarkt first, Wikipedia fallback if it yields nothing.
+
+    Transfermarkt is the primary source (richer, per-club). When it is unavailable — blocked,
+    no ``tm_id``/``url`` in the manifest entry, or a layout change makes it return no rows —
+    the Wikipedia "<tournament> squads" page is scraped instead
+    (:func:`~polymbappe.data.sources.fetch_wikipedia_squad`). Both fetchers already isolate
+    their own failures and return ``[]``, so this only chooses between them.
+    """
+
+    tournament = str(entry["tournament"])
+    team = str(entry["team"])
+
+    tm_kwargs: dict[str, object] = {"settings": settings}
+    for key in ("tm_id", "saison_id", "url"):
+        if key in entry and entry[key] is not None:
+            tm_kwargs[key] = entry[key]
+    rows = sources.fetch_transfermarkt_squad(tournament, team, **tm_kwargs)
+    if rows:
+        logger.info("ingest.squads.source", team=team, source="transfermarkt", rows=len(rows))
+        return rows
+
+    wiki_page = entry.get("wiki_page") if "wiki_page" in entry else None
+    rows = sources.fetch_wikipedia_squad(
+        tournament, team, settings=settings,
+        page=str(wiki_page) if wiki_page is not None else None,
+    )
+    logger.info(
+        "ingest.squads.source", team=team,
+        source="wikipedia" if rows else "none", rows=len(rows),
+    )
+    return rows
+
+
+def derive_manager_records(
+    tenure_rows: list[dict[str, object]] | pl.DataFrame,
+    matches: pl.DataFrame,
+    tournaments=None,
+) -> pl.DataFrame:
+    """Derive ``manager_records`` rows from manager tenure windows + the matches table.
+
+    Pure, network-free, unit-testable. For each tenure row (``manager, team, start_year``,
+    optional ``end_year``) and each tournament whose window the tenure covers, count the
+    manager's team's knockout matches/wins in that tournament from ``matches`` and label the
+    deepest knockout stage reached.
+
+    Args:
+        tenure_rows: Manager tenure windows (from the Wikipedia scraper).
+        matches: The ingested ``matches`` table (``home_team, away_team, home_goals,
+            away_goals, competition, is_knockout, date``).
+        tournaments: Iterable of backtest ``Tournament`` objects (defaults to
+            ``DEFAULT_TOURNAMENTS``) providing each tournament's name + date window. Their
+            order in the sequence supplies ``tournament_order``.
+
+    Returns:
+        Frame with ``TABLE_COLUMNS[Table.MANAGER_RECORDS]`` columns. ``stage_reached`` uses
+        the manager builder's stage vocabulary (group/R16/QF/SF/final/winner).
+    """
+
+    from polymbappe.eval.backtest import DEFAULT_TOURNAMENTS
+
+    tours = list(tournaments) if tournaments is not None else list(DEFAULT_TOURNAMENTS)
+    order_by_name = {t.name: i for i, t in enumerate(tours)}
+
+    if isinstance(tenure_rows, pl.DataFrame):
+        tenures = tenure_rows.to_dicts()
+    else:
+        tenures = list(tenure_rows)
+
+    if matches.height == 0:
+        return _empty_manager_records()
+
+    matches = matches.with_columns(pl.col("date").cast(pl.Date, strict=False))
+
+    out: list[dict[str, object]] = []
+    for tenure in tenures:
+        manager = str(tenure["manager"])
+        team = str(tenure["team"])
+        start_year = int(tenure["start_year"])
+        end_year = tenure.get("end_year")
+        end_year = int(end_year) if end_year is not None else 9999
+        for tour in tours:
+            if not (start_year <= tour.start.year <= end_year):
+                continue
+            window = matches.filter(
+                (pl.col("date") >= tour.start) & (pl.col("date") <= tour.end)
+            )
+            team_ko = window.filter(
+                (pl.col("is_knockout"))
+                & ((pl.col("home_team") == team) | (pl.col("away_team") == team))
+            )
+            ko_matches = team_ko.height
+            if ko_matches == 0 and window.filter(
+                (pl.col("home_team") == team) | (pl.col("away_team") == team)
+            ).is_empty():
+                continue  # team did not play this tournament under this manager
+            ko_wins = 0
+            for m in team_ko.iter_rows(named=True):
+                home = m["home_team"] == team
+                gf = m["home_goals"] if home else m["away_goals"]
+                ga = m["away_goals"] if home else m["home_goals"]
+                if gf is not None and ga is not None and gf > ga:
+                    ko_wins += 1
+            stage = _deepest_stage(team_ko, team)
+            out.append(
+                {
+                    "manager": manager,
+                    "team": team,
+                    "tournament": tour.name,
+                    "stage_reached": stage,
+                    "knockout_matches": ko_matches,
+                    "knockout_wins": ko_wins,
+                    "tournament_order": order_by_name.get(tour.name, 0),
+                }
+            )
+
+    if not out:
+        return _empty_manager_records()
+    return pl.DataFrame(out).select(TABLE_COLUMNS[Table.MANAGER_RECORDS])
+
+
+#: Number of knockout matches a team plays to reach a given depth, mapped to the manager
+#: builder's stage vocabulary. A team with N knockout matches reached at least this stage.
+_KO_COUNT_TO_STAGE: dict[int, str] = {0: "group", 1: "R16", 2: "QF", 3: "SF", 4: "final"}
+
+
+def _deepest_stage(team_ko: pl.DataFrame, team: str) -> str:
+    """Label the deepest knockout stage a team reached from its knockout-match count + result.
+
+    Uses the manager builder's stage vocabulary (``STAGE_DEPTH`` keys). A team that won its
+    final knockout match (and played a full 4-round bracket) is labelled ``winner``.
+    """
+
+    ko_count = team_ko.height
+    if ko_count == 0:
+        return "group"
+    base = _KO_COUNT_TO_STAGE.get(ko_count, "final")
+    if ko_count >= 4:
+        last = team_ko.sort("date").row(-1, named=True)
+        home = last["home_team"] == team
+        gf = last["home_goals"] if home else last["away_goals"]
+        ga = last["away_goals"] if home else last["home_goals"]
+        if gf is not None and ga is not None and gf > ga:
+            return "winner"
+    return base
+
+
+def _empty_manager_records() -> pl.DataFrame:
+    return pl.DataFrame(
+        schema={
+            "manager": pl.Utf8,
+            "team": pl.Utf8,
+            "tournament": pl.Utf8,
+            "stage_reached": pl.Utf8,
+            "knockout_matches": pl.Int64,
+            "knockout_wins": pl.Int64,
+            "tournament_order": pl.Int64,
+        }
+    ).select(TABLE_COLUMNS[Table.MANAGER_RECORDS])
+
+
+def ingest_manager_records(settings: Settings | None = None) -> int:
+    """Ingest manager tournament pedigree into the ``manager_records`` table.
+
+    Prefers ``data/raw/manager_records.csv`` (reproducible, offline); else runs the
+    Wikipedia tenure scraper (:func:`~polymbappe.data.sources.fetch_wikipedia_manager_history`)
+    and derives knockout stats from the ingested ``matches`` table via
+    :func:`derive_manager_records`. Output columns =
+    ``TABLE_COLUMNS[Table.MANAGER_RECORDS]``: ``team`` is canonicalized via
+    :func:`normalize_team_expr`; int counts (``knockout_matches``, ``knockout_wins``,
+    ``tournament_order``) are cast; ``stage_reached`` must be from the manager builder's
+    stage vocabulary; ``tournament`` must equal a ``Tournament.name``.
+
+    Skips (returns 0) when the local file is absent AND the scraper yields nothing.
+    """
+
+    settings = settings or Settings()
+    required = set(TABLE_COLUMNS[Table.MANAGER_RECORDS])
+    local = settings.raw_data_dir / "manager_records.csv"
+    if local.exists():
+        raw = pl.read_csv(io.BytesIO(local.read_bytes()))
+        logger.info("ingest.manager_records.local", path=str(local), rows=raw.height)
+    else:
+        raw = _scrape_manager_records(settings)
+        if raw is None or raw.height == 0:
+            logger.info(
+                "ingest.manager_records.skip",
+                reason="no data/raw/manager_records.csv and scraper empty",
+            )
+            return 0
+        logger.info("ingest.manager_records.scraped", rows=raw.height)
+
+    missing = required - set(raw.columns)
+    if missing:
+        raise ValueError(f"manager_records source missing columns: {sorted(missing)}")
+
+    normalized = raw.select(
+        pl.col("manager").cast(pl.Utf8),
+        normalize_team_expr("team").alias("team"),
+        pl.col("tournament").cast(pl.Utf8),
+        pl.col("stage_reached").cast(pl.Utf8),
+        pl.col("knockout_matches").cast(pl.Int64),
+        pl.col("knockout_wins").cast(pl.Int64),
+        pl.col("tournament_order").cast(pl.Int64),
+    ).select(TABLE_COLUMNS[Table.MANAGER_RECORDS])
+    write_table(Table.MANAGER_RECORDS, normalized, mode="overwrite", settings=settings)
+    logger.info("ingest.manager_records.stored", rows=normalized.height)
+    return normalized.height
+
+
+def _scrape_manager_records(settings: Settings) -> pl.DataFrame | None:
+    """Scrape manager tenure windows + derive records against the ``matches`` table.
+
+    Reads optional ``data/raw/managers.csv`` (column ``manager`` per row), fetches each
+    manager's Wikipedia tenure history, and calls :func:`derive_manager_records` against the
+    ingested ``matches`` table. Returns ``None`` when no manifest, no matches table, or
+    nothing derived — so the local-CSV path stays the default and tests stay offline.
+    """
+
+    manifest_path = settings.raw_data_dir / "managers.csv"
+    if not manifest_path.exists() or not table_exists(Table.MATCHES, settings):
+        return None
+    manifest = pl.read_csv(io.BytesIO(manifest_path.read_bytes()))
+    tenure_rows: list[dict[str, object]] = []
+    for entry in manifest.iter_rows(named=True):
+        tenure_rows.extend(
+            sources.fetch_wikipedia_manager_history(str(entry["manager"]), settings=settings)
+        )
+    if not tenure_rows:
+        return None
+    matches = read_table(Table.MATCHES, settings)
+    derived = derive_manager_records(tenure_rows, matches)
+    return derived if derived.height > 0 else None
+
+
 def ingest_all_sources(live: bool = False, settings: Settings | None = None) -> dict[str, int]:
     """Ingest all configured upstream datasets into normalized storage.
 
     Runs results first (the others depend on it or are optional overlays), then Elo
-    (self-computed from results), market odds, and team xG. Each source is isolated:
-    a failure or a skipped optional source is recorded rather than aborting the run.
+    (self-computed from results), market odds, team xG, squads (Transfermarkt → cohesion
+    inputs), and manager records (Wikipedia tenure + match-join derivation → manager
+    pedigree). Each source is isolated: a failure or a skipped optional source is recorded
+    rather than aborting the run.
 
     Args:
         live: Incremental mode — append latest results/odds rather than overwrite.
@@ -268,6 +574,8 @@ def ingest_all_sources(live: bool = False, settings: Settings | None = None) -> 
         ("elo", ingest_elo, False),
         ("market_odds", ingest_market_odds, True),
         ("team_xg", ingest_team_xg, False),
+        ("squads", ingest_squads, False),
+        ("manager_records", ingest_manager_records, False),
     )
     for name, fn, takes_live in steps:
         try:
@@ -276,9 +584,11 @@ def ingest_all_sources(live: bool = False, settings: Settings | None = None) -> 
             logger.warning("ingest.source_failed", source=name, error=str(exc))
             report[name] = -1
 
-    # Transfermarkt squad valuations and FBref live scraping remain manual/optional:
-    # their fetchers exist in `sources` but require auth/heavy network and are off the
-    # minimum-viable-model critical path.
+    # Transfermarkt squad *valuations* (SQUAD_VALUATIONS) and FBref live xG scraping remain
+    # manual/optional: their fetchers exist in `sources` but require auth/heavy network and
+    # are off the minimum-viable-model critical path. The squads (per-player) and manager
+    # records sources above prefer a local CSV and fall back to cached scrapers, so they are
+    # safe to run by default — an absent local file + empty scraper records `0`.
 
     logger.info("ingest.done", report=report)
     return report

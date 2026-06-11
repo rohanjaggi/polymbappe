@@ -108,6 +108,106 @@ def test_train_full_stack_and_persist(tmp_path) -> None:
     assert loaded.predict_match("A", "D")["home_win"] > 0.0
 
 
+def _write_context_tables(settings, tournaments=_TOURNAMENTS) -> None:
+    """Squads + manager records for every tournament in ``tournaments`` (all teams).
+
+    Mirrors the data contract the assembly path consumes (Phase C): per-player ``squads``
+    rows (``team/tournament/player/club/age``) and per-team ``manager_records``
+    (``manager/team/tournament/stage_reached/knockout_matches/knockout_wins/
+    tournament_order``). Populated densely so cohesion has data for every tournament and
+    manager has pre-cutoff pedigree for all but the earliest one.
+    """
+
+    from polymbappe.data.store import write_table
+    from polymbappe.data.tables import Table
+
+    squad_rows: list[dict[str, object]] = []
+    record_rows: list[dict[str, object]] = []
+    for order, t in enumerate(tournaments, start=1):
+        for team in TEAMS:
+            # Two club-mates (a cohesion pair) + one outlier -> club_cluster_index == 1.
+            for p, club in enumerate(("City", "City", "Madrid")):
+                squad_rows.append(
+                    {
+                        "team": team, "tournament": t.name, "player": f"{team}p{p}",
+                        "club": club, "age": 27.0 + p,
+                    }
+                )
+            record_rows.append(
+                {
+                    "manager": f"mgr{team}", "team": team, "tournament": t.name,
+                    "stage_reached": "FINAL" if team == "A" else "QF",
+                    "knockout_matches": 6, "knockout_wins": 5 if team == "A" else 2,
+                    "tournament_order": order,
+                }
+            )
+    write_table(Table.SQUADS, pl.DataFrame(squad_rows), settings=settings)
+    write_table(Table.MANAGER_RECORDS, pl.DataFrame(record_rows), settings=settings)
+
+
+def test_train_to_adjuster_integration_with_context_tables(tmp_path) -> None:
+    """End-to-end fit smoke: synthetic matches + squads/manager tables -> fitted adjuster.
+
+    Drives the real contextual FIT seam (``build_tournament_context_features`` ->
+    ``_fit_contextual_adjuster``) over a tiny-but-LightGBM-fittable dataset and asserts:
+    (a) it does not crash and produces an adjuster; (b) the fitted adjuster's
+    ``active_features`` include the cohesion and manager columns (toggles on by default);
+    (c) the assembled context frame carries all 11 ``SIM_CONTEXT_FEATURES`` *and* the
+    cohesion/manager columns carry real non-zero data (coverage is sufficient, not 0-fill).
+    """
+
+    import importlib.util
+
+    from polymbappe.config import Settings
+    from polymbappe.context.runtime import (
+        FEATURE_GROUPS,
+        SIM_CONTEXT_FEATURES,
+        build_tournament_context_features,
+    )
+    from polymbappe.models.ensemble import BASE_GROUPS, EnsembleConfig, build_dual_pipelines
+    from polymbappe.models.train import (
+        _attach_core_features,
+        _fit_contextual_adjuster,
+        assemble_stacked_frame,
+    )
+
+    settings = Settings(data_dir=tmp_path)
+    _write_context_tables(settings)
+    matches = _make_matches()
+
+    # (c) The assembled fit frame carries all 11 columns with real cohesion/manager data.
+    context = build_tournament_context_features(
+        matches, _TOURNAMENTS, settings, include_tournament=True
+    )
+    assert all(c in context.columns for c in SIM_CONTEXT_FEATURES)
+    cohesion_tournaments = (
+        context.filter(pl.col("home_club_cluster_index") != 0.0)["tournament"].n_unique()
+    )
+    manager_tournaments = (
+        context.filter(pl.col("home_knockout_win_rate") != 0.0)["tournament"].n_unique()
+    )
+    assert cohesion_tournaments == 3  # cohesion has data for every tournament
+    assert manager_tournaments >= 2  # earliest tournament has no pre-cutoff pedigree
+
+    # Build the stacked frame + calibration ensemble the adjuster is fit against.
+    frame = assemble_stacked_frame(matches, _TOURNAMENTS)
+    frame, core_cols = _attach_core_features(frame, matches, None)
+    gbm_available = importlib.util.find_spec("lightgbm") is not None
+    gbm_cols = [c for c in BASE_GROUPS["dc"] + BASE_GROUPS["elo"] if c in frame.columns] + core_cols
+    cfg = EnsembleConfig(base_groups=("dc", "elo"), use_gbm=gbm_available and bool(gbm_cols))
+    calibration, _edge = build_dual_pipelines(cfg, gbm_feature_columns=gbm_cols)
+    calibration.fit(frame)
+
+    # (a) The real fit seam produces an adjuster without crashing.
+    adjuster = _fit_contextual_adjuster(frame, calibration, context.drop("tournament"))
+    assert adjuster is not None
+
+    # (b) Cohesion + manager columns are in the fitted feature set (toggles default on).
+    for group in ("cohesion", "manager"):
+        for col in FEATURE_GROUPS[group]:
+            assert col in adjuster.active_features
+
+
 def test_contextual_adjuster_fit_and_persisted(tmp_path) -> None:
     import numpy as np
 
