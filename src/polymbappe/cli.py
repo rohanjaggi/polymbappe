@@ -94,7 +94,8 @@ def edges_command(
 def report_command(tournament: int = 2026) -> None:
     """Generate the tournament prediction report."""
 
-    generate_report(tournament=tournament)
+    path = generate_report(tournament=tournament)
+    typer.echo(f"Report written to {path}")
 
 
 @app.command("autotune")
