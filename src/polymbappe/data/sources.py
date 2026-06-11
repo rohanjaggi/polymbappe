@@ -16,9 +16,12 @@ from urllib.parse import urlsplit
 
 import polars as pl
 import requests
+import structlog
 from bs4 import BeautifulSoup
 
 from polymbappe.config import Settings
+
+logger = structlog.get_logger(__name__)
 
 #: Default raw CSV mirror of martj42/international_results (GitHub raw, no Kaggle auth).
 KAGGLE_RESULTS_RAW_URL = (
@@ -156,6 +159,238 @@ def fetch_football_data_csv(url: str, timeout: float = 60.0) -> pl.DataFrame:
     """Download a Football-Data.co.uk CSV of bookmaker odds into Polars."""
 
     return pl.read_csv(io.BytesIO(_get(url, timeout).content), ignore_errors=True)
+
+
+#: Transfermarkt squad/kader page template. ``{slug}`` is the team's URL slug and
+#: ``{tm_id}`` its numeric club id; appended ``saison_id`` selects the season. Layout is
+#: anti-bot-sensitive, so fetches go through :func:`cached_get` (browser headers + cache).
+TRANSFERMARKT_SQUAD_URL = (
+    "https://www.transfermarkt.com/{slug}/kader/verein/{tm_id}/saison_id/{saison_id}"
+)
+
+
+def fetch_transfermarkt_squad(
+    tournament: str,
+    team: str,
+    *,
+    settings: Settings | None = None,
+    url: str | None = None,
+    tm_id: str | None = None,
+    saison_id: str = "",
+    min_interval: float = 2.5,
+    timeout: float = 20.0,
+) -> list[dict[str, object]]:
+    """Fetch one national team's Transfermarkt squad (kader) page → raw player rows.
+
+    Returns a list of ``{"player", "club", "age", "team", "tournament"}`` dicts (one per
+    called-up player). Market-value parsing is intentionally OUT OF SCOPE — cohesion only
+    needs ``player``/``club``/``age``.
+
+    The page is fetched through :func:`cached_get` (browser headers, on-disk cache,
+    ``min_interval`` throttle defaulting to 2.5s for Transfermarkt). Brittle selectors are
+    isolated: any parse/layout failure logs and returns ``[]`` rather than raising, so an
+    upstream redesign degrades to "no rows" instead of breaking ingestion.
+
+    Args:
+        tournament: ``Tournament.name`` this snapshot belongs to (passed through onto rows).
+        team: Source team name (canonicalization happens at ingest time).
+        url: Explicit squad URL; overrides the ``slug``/``tm_id`` template.
+        tm_id / saison_id: Components of the default :data:`TRANSFERMARKT_SQUAD_URL`.
+        min_interval: Per-host throttle seconds (pass ``0`` in tests).
+    """
+
+    if url is None:
+        if tm_id is None:
+            logger.warning(
+                "sources.transfermarkt.no_url", team=team, reason="no url or tm_id provided"
+            )
+            return []
+        slug = team.lower().replace(" ", "-")
+        url = TRANSFERMARKT_SQUAD_URL.format(slug=slug, tm_id=tm_id, saison_id=saison_id)
+
+    try:
+        html = cached_get(
+            url, settings=settings, timeout=timeout, min_interval=min_interval
+        ).decode("utf-8", errors="replace")
+    except Exception as exc:  # noqa: BLE001 - network failure isolated, degrade to empty
+        logger.warning("sources.transfermarkt.fetch_failed", team=team, url=url, error=str(exc))
+        return []
+
+    try:
+        return _parse_transfermarkt_squad(html, team=team, tournament=tournament)
+    except Exception as exc:  # noqa: BLE001 - brittle selectors isolated
+        logger.warning("sources.transfermarkt.parse_failed", team=team, error=str(exc))
+        return []
+
+
+def _parse_transfermarkt_squad(
+    html: str, *, team: str, tournament: str
+) -> list[dict[str, object]]:
+    """Parse a Transfermarkt squad table into ``player``/``club``/``age`` rows.
+
+    Selector-isolated helper for :func:`fetch_transfermarkt_squad`. The kader table rows
+    (``table.items > tbody > tr``) carry the player name in the ``inline-table`` hauptlink
+    cell, the club in the row's club-logo ``img`` alt/title, and the age inside a
+    parenthesized ``(DD/MM/YYYY (age))`` birth-date cell.
+    """
+
+    import re
+
+    soup = BeautifulSoup(html, "html.parser")
+    table = soup.select_one("table.items")
+    if table is None:
+        return []
+
+    rows: list[dict[str, object]] = []
+    for tr in table.select("tbody > tr"):
+        name_cell = tr.select_one("td.hauptlink a") or tr.select_one(".inline-table a")
+        if name_cell is None:
+            continue
+        player = name_cell.get_text(strip=True)
+        if not player:
+            continue
+
+        club: str | None = None
+        club_img = tr.select_one("td img.tiny_wappen") or tr.select_one(
+            "td a img[class*='wappen']"
+        )
+        if club_img is not None:
+            club = (club_img.get("alt") or club_img.get("title") or "").strip() or None
+
+        age: float | None = None
+        for td in tr.select("td.zentriert"):
+            text = td.get_text(strip=True)
+            match = re.search(r"\((\d{1,2})\)", text)
+            if match:
+                age = float(match.group(1))
+                break
+
+        rows.append(
+            {
+                "player": player,
+                "club": club,
+                "age": age,
+                "team": team,
+                "tournament": tournament,
+            }
+        )
+    return rows
+
+
+#: MediaWiki API endpoint used to pull a manager's article wikitext for tenure parsing.
+WIKIPEDIA_API_URL = "https://en.wikipedia.org/w/api.php"
+
+
+def fetch_wikipedia_manager_history(
+    manager: str,
+    *,
+    settings: Settings | None = None,
+    api_url: str = WIKIPEDIA_API_URL,
+    min_interval: float = 1.0,
+    timeout: float = 20.0,
+) -> list[dict[str, object]]:
+    """Fetch a manager's national-team tenure rows from Wikipedia (MediaWiki API).
+
+    Returns raw ``{"manager", "team", "start_year", "end_year"}`` tenure rows. There is NO
+    canonical knockout-record field on Wikipedia, so this fetch only yields the manager's
+    national-team **tenure windows**; the derivation of
+    ``knockout_matches``/``knockout_wins``/``stage_reached`` from those windows joined
+    against the ingested ``matches`` table happens in the ingest layer
+    (:func:`~polymbappe.data.ingest.derive_manager_records`), not here.
+
+    The infobox "Managerial career → National team (start–end)" rows are parsed from the
+    article wikitext. Any fetch/parse failure logs and returns ``[]`` (graceful degrade).
+    """
+
+    from urllib.parse import urlencode
+
+    params = {
+        "action": "query",
+        "prop": "revisions",
+        "rvprop": "content",
+        "rvslots": "main",
+        "format": "json",
+        "titles": manager,
+        "redirects": "1",
+    }
+    url = f"{api_url}?{urlencode(params)}"
+    try:
+        body = cached_get(
+            url, settings=settings, timeout=timeout, min_interval=min_interval
+        ).decode("utf-8", errors="replace")
+    except Exception as exc:  # noqa: BLE001 - network isolated
+        logger.warning("sources.wikipedia.fetch_failed", manager=manager, error=str(exc))
+        return []
+
+    try:
+        return _parse_wikipedia_manager_history(body, manager=manager)
+    except Exception as exc:  # noqa: BLE001 - brittle parse isolated
+        logger.warning("sources.wikipedia.parse_failed", manager=manager, error=str(exc))
+        return []
+
+
+def _parse_wikipedia_manager_history(
+    body: str, *, manager: str
+) -> list[dict[str, object]]:
+    """Parse national-team manager tenure windows from a MediaWiki revisions JSON blob.
+
+    Selector-isolated helper for :func:`fetch_wikipedia_manager_history`. Scans the infobox
+    "Managerclubs"/"Manageryears" wikitext for national-team rows and extracts the
+    ``start_year``/``end_year`` of each tenure (an open-ended tenure has ``end_year=None``).
+    """
+
+    import json
+    import re
+
+    payload = json.loads(body)
+    pages = payload.get("query", {}).get("pages", {})
+    wikitext = ""
+    for page in pages.values():
+        revisions = page.get("revisions") or []
+        if revisions:
+            slots = revisions[0].get("slots", {})
+            wikitext = slots.get("main", {}).get("*", "") or revisions[0].get("*", "")
+            break
+    if not wikitext:
+        return []
+
+    rows: list[dict[str, object]] = []
+    # Infobox managerial-career rows pair a years field with a club/team field, e.g.
+    # | manageryears3 = 2018–2022 | managerclubs3 = [[England national football team|England]]
+    years = dict(re.findall(r"manageryears(\d*)\s*=\s*([^\n|]+)", wikitext))
+    clubs = dict(re.findall(r"managerclubs(\d*)\s*=\s*([^\n|]+)", wikitext))
+    for key, raw_years in years.items():
+        raw_team = clubs.get(key)
+        if not raw_team:
+            continue
+        team = _wikilink_text(raw_team)
+        span = re.search(r"(\d{4})\s*[–\-]\s*(\d{4})?", raw_years)
+        if span is None:
+            continue
+        start_year = int(span.group(1))
+        end_year = int(span.group(2)) if span.group(2) else None
+        rows.append(
+            {
+                "manager": manager,
+                "team": team,
+                "start_year": start_year,
+                "end_year": end_year,
+            }
+        )
+    return rows
+
+
+def _wikilink_text(raw: str) -> str:
+    """Extract display text from a ``[[Target|Display]]`` (or ``[[Target]]``) wikilink."""
+
+    import re
+
+    cleaned = raw.strip()
+    match = re.search(r"\[\[([^\]]+)\]\]", cleaned)
+    if match:
+        inner = match.group(1)
+        return inner.split("|")[-1].strip() if "|" in inner else inner.strip()
+    return cleaned
 
 
 def get_fbref_matches(

@@ -8,9 +8,12 @@ import polars as pl
 
 from polymbappe.config import Settings
 from polymbappe.data.ingest import (
+    derive_manager_records,
     ingest_all_sources,
     ingest_elo,
+    ingest_manager_records,
     ingest_market_odds,
+    ingest_squads,
     ingest_team_xg,
 )
 from polymbappe.data.store import read_table, table_exists
@@ -97,6 +100,87 @@ def test_ingest_team_xg_from_local(tmp_path: Path) -> None:
     xg = read_table(Table.TEAM_XG, settings)
     assert set(xg.columns) == set(TABLE_COLUMNS[Table.TEAM_XG])
     assert xg.row(0, named=True)["xg"] == 2.7
+
+
+def test_ingest_squads_from_local(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    (settings.raw_data_dir / "squads.csv").write_text(
+        "team,tournament,player,club,age\n"
+        "USA,WC2018,Christian Pulisic, Borussia Dortmund ,19\n"
+        "USA,WC2018,Weston McKennie,Schalke 04,20\n"
+        "Brazil,WC2018,Neymar,Paris Saint-Germain,26\n"
+    )
+    n = ingest_squads(settings)
+    assert n == 3
+    squads = read_table(Table.SQUADS, settings)
+    assert tuple(squads.columns) == TABLE_COLUMNS[Table.SQUADS]
+    assert squads.schema["age"] == pl.Float64
+    # team normalized via alias (USA -> United States) and club trimmed.
+    usa = squads.filter(pl.col("player") == "Christian Pulisic").row(0, named=True)
+    assert usa["team"] == "United States"
+    assert usa["club"] == "Borussia Dortmund"
+    assert "USA" not in set(squads["team"].to_list())
+
+
+def test_ingest_squads_skips_when_absent(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    assert ingest_squads(settings) == 0
+    assert not table_exists(Table.SQUADS, settings)
+
+
+def test_ingest_manager_records_from_local(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    (settings.raw_data_dir / "manager_records.csv").write_text(
+        "manager,team,tournament,stage_reached,knockout_matches,knockout_wins,tournament_order\n"
+        "Gregg Berhalter,USA,WC2022,R16,1,0,3\n"
+        "Tite,Brazil,WC2018,QF,2,1,2\n"
+    )
+    n = ingest_manager_records(settings)
+    assert n == 2
+    records = read_table(Table.MANAGER_RECORDS, settings)
+    assert tuple(records.columns) == TABLE_COLUMNS[Table.MANAGER_RECORDS]
+    assert records.schema["knockout_matches"] == pl.Int64
+    assert records.schema["tournament_order"] == pl.Int64
+    usa = records.filter(pl.col("manager") == "Gregg Berhalter").row(0, named=True)
+    assert usa["team"] == "United States"  # alias normalized
+    assert "USA" not in set(records["team"].to_list())
+
+
+def test_ingest_manager_records_skips_when_absent(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    assert ingest_manager_records(settings) == 0
+    assert not table_exists(Table.MANAGER_RECORDS, settings)
+
+
+def test_derive_manager_records_from_matches() -> None:
+    from datetime import date
+
+    from polymbappe.eval.backtest import Tournament
+
+    tours = (Tournament("WC2018", "FIFA World Cup", date(2018, 6, 14), date(2018, 7, 15)),)
+    matches = pl.DataFrame(
+        {
+            "home_team": ["Brazil", "Brazil"],
+            "away_team": ["Mexico", "Belgium"],
+            "home_goals": [2, 1],
+            "away_goals": [0, 2],
+            "competition": ["FIFA World Cup", "FIFA World Cup"],
+            "is_knockout": [True, True],
+            "date": [date(2018, 7, 2), date(2018, 7, 6)],
+        }
+    )
+    out = derive_manager_records(
+        [{"manager": "Tite", "team": "Brazil", "start_year": 2016, "end_year": 2022}],
+        matches,
+        tournaments=tours,
+    )
+    assert tuple(out.columns) == TABLE_COLUMNS[Table.MANAGER_RECORDS]
+    row = out.row(0, named=True)
+    assert row["tournament"] == "WC2018"
+    assert row["knockout_matches"] == 2  # won R16, lost QF
+    assert row["knockout_wins"] == 1
+    assert row["stage_reached"] == "QF"  # 2 knockout matches reached -> QF
+    assert row["tournament_order"] == 0
 
 
 def test_normalize_footballdata_odds() -> None:
@@ -195,5 +279,7 @@ def test_ingest_all_sources_orchestration(tmp_path: Path) -> None:
     assert report["elo"] == 6
     assert report["market_odds"] == 1
     assert report["team_xg"] == 0  # optional, no file -> skipped cleanly
+    assert report["squads"] == 0  # optional, no file/scraper -> skipped cleanly
+    assert report["manager_records"] == 0  # optional, no file/scraper -> skipped cleanly
     for table in (Table.MATCHES, Table.ELO_SNAPSHOTS, Table.MARKET_ODDS):
         assert table_exists(table, settings)
