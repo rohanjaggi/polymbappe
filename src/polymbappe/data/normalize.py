@@ -149,6 +149,58 @@ def implied_probabilities(
     return raw_h / overround, raw_d / overround, raw_a / overround
 
 
+#: Bookmaker odds-column prefixes in Football-Data.co.uk CSVs, best first: Bet365,
+#: market average, Pinnacle, then the older Bet&Win / average columns.
+_FOOTBALLDATA_PREFIXES: tuple[str, ...] = ("B365", "Avg", "PS", "P", "BW", "BbAv")
+
+
+def normalize_footballdata_odds(
+    raw: pl.DataFrame, *, source: str = "football-data"
+) -> pl.DataFrame:
+    """Normalize a Football-Data.co.uk CSV into the ``market_odds`` schema.
+
+    Picks the first available bookmaker odds triple (``{prefix}H/D/A`` for a prefix in
+    :data:`_FOOTBALLDATA_PREFIXES`), builds the ``date__home__away`` match id (matching the
+    matches table convention so odds join by id), and removes the overround. Football-Data
+    covers club leagues, so these odds join any match sharing that id convention. Rows
+    missing the chosen odds, date, or teams are dropped.
+    """
+
+    required = {"Date", "HomeTeam", "AwayTeam"}
+    missing = required - set(raw.columns)
+    if missing:
+        raise ValueError(f"Football-Data CSV missing columns: {sorted(missing)}")
+
+    prefix = next(
+        (
+            p
+            for p in _FOOTBALLDATA_PREFIXES
+            if {f"{p}H", f"{p}D", f"{p}A"}.issubset(raw.columns)
+        ),
+        None,
+    )
+    if prefix is None:
+        raise ValueError("Football-Data CSV has no recognized H/D/A odds columns.")
+
+    iso_date = pl.coalesce(
+        pl.col("Date").cast(pl.Utf8).str.to_date("%d/%m/%Y", strict=False),
+        pl.col("Date").cast(pl.Utf8).str.to_date("%d/%m/%y", strict=False),
+    )
+    prepared = raw.with_columns(iso_date.alias("_date")).drop_nulls("_date").with_columns(
+        pl.format("{}__{}__{}", pl.col("_date"), pl.col("HomeTeam"), pl.col("AwayTeam"))
+        .alias("match_id")
+    )
+    return normalize_odds_frame(
+        prepared,
+        source=source,
+        home_col=f"{prefix}H",
+        draw_col=f"{prefix}D",
+        away_col=f"{prefix}A",
+        match_id_col="match_id",
+        timestamp_col=None,
+    )
+
+
 def normalize_odds_frame(
     raw: pl.DataFrame,
     *,

@@ -76,53 +76,131 @@ def ingest_elo(settings: Settings | None = None) -> int:
     return snapshots.height
 
 
-def ingest_market_odds(
-    settings: Settings | None = None, *, live: bool = False, source: str = "football-data"
-) -> int:
-    """Ingest bookmaker/market odds into the ``market_odds`` table.
+_MARKET_ODDS_COLUMNS = TABLE_COLUMNS[Table.MARKET_ODDS]
 
-    Reads a normalized decimal-odds CSV at ``data/raw/odds.csv`` with columns
-    ``date, home_team, away_team, home_odds, draw_odds, away_odds`` (optional
-    ``timestamp``). The per-match ``match_id`` is rebuilt with the same
-    ``date__home__away`` convention as the matches table so odds join cleanly; team
-    spellings must therefore match the results source. Overround is removed by
-    :func:`~polymbappe.data.normalize.normalize_odds_frame`.
 
-    Skips (returns 0) when the file is absent — market odds are optional for the MVM path.
-    """
+def _local_odds(settings: Settings) -> pl.DataFrame | None:
+    """Normalized decimal-odds CSV at ``data/raw/odds.csv`` (manual / fallback source)."""
 
-    settings = settings or Settings()
     local = settings.raw_data_dir / "odds.csv"
     if not local.exists():
-        logger.info("ingest.odds.skip", reason="no data/raw/odds.csv")
-        return 0
-
+        return None
     raw = pl.read_csv(io.BytesIO(local.read_bytes()))
     required = {"date", "home_team", "away_team", "home_odds", "draw_odds", "away_odds"}
     missing = required - set(raw.columns)
     if missing:
         raise ValueError(f"odds.csv missing columns: {sorted(missing)}")
-
     raw = raw.with_columns(
         pl.col("date").cast(pl.Utf8).str.to_date(strict=False).alias("date")
     ).with_columns(
         pl.format("{}__{}__{}", pl.col("date"), pl.col("home_team"), pl.col("away_team"))
         .alias("match_id")
     )
+    return normalize_odds_frame(
+        raw, source="local-csv", home_col="home_odds", draw_col="draw_odds",
+        away_col="away_odds", timestamp_col="timestamp" if "timestamp" in raw.columns else None,
+    )
 
-    normalized = normalize_odds_frame(
-        raw,
-        source=source,
-        home_col="home_odds",
-        draw_col="draw_odds",
-        away_col="away_odds",
-        timestamp_col="timestamp" if "timestamp" in raw.columns else None,
-    )
+
+def _footballdata_odds(settings: Settings) -> pl.DataFrame | None:
+    """Football-Data.co.uk bookmaker odds from local CSVs and/or configured URLs.
+
+    Local CSVs: ``data/raw/football_data/*.csv``. Remote: one URL per line in
+    ``data/raw/football_data_urls.txt``. Each is parsed by
+    :func:`~polymbappe.data.normalize.normalize_footballdata_odds`; network failures are
+    isolated per URL.
+    """
+
+    from polymbappe.data.normalize import normalize_footballdata_odds
+
+    frames: list[pl.DataFrame] = []
+    local_dir = settings.raw_data_dir / "football_data"
+    if local_dir.is_dir():
+        for csv_path in sorted(local_dir.glob("*.csv")):
+            raw = pl.read_csv(io.BytesIO(csv_path.read_bytes()), ignore_errors=True)
+            frames.append(normalize_footballdata_odds(raw))
+    url_file = settings.raw_data_dir / "football_data_urls.txt"
+    if url_file.exists():
+        for url in url_file.read_text().splitlines():
+            url = url.strip()
+            if not url or url.startswith("#"):
+                continue
+            try:
+                raw = sources.fetch_football_data_csv(url)
+                frames.append(normalize_footballdata_odds(raw))
+            except Exception as exc:  # noqa: BLE001 - isolate per-URL fetch/parse failure
+                logger.warning("ingest.odds.footballdata_url_failed", url=url, error=str(exc))
+    if not frames:
+        return None
+    return pl.concat(frames, how="vertical_relaxed")
+
+
+def _polymarket_odds(settings: Settings) -> pl.DataFrame | None:
+    """Polymarket three-way match odds, aligned to the 2026 fixtures in match_predictions.
+
+    Requires ``data/outputs/match_predictions.parquet`` (run ``simulate`` once) to orient
+    each market to a fixture's home/away and key it as ``2026__home__away``. The query slug
+    is read from ``data/raw/polymarket_query.txt`` when present. Network/auth failures are
+    isolated and return ``None``.
+    """
+
+    from polymbappe.polymarket import adapter
+
+    preds_path = settings.outputs_data_dir / "match_predictions.parquet"
+    if not preds_path.exists():
+        logger.info("ingest.odds.polymarket_skip", reason="no match_predictions fixtures")
+        return None
+    fixtures = pl.read_parquet(preds_path).select("match_id", "home_team", "away_team")
+    query_file = settings.raw_data_dir / "polymarket_query.txt"
+    query = query_file.read_text().strip() if query_file.exists() else None
+    try:
+        long_prices = adapter.fetch_polymarket_prices(query=query)
+    except Exception as exc:  # noqa: BLE001 - network/auth isolated
+        logger.warning("ingest.odds.polymarket_failed", error=str(exc))
+        return None
+    three_way = adapter.normalize_polymarket_three_way(long_prices)
+    aligned = adapter.align_polymarket_to_fixtures(three_way, fixtures)
+    return aligned if aligned.height > 0 else None
+
+
+def ingest_market_odds(settings: Settings | None = None, *, live: bool = False) -> int:
+    """Ingest market odds into ``market_odds`` from all available sources.
+
+    Gathers from (1) a local normalized ``odds.csv``, (2) Football-Data.co.uk CSVs/URLs,
+    and (3) Polymarket (aligned to the 2026 fixtures). Each source is isolated; sources
+    with no input are skipped. Frames are concatenated and de-duplicated on
+    ``(match_id, source)``. Match ids follow ``date__home__away`` (Football-Data / local)
+    or ``2026__home__away`` (Polymarket) so odds join the matches / predictions tables.
+
+    Returns the number of odds rows written (0 if no source produced any).
+    """
+
+    settings = settings or Settings()
+    gathered: list[pl.DataFrame] = []
+    for name, fetch in (
+        ("local", _local_odds),
+        ("football-data", _footballdata_odds),
+        ("polymarket", _polymarket_odds),
+    ):
+        try:
+            frame = fetch(settings)
+        except Exception as exc:  # noqa: BLE001 - isolate per-source failure
+            logger.warning("ingest.odds.source_failed", source=name, error=str(exc))
+            frame = None
+        if frame is not None and frame.height > 0:
+            gathered.append(frame.select(_MARKET_ODDS_COLUMNS))
+            logger.info("ingest.odds.source", source=name, rows=frame.height)
+
+    if not gathered:
+        logger.info("ingest.odds.skip", reason="no odds source produced data")
+        return 0
+
+    combined = pl.concat(gathered, how="vertical_relaxed").unique(subset=["match_id", "source"])
     write_table(
-        Table.MARKET_ODDS, normalized, mode="append" if live else "overwrite", settings=settings
+        Table.MARKET_ODDS, combined, mode="append" if live else "overwrite", settings=settings
     )
-    logger.info("ingest.odds.stored", rows=normalized.height, live=live)
-    return normalized.height
+    logger.info("ingest.odds.stored", rows=combined.height, live=live)
+    return combined.height
 
 
 def ingest_team_xg(settings: Settings | None = None) -> int:

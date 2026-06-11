@@ -83,3 +83,102 @@ def fetch_polymarket_prices(
             "price": pl.Float64,
         },
     )
+
+
+def normalize_polymarket_three_way(
+    long_prices: pl.DataFrame, draw_label: str = "Draw"
+) -> pl.DataFrame:
+    """Collapse long outcome prices into per-market three-way (team/draw/team) rows.
+
+    A match market has exactly three outcomes: two team names and a draw. Prices are
+    treated as implied probabilities and renormalized to remove the overround. Markets that
+    aren't a clean three-way (no draw, wrong outcome count) are skipped.
+
+    Returns ``[market_id, question, team_a, team_b, prob_a, prob_draw, prob_b]`` (team_a /
+    team_b in their listed order; orientation to home/away happens in
+    :func:`align_polymarket_to_fixtures`).
+    """
+
+    rows: list[dict[str, Any]] = []
+    for (market_id,), group in long_prices.group_by(["market_id"]):
+        outcomes = group["outcome"].to_list()
+        prices = [float(p) for p in group["price"].to_list()]
+        draw_idx = [i for i, o in enumerate(outcomes) if o.strip().lower() == draw_label.lower()]
+        team_idx = [i for i in range(len(outcomes)) if i not in draw_idx]
+        if len(draw_idx) != 1 or len(team_idx) != 2:
+            continue
+        total = sum(prices)
+        if total <= 0:
+            continue
+        ia, ib = team_idx
+        idr = draw_idx[0]
+        rows.append(
+            {
+                "market_id": str(market_id),
+                "question": group["question"].to_list()[0],
+                "team_a": outcomes[ia],
+                "team_b": outcomes[ib],
+                "prob_a": prices[ia] / total,
+                "prob_draw": prices[idr] / total,
+                "prob_b": prices[ib] / total,
+            }
+        )
+    return pl.DataFrame(
+        rows,
+        schema={
+            "market_id": pl.Utf8,
+            "question": pl.Utf8,
+            "team_a": pl.Utf8,
+            "team_b": pl.Utf8,
+            "prob_a": pl.Float64,
+            "prob_draw": pl.Float64,
+            "prob_b": pl.Float64,
+        },
+    )
+
+
+def align_polymarket_to_fixtures(
+    three_way: pl.DataFrame, fixtures: pl.DataFrame, *, source: str = "polymarket"
+) -> pl.DataFrame:
+    """Map three-way market rows onto known fixtures, oriented to home/away.
+
+    ``fixtures`` provides ``[match_id, home_team, away_team]``. A market is matched to a
+    fixture by its unordered team pair, then its probabilities are oriented to the fixture's
+    home/away so the result joins ``match_predictions`` by ``match_id``. Team spellings must
+    match across sources (normalization is handled upstream). Returns the ``market_odds``
+    schema.
+    """
+
+    lookup: dict[frozenset[str], dict[str, str]] = {
+        frozenset({r["home_team"], r["away_team"]}): r
+        for r in fixtures.iter_rows(named=True)
+    }
+    rows: list[dict[str, Any]] = []
+    for m in three_way.iter_rows(named=True):
+        fixture = lookup.get(frozenset({m["team_a"], m["team_b"]}))
+        if fixture is None:
+            continue
+        a_is_home = m["team_a"] == fixture["home_team"]
+        home_p = m["prob_a"] if a_is_home else m["prob_b"]
+        away_p = m["prob_b"] if a_is_home else m["prob_a"]
+        rows.append(
+            {
+                "match_id": fixture["match_id"],
+                "source": source,
+                "home_win_prob": float(home_p),
+                "draw_prob": float(m["prob_draw"]),
+                "away_win_prob": float(away_p),
+                "timestamp": None,
+            }
+        )
+    return pl.DataFrame(
+        rows,
+        schema={
+            "match_id": pl.Utf8,
+            "source": pl.Utf8,
+            "home_win_prob": pl.Float64,
+            "draw_prob": pl.Float64,
+            "away_win_prob": pl.Float64,
+            "timestamp": pl.Datetime,
+        },
+    )
