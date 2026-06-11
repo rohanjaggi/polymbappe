@@ -54,10 +54,12 @@ def normalize_kaggle_results(raw: pl.DataFrame) -> pl.DataFrame:
     present = {k: v for k, v in _KAGGLE_RENAME.items() if k in raw.columns}
     df = raw.rename(present)
 
+    from polymbappe.data.aliases import normalize_team_expr
+
     df = df.with_columns(
         pl.col("date").cast(pl.Utf8).str.to_date(strict=False).alias("date"),
-        pl.col("home_team").cast(pl.Utf8),
-        pl.col("away_team").cast(pl.Utf8),
+        normalize_team_expr("home_team").alias("home_team"),
+        normalize_team_expr("away_team").alias("away_team"),
         pl.col("home_goals").cast(pl.Int64, strict=False),
         pl.col("away_goals").cast(pl.Int64, strict=False),
         pl.col("competition").cast(pl.Utf8),
@@ -182,13 +184,23 @@ def normalize_footballdata_odds(
     if prefix is None:
         raise ValueError("Football-Data CSV has no recognized H/D/A odds columns.")
 
+    from polymbappe.data.aliases import normalize_team_expr
+
     iso_date = pl.coalesce(
         pl.col("Date").cast(pl.Utf8).str.to_date("%d/%m/%Y", strict=False),
         pl.col("Date").cast(pl.Utf8).str.to_date("%d/%m/%y", strict=False),
     )
-    prepared = raw.with_columns(iso_date.alias("_date")).drop_nulls("_date").with_columns(
-        pl.format("{}__{}__{}", pl.col("_date"), pl.col("HomeTeam"), pl.col("AwayTeam"))
-        .alias("match_id")
+    prepared = (
+        raw.with_columns(
+            iso_date.alias("_date"),
+            normalize_team_expr("HomeTeam").alias("HomeTeam"),
+            normalize_team_expr("AwayTeam").alias("AwayTeam"),
+        )
+        .drop_nulls("_date")
+        .with_columns(
+            pl.format("{}__{}__{}", pl.col("_date"), pl.col("HomeTeam"), pl.col("AwayTeam"))
+            .alias("match_id")
+        )
     )
     return normalize_odds_frame(
         prepared,

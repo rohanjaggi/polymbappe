@@ -149,16 +149,26 @@ def align_polymarket_to_fixtures(
     schema.
     """
 
+    from polymbappe.data.aliases import normalize_team_name
+
     lookup: dict[frozenset[str], dict[str, str]] = {
-        frozenset({r["home_team"], r["away_team"]}): r
+        frozenset(
+            {normalize_team_name(r["home_team"]), normalize_team_name(r["away_team"])}
+        ): {
+            "match_id": r["match_id"],
+            "home_team": normalize_team_name(r["home_team"]),
+            "away_team": normalize_team_name(r["away_team"]),
+        }
         for r in fixtures.iter_rows(named=True)
     }
     rows: list[dict[str, Any]] = []
     for m in three_way.iter_rows(named=True):
-        fixture = lookup.get(frozenset({m["team_a"], m["team_b"]}))
+        team_a = normalize_team_name(m["team_a"])
+        team_b = normalize_team_name(m["team_b"])
+        fixture = lookup.get(frozenset({team_a, team_b}))
         if fixture is None:
             continue
-        a_is_home = m["team_a"] == fixture["home_team"]
+        a_is_home = team_a == fixture["home_team"]
         home_p = m["prob_a"] if a_is_home else m["prob_b"]
         away_p = m["prob_b"] if a_is_home else m["prob_a"]
         rows.append(
