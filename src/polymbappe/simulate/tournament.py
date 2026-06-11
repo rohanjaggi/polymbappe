@@ -551,6 +551,15 @@ def _write_edges(
         logger.info("simulate.edges", status="no market_odds ingested; empty edges")  # type: ignore[attr-defined]
         return empty
     market = read_table(Table.MARKET_ODDS, settings)  # type: ignore[arg-type]
+    matched = predictions.join(market, on="match_id", how="inner").select("match_id").unique()
+    hint = None if matched.height else "no fixture match_ids joined market odds (check ids/aliases)"
+    logger.info(  # type: ignore[attr-defined]
+        "simulate.edges.coverage",
+        fixtures=predictions.height,
+        market_rows=market.height,
+        matched_fixtures=matched.height,
+        hint=hint,
+    )
     edges = compute_edges(
         predictions.select("match_id", "model_home", "model_draw", "model_away"), market
     )

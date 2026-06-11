@@ -159,6 +159,13 @@ def _polymarket_odds(settings: Settings) -> pl.DataFrame | None:
         logger.warning("ingest.odds.polymarket_failed", error=str(exc))
         return None
     three_way = adapter.normalize_polymarket_three_way(long_prices)
+    unmatched = adapter.unmatched_market_teams(three_way, fixtures)
+    if unmatched:
+        logger.warning(
+            "ingest.odds.polymarket_unmatched",
+            teams=unmatched,
+            hint="add these spellings to configs/team_aliases.yaml so their odds join",
+        )
     aligned = adapter.align_polymarket_to_fixtures(three_way, fixtures)
     return aligned if aligned.height > 0 else None
 

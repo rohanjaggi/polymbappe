@@ -137,6 +137,27 @@ def normalize_polymarket_three_way(
     )
 
 
+def unmatched_market_teams(three_way: pl.DataFrame, fixtures: pl.DataFrame) -> list[str]:
+    """Canonical market team names that match no fixture — i.e. need an alias entry.
+
+    Compares the (normalized) teams appearing in Polymarket markets against the teams in
+    the known fixtures. Any market team absent from the fixtures is reported so a spelling
+    can be added to ``configs/team_aliases.yaml``. Returns a sorted, de-duplicated list.
+    """
+
+    from polymbappe.data.aliases import normalize_team_name
+
+    fixture_teams: set[str] = set()
+    for r in fixtures.iter_rows(named=True):
+        fixture_teams.add(normalize_team_name(r["home_team"]))
+        fixture_teams.add(normalize_team_name(r["away_team"]))
+    market_teams: set[str] = set()
+    for m in three_way.iter_rows(named=True):
+        market_teams.add(normalize_team_name(m["team_a"]))
+        market_teams.add(normalize_team_name(m["team_b"]))
+    return sorted(market_teams - fixture_teams)
+
+
 def align_polymarket_to_fixtures(
     three_way: pl.DataFrame, fixtures: pl.DataFrame, *, source: str = "polymarket"
 ) -> pl.DataFrame:

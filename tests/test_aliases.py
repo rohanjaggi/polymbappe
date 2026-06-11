@@ -9,6 +9,7 @@ from polymbappe.data.normalize import normalize_footballdata_odds, normalize_kag
 from polymbappe.polymarket.adapter import (
     align_polymarket_to_fixtures,
     normalize_polymarket_three_way,
+    unmatched_market_teams,
 )
 
 
@@ -75,3 +76,23 @@ def test_polymarket_alignment_reconciles_spellings() -> None:
     assert aligned.height == 1  # "USA" reconciled to "United States" -> joined
     row = aligned.row(0, named=True)
     assert row["match_id"] == "2026__United States__Spain"
+
+
+def test_unmatched_market_teams_flags_unmapped_spellings() -> None:
+    # "Narnia" has no fixture and no alias -> reported; "USA" reconciles -> not reported.
+    long = pl.DataFrame(
+        {
+            "market_id": ["m1"] * 3 + ["m2"] * 3,
+            "question": ["USA vs Spain"] * 3 + ["Narnia vs Spain"] * 3,
+            "outcome": ["USA", "Draw", "Spain", "Narnia", "Draw", "Spain"],
+            "price": [0.4, 0.26, 0.34, 0.3, 0.3, 0.4],
+        }
+    )
+    tw = normalize_polymarket_three_way(long)
+    fixtures = pl.DataFrame(
+        {
+            "match_id": ["2026__United States__Spain"],
+            "home_team": ["United States"], "away_team": ["Spain"],
+        }
+    )
+    assert unmatched_market_teams(tw, fixtures) == ["Narnia"]
