@@ -344,11 +344,21 @@ def run_tournament_simulation(
 
     _ = (with_context, live)  # reserved: contextual injection / live re-estimation hooks
 
+    import structlog
+
     from polymbappe.config import Settings
+    from polymbappe.data.store import read_table, table_exists
+    from polymbappe.data.tables import Table
     from polymbappe.features.context import HOSTS_2026
     from polymbappe.models.train import load_artifact
-    from polymbappe.simulate.structure import load_structure_2026
+    from polymbappe.simulate.structure import (
+        load_structure_2026,
+        placeholder_structure_2026,
+        structure_from_strengths,
+        team_strengths,
+    )
 
+    logger = structlog.get_logger(__name__)
     settings = Settings()
     try:
         dc = load_artifact("dixon_coles", settings)
@@ -357,7 +367,30 @@ def run_tournament_simulation(
             "No trained Dixon-Coles artifact found. Run `polymbappe train` first."
         ) from exc
 
-    structure = load_structure_2026()
+    # Latest Elo per team (for pot-seeding + the knockout upset floor) when ingested.
+    elo: dict[str, float] | None = None
+    if table_exists(Table.ELO_SNAPSHOTS, settings):
+        latest = (
+            read_table(Table.ELO_SNAPSHOTS, settings)
+            .sort("date")
+            .group_by("team")
+            .agg(pl.col("rating").last())
+        )
+        elo = {r["team"]: float(r["rating"]) for r in latest.iter_rows(named=True)}
+
+    # Structure resolution: real published draw > trained-strength draw > placeholder.
+    if (settings.configs_dir / "tournament_2026.yaml").exists():
+        structure = load_structure_2026(settings)
+        logger.info("simulate.structure", source="config")
+    elif len(team_strengths(dc)) >= 48:
+        structure = structure_from_strengths(dc, elo)
+        logger.info(
+            "simulate.structure", source="trained_strengths", elo_seeded=elo is not None
+        )
+    else:
+        structure = placeholder_structure_2026()
+        logger.warning("simulate.structure", source="placeholder", reason="<48 trained teams")
+
     model = StrengthModel.from_dixon_coles(dc, hosts=HOSTS_2026)
     result = simulate_tournament(structure, model, n_sims=n_sims)
 

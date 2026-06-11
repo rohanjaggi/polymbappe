@@ -4,7 +4,13 @@ from __future__ import annotations
 
 import numpy as np
 
-from polymbappe.simulate.structure import build_structure, placeholder_structure_2026
+from polymbappe.simulate.structure import (
+    build_structure,
+    placeholder_structure_2026,
+    pot_seed_groups,
+    structure_from_strengths,
+    team_strengths,
+)
 from polymbappe.simulate.tournament import (
     STAGES,
     StalenessMonitor,
@@ -63,6 +69,57 @@ def test_build_structure_validates() -> None:
         pass
     else:  # pragma: no cover
         raise AssertionError("expected ValueError for malformed structure")
+
+
+class _FakeDC:
+    """Minimal stand-in for a fitted DixonColesModel (attack/defense by team index)."""
+
+    def __init__(self, n: int) -> None:
+        self.index_to_team = [f"Nat{i:02d}" for i in range(n)]
+        self.team_to_index = {t: i for i, t in enumerate(self.index_to_team)}
+        # Descending strength: team 0 strongest (high attack, low defense).
+        self.attack = np.array([1.0 - 0.02 * i for i in range(n)])
+        self.defense = np.array([-0.5 + 0.015 * i for i in range(n)])
+
+
+def test_team_strengths_ordering() -> None:
+    s = team_strengths(_FakeDC(5))
+    assert s["Nat00"] > s["Nat04"]  # strongest first
+
+
+def test_pot_seed_groups_balanced() -> None:
+    ranked = [f"T{i:02d}" for i in range(48)]
+    groups = pot_seed_groups(ranked)
+    assert len(groups) == 12 and all(len(v) == 4 for v in groups.values())
+    # Each group spans all four pots (one from each strength twelfth).
+    g = groups["A"]
+    assert g == ["T00", "T12", "T24", "T36"]
+    # All 48 teams used exactly once.
+    flat = [t for v in groups.values() for t in v]
+    assert sorted(flat) == ranked
+
+
+def test_structure_from_strengths_uses_real_teams_and_elo_seeds() -> None:
+    dc = _FakeDC(60)  # more than 48 -> top 48 selected
+    structure = structure_from_strengths(dc)
+    assert len(structure.teams) == 48
+    assert "Nat00" in structure.teams  # strongest team qualifies
+    assert "Nat59" not in structure.teams  # weakest 12 dropped
+    assert len(structure.elo) == 48  # pseudo-Elo attached for the upset floor
+
+    # With real Elo, ranking follows Elo, not model strength.
+    elo = {t: float(i) for i, t in enumerate(dc.index_to_team)}  # Nat59 highest
+    by_elo = structure_from_strengths(dc, elo=elo)
+    assert "Nat59" in by_elo.teams
+
+
+def test_structure_from_strengths_requires_48() -> None:
+    try:
+        structure_from_strengths(_FakeDC(20))
+    except ValueError:
+        pass
+    else:  # pragma: no cover
+        raise AssertionError("expected ValueError with fewer than 48 teams")
 
 
 def test_staleness_monitor_levels() -> None:

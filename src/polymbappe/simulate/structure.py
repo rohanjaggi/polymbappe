@@ -34,6 +34,73 @@ def build_structure(
     )
 
 
+def team_strengths(model: object) -> dict[str, float]:
+    """Overall strength per team from a fitted Dixon-Coles model (``attack - defense``).
+
+    Higher is stronger: high attack and low (often negative) defense — matching the
+    ``lam = exp(... + attack_home + defense_away)`` convention.
+    """
+
+    idx = model.team_to_index  # type: ignore[attr-defined]
+    return {t: float(model.attack[i] - model.defense[i]) for t, i in idx.items()}  # type: ignore[attr-defined]
+
+
+def _pseudo_elo(strengths: dict[str, float]) -> dict[str, float]:
+    """Map model strengths onto an Elo-like scale (~1500 ± spread) for the upset floor."""
+
+    import statistics
+
+    values = list(strengths.values())
+    if len(values) < 2:
+        return {t: 1500.0 for t in strengths}
+    mean = statistics.fmean(values)
+    std = statistics.pstdev(values) or 1.0
+    return {t: 1500.0 + (s - mean) / std * 180.0 for t, s in strengths.items()}
+
+
+def pot_seed_groups(ranked_teams: list[str]) -> dict[str, list[str]]:
+    """Pot-seed 48 ranked teams into 12 groups of 4 (one team per strength pot).
+
+    Pots are the four contiguous twelfths of the ranking (best -> worst); group ``g`` takes
+    the ``g``-th team from each pot, so every group spans the full strength range — the
+    same balancing principle as the real FIFA pot draw (minus confederation constraints,
+    which need data we don't reliably have).
+    """
+
+    if len(ranked_teams) != 48:
+        raise ValueError(f"pot seeding needs exactly 48 teams; got {len(ranked_teams)}.")
+    pots = [ranked_teams[p * 12 : p * 12 + 12] for p in range(4)]
+    return {GROUP_LETTERS[g]: [pots[p][g] for p in range(4)] for g in range(12)}
+
+
+def structure_from_strengths(
+    model: object,
+    elo: dict[str, float] | None = None,
+    n_teams: int = 48,
+) -> TournamentStructure:
+    """Build a pot-seeded 2026 structure from a fitted model's strongest ``n_teams``.
+
+    Teams are ranked by real Elo when an ``elo`` map is supplied, otherwise by model
+    strength (:func:`team_strengths`). The top ``n_teams`` are pot-seeded into the 12
+    groups, and an Elo map (real or strength-derived) is attached so the knockout upset
+    floor has a meaningful scale. Requires the model to know at least ``n_teams`` teams.
+    """
+
+    strengths = team_strengths(model)
+    if len(strengths) < n_teams:
+        raise ValueError(
+            f"model knows {len(strengths)} teams; need >= {n_teams} for a 2026 draw."
+        )
+    rank_key = elo if elo else strengths
+    ranked = sorted(strengths, key=lambda t: rank_key.get(t, float("-inf")), reverse=True)
+    selected = ranked[:n_teams]
+    groups = pot_seed_groups(selected)
+    elo_map = {t: float(elo[t]) for t in selected if t in elo} if elo else _pseudo_elo(
+        {t: strengths[t] for t in selected}
+    )
+    return TournamentStructure(groups=groups, elo=elo_map)
+
+
 def placeholder_structure_2026() -> TournamentStructure:
     """Deterministic 48-team placeholder (``Team01``..``Team48``) — NOT the real draw."""
 
