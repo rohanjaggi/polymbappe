@@ -240,3 +240,121 @@ def test_staleness_monitor_levels() -> None:
     assert mon.observe(0.9, occurred=False) == "green"  # surprise 0.9
     assert mon.observe(0.95, occurred=False) == "yellow"  # cumulative 1.85
     assert mon.observe(0.95, occurred=False) == "red"  # cumulative 2.8
+
+
+# -- live context hook (cohesion + manager feed) -------------------------------
+
+from datetime import date, timedelta  # noqa: E402
+
+from polymbappe.config import Settings  # noqa: E402
+from polymbappe.context.runtime import SIM_CONTEXT_FEATURES  # noqa: E402
+from polymbappe.data.store import write_table  # noqa: E402
+from polymbappe.data.tables import Table  # noqa: E402
+from polymbappe.simulate.tournament import (  # noqa: E402
+    _context_feature_frame,
+    _live_fixture_context,
+)
+
+
+class _NullLogger:
+    def info(self, *args, **kwargs):
+        pass
+
+    def warning(self, *args, **kwargs):
+        pass
+
+
+def _live_matches() -> pl.DataFrame:
+    """Pre-2026 friendly history between A and B (so overperf/elo have data)."""
+
+    rows = []
+    for i in range(6):
+        rows.append(
+            {
+                "match_id": f"h{i}", "date": date(2024, 1, 1) + timedelta(days=i * 30),
+                "home_team": "A", "away_team": "B", "home_goals": 1, "away_goals": 0,
+                "competition": "Friendly", "is_knockout": False,
+                "neutral_site": False, "group": None,
+            }
+        )
+    return pl.DataFrame(rows)
+
+
+def _write_live_tables(settings: Settings) -> None:
+    """matches + 2026 squads + 2026 manager identity rows (team A only)."""
+
+    write_table(Table.MATCHES, _live_matches(), settings=settings)
+    squads = pl.DataFrame(
+        {
+            "team": ["A", "A", "A"],
+            "tournament": ["WC2026"] * 3,
+            "player": ["p1", "p2", "p3"],
+            "club": ["City", "City", "Madrid"],
+            "age": [27.0, 29.0, 31.0],
+        }
+    )
+    write_table(Table.SQUADS, squads, settings=settings)
+    records = pl.DataFrame(
+        {
+            # Historical pedigree (WC2022) + a 2026 identity row naming the current manager.
+            "manager": ["mgrA", "mgrA"],
+            "team": ["A", "A"],
+            "tournament": ["WC2022", "WC2026"],
+            "stage_reached": ["FINAL", "GROUP"],
+            "knockout_matches": [6, 0],
+            "knockout_wins": [5, 0],
+            "tournament_order": [1, 2],
+        }
+    )
+    write_table(Table.MANAGER_RECORDS, records, settings=settings)
+
+
+def test_live_context_frame_column_identical(tmp_path) -> None:
+    """The live per-pair frame columns equal SIM_CONTEXT_FEATURES (col-identical to fit)."""
+
+    settings = Settings(data_dir=tmp_path)
+    _write_live_tables(settings)
+    ctx = _live_fixture_context(settings, elo={"A": 1600.0, "B": 1500.0}, logger=_NullLogger())
+    _pairs, frame = _context_feature_frame(["A", "B"], ctx)
+    assert frame.columns == list(SIM_CONTEXT_FEATURES)
+
+    # Cohesion/manager populated for A (2026 snapshot + pre-2026 FINAL pedigree).
+    a_home = frame.row(0, named=True)  # first pair is (A, B)
+    assert a_home["home_club_cluster_index"] == 1.0  # City pair
+    assert a_home["home_median_age"] == 29.0
+    assert a_home["home_knockout_win_rate"] > 0.0
+    assert a_home["home_deepest_run_weighted"] > 0.0
+    # B is absent from both tables -> away cohesion/manager 0-filled.
+    assert a_home["away_club_cluster_index"] == 0.0
+    assert a_home["away_knockout_win_rate"] == 0.0
+
+
+def test_live_context_frame_no_tables(tmp_path) -> None:
+    """Without squads/manager tables: same columns, new ones 0-filled."""
+
+    settings = Settings(data_dir=tmp_path)
+    write_table(Table.MATCHES, _live_matches(), settings=settings)
+    ctx = _live_fixture_context(settings, elo={"A": 1600.0, "B": 1500.0}, logger=_NullLogger())
+    _pairs, frame = _context_feature_frame(["A", "B"], ctx)
+    assert frame.columns == list(SIM_CONTEXT_FEATURES)
+    row = frame.row(0, named=True)
+    for col in SIM_CONTEXT_FEATURES:
+        if col not in ("home_xg_overperf", "away_xg_overperf", "draw_pressure"):
+            assert row[col] == 0.0
+
+
+def test_live_context_frame_matches_fit_frame_columns(tmp_path) -> None:
+    """Parity: live frame and the fit-path builder produce the identical column set."""
+
+    from polymbappe.context.runtime import build_tournament_context_features
+    from polymbappe.eval.backtest import Tournament
+
+    settings = Settings(data_dir=tmp_path)
+    _write_live_tables(settings)
+    ctx = _live_fixture_context(settings, elo={"A": 1600.0, "B": 1500.0}, logger=_NullLogger())
+    _pairs, live_frame = _context_feature_frame(["A", "B"], ctx)
+
+    tournaments = (Tournament("WC2026", "FIFA World Cup", date(2026, 6, 11), date(2026, 7, 19)),)
+    fit_frame = build_tournament_context_features(_live_matches(), tournaments, settings)
+    fit_feature_cols = [c for c in fit_frame.columns if c != "match_id"]
+    assert live_frame.columns == fit_feature_cols == list(SIM_CONTEXT_FEATURES)
