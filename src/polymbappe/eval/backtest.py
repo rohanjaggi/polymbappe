@@ -8,17 +8,19 @@ out-of-fold stacking) and evaluated on the held-out tournament.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date
 
 import numpy as np
 import polars as pl
 import structlog
 
+from polymbappe.context.adjuster import ContextualAdjusterConfig
 from polymbappe.eval.base_probs import BaseProbConfig, compute_tournament_base_probs
 from polymbappe.eval.metrics import multiclass_log_loss, ranked_probability_score
-from polymbappe.models.dixon_coles import DixonColesConfig, DixonColesModel
-from polymbappe.models.meta import OUTCOMES, MetaConfig, MetaLearner
+from polymbappe.models.dixon_coles import DixonColesModel
+from polymbappe.models.ensemble import Ensemble, EnsembleConfig
+from polymbappe.models.meta import OUTCOMES
 
 logger = structlog.get_logger(__name__)
 
@@ -108,16 +110,26 @@ def run_leave_one_tournament_out(
     tournaments: tuple[Tournament, ...] = DEFAULT_TOURNAMENTS,
     *,
     base_config: BaseProbConfig | None = None,
-    meta_config: MetaConfig | None = None,
+    ensemble_config: EnsembleConfig | None = None,
+    contextual_config: ContextualAdjusterConfig | None = None,
     market_odds: pl.DataFrame | None = None,
 ) -> BacktestResult:
-    """Run the leave-one-tournament-out MVM backtest.
+    """Run the leave-one-tournament-out backtest over the stacked ensemble.
 
-    Returns per-tournament RPS / log loss / Brier and the feature set used. Requires at
-    least two tournaments with fixtures present in ``matches``.
+    For each held-out tournament the stacking :class:`~polymbappe.models.ensemble.Ensemble`
+    (base-probability groups -> optional LightGBM -> meta-learner) is fit on every *other*
+    tournament's base probabilities and evaluated on the held-out one. When
+    ``contextual_config`` enables the layer, a :class:`ContextualAdjuster` is fit on the
+    training fold's residuals and applied to the held-out predictions (capped at ±3pp).
+
+    The full search space flows through here: ``ensemble_config`` carries the meta-learner
+    choice / regularization and the GBM hyperparameters, ``contextual_config`` the
+    contextual toggles. Returns per-tournament RPS / log loss / Brier and the feature set
+    used. Requires at least two tournaments with fixtures present in ``matches``.
     """
 
     base_config = base_config or BaseProbConfig()
+    ensemble_config = ensemble_config or EnsembleConfig()
 
     dc_model = DixonColesModel(base_config.dixon_coles)
     sorted_tournaments = sorted(tournaments, key=lambda t: t.start)
@@ -149,6 +161,15 @@ def run_leave_one_tournament_out(
     # Use the market features only if every tournament has non-null market odds.
     use_market = all(_has_market(df) for df in per_tournament_probs.values())
     feature_cols = _DC_COLS + _ELO_COLS + (_MKT_COLS if use_market else [])
+    base_groups = ("dc", "elo", "mkt") if use_market else ("dc", "elo")
+    # GBM stacks over the base-model H/D/A outputs (the only features the base-prob frame
+    # carries); its OOF predictions then enter the meta-learner.
+    ensemble_config = replace(ensemble_config, base_groups=base_groups, market_blind=False)
+    gbm_cols = feature_cols if ensemble_config.use_gbm else None
+
+    use_contextual, feature_groups = _prepare_contextual(
+        matches, sorted_tournaments, per_tournament_probs, contextual_config
+    )
 
     result = BacktestResult(feature_columns=feature_cols)
     names = list(per_tournament_probs)
@@ -156,18 +177,57 @@ def run_leave_one_tournament_out(
         train = pl.concat(
             [per_tournament_probs[n] for n in names if n != held_out], how="vertical_relaxed"
         )
-        meta = MetaLearner(feature_cols, meta_config).fit(train)
+        ensemble = Ensemble(ensemble_config, gbm_feature_columns=gbm_cols).fit(train)
         test = per_tournament_probs[held_out]
-        y_prob = meta.predict_proba(test)
+        y_prob = ensemble.predict_proba(test)
+        if use_contextual:
+            from polymbappe.context.adjuster import ContextualAdjuster
+
+            adjuster = ContextualAdjuster(feature_groups, contextual_config).fit(
+                train, ensemble.predict_proba(train)
+            )
+            y_prob = adjuster.adjust(test, y_prob)
         result.per_tournament[held_out] = _metrics(test["label"].to_list(), y_prob)
 
     logger.info(
         "backtest.done",
         mean_rps=round(result.mean_rps, 4),
         features=feature_cols,
+        meta=ensemble_config.meta.learner,
+        gbm=ensemble_config.use_gbm,
+        contextual=use_contextual,
         tournaments=names,
     )
     return result
+
+
+def _prepare_contextual(
+    matches: pl.DataFrame,
+    sorted_tournaments: list[Tournament],
+    per_tournament_probs: dict[str, pl.DataFrame],
+    contextual_config: ContextualAdjusterConfig | None,
+) -> tuple[bool, dict[str, list[str]]]:
+    """Join contextual feature columns into each tournament frame, in-place.
+
+    Returns ``(enabled, feature_groups)``: ``enabled`` is False (and the frames are left
+    untouched) unless a contextual layer is requested and its features build successfully.
+    """
+
+    if contextual_config is None or not contextual_config.enable_contextual_layer:
+        return False, {}
+    try:
+        from polymbappe.context.runtime import (
+            FEATURE_GROUPS,
+            build_tournament_context_features,
+        )
+
+        context = build_tournament_context_features(matches, sorted_tournaments)
+        for name, df in per_tournament_probs.items():
+            per_tournament_probs[name] = df.join(context, on="match_id", how="left")
+        return True, FEATURE_GROUPS
+    except Exception as exc:  # noqa: BLE001 - contextual layer is optional, never fatal
+        logger.warning("backtest.context_skip", error=str(exc))
+        return False, {}
 
 
 def run_walk_forward_backtest() -> None:

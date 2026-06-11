@@ -3,25 +3,32 @@
 # Phase 2 (Optuna TPE) samples the numeric/categorical ranges below within the structure
 # fixed by Phase 1. Each parameter declares a type and bounds/choices; the sampler in
 # polymbappe.tune.search_space interprets them. Parameters are grouped by component.
+#
+# Every parameter here is wired into the backtest objective (tune/objective.py ->
+# eval/backtest.py); sampling one changes the score. Knobs that the backtest cannot
+# exercise are deliberately *omitted* so TPE never wastes trials on inert dimensions:
+#   * bayesian.*        - the PyMC hierarchical model is NUTS-sampled per tournament; fit
+#                         per-trial across the leave-one-tournament-out loop it would turn
+#                         a 2 h run into days. It is exercised via models.train /
+#                         standalone evaluation, not the TPE loop.
+#   * features.xg_window - only feeds the core FeaturePipeline; the base-probability path
+#                         the backtest stacks on does not build rolling-xG features.
+#   * contextual.toggle_{ppda,cohesion,manager,fatigue} - not in the runtime contextual
+#                         feature set (context.runtime.FEATURE_GROUPS), so they are inert
+#                         at both backtest and simulation time.
 
 dixon_coles:
   xi: {type: float, low: 0.0005, high: 0.005}
   friendly_weight: {type: float, low: 0.1, high: 0.5}
   max_goals: {type: categorical, choices: [8, 10, 12]}
 
-bayesian:
-  confederation_sigma_prior: {type: float, low: 0.1, high: 1.0}
-  sigma_walk: {type: float, low: 0.001, high: 0.05, log: true}
-  home_advantage_prior_mean: {type: float, low: 0.1, high: 0.4}
-  n_tune: {type: categorical, choices: [1000, 2000, 4000]}
-  n_draws: {type: categorical, choices: [1000, 2000, 4000]}
-
 features:
   elo_k_factor: {type: float, low: 10.0, high: 40.0}
-  xg_window: {type: int, low: 5, high: 20}
   draw_max: {type: float, low: 0.20, high: 0.32}
 
 gbm:
+  # GBM stacks over the base-model H/D/A outputs; `enable` lets TPE switch the layer in/out.
+  enable: {type: categorical, choices: [true, false]}
   num_leaves: {type: int, low: 15, high: 63}
   learning_rate: {type: float, low: 0.01, high: 0.1, log: true}
   n_estimators: {type: int, low: 100, high: 500}
@@ -30,10 +37,6 @@ gbm:
 contextual:
   context_num_leaves: {type: int, low: 7, high: 31}
   context_n_estimators: {type: int, low: 50, high: 200}
-  toggle_ppda: {type: categorical, choices: [true, false]}
-  toggle_cohesion: {type: categorical, choices: [true, false]}
-  toggle_manager: {type: categorical, choices: [true, false]}
-  toggle_fatigue: {type: categorical, choices: [true, false]}
   toggle_xg_overperformance: {type: categorical, choices: [true, false]}
   toggle_draw_pressure: {type: categorical, choices: [true, false]}
   enable_contextual_layer: {type: categorical, choices: [true, false]}

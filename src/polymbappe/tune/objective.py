@@ -13,6 +13,7 @@ from typing import Any
 
 import polars as pl
 
+from polymbappe.context.adjuster import ContextualAdjusterConfig
 from polymbappe.eval.backtest import (
     DEFAULT_TOURNAMENTS,
     Tournament,
@@ -21,6 +22,8 @@ from polymbappe.eval.backtest import (
 from polymbappe.eval.base_probs import BaseProbConfig
 from polymbappe.features.elo import EloConfig
 from polymbappe.models.dixon_coles import DixonColesConfig
+from polymbappe.models.ensemble import EnsembleConfig
+from polymbappe.models.gbm import GBMConfig
 from polymbappe.models.meta import MetaConfig
 
 
@@ -33,8 +36,27 @@ def _get(config: dict[str, Any], *keys: str, default: Any = None) -> Any:
     return default
 
 
-def config_to_configs(config: dict[str, Any]) -> tuple[BaseProbConfig, MetaConfig]:
-    """Translate a flat tuner config into :class:`BaseProbConfig` / :class:`MetaConfig`."""
+@dataclass(slots=True)
+class BacktestConfigs:
+    """Fully-resolved model configs the backtest objective consumes.
+
+    Bundles the base-probability config, the stacking-ensemble config (carrying the
+    meta-learner and optional GBM hyperparameters), and the optional contextual-adjuster
+    config, so every group of the autotuner search space maps onto a live knob.
+    """
+
+    base: BaseProbConfig
+    ensemble: EnsembleConfig
+    contextual: ContextualAdjusterConfig
+
+
+def config_to_configs(config: dict[str, Any]) -> BacktestConfigs:
+    """Translate a flat tuner config into the resolved backtest configs.
+
+    Defaults reproduce the historical baseline (Dixon-Coles + Elo stacked by a logistic
+    meta-learner, no GBM, no contextual layer), so an empty config measures the same
+    baseline as before while every sampled group now feeds a real knob.
+    """
 
     dc = DixonColesConfig(
         xi=float(_get(config, "dixon_coles.xi", default=0.0019)),
@@ -47,8 +69,36 @@ def config_to_configs(config: dict[str, Any]) -> tuple[BaseProbConfig, MetaConfi
         elo=elo,
         draw_max=float(_get(config, "features.draw_max", default=0.28)),
     )
-    meta = MetaConfig(C=float(_get(config, "ensemble.meta_C", default=1.0)))
-    return base, meta
+
+    meta = MetaConfig(
+        C=float(_get(config, "ensemble.meta_C", default=1.0)),
+        learner=str(_get(config, "ensemble.meta_learner", default="logistic")),
+    )
+    gbm = GBMConfig(
+        num_leaves=int(_get(config, "gbm.num_leaves", default=31)),
+        learning_rate=float(_get(config, "gbm.learning_rate", default=0.05)),
+        n_estimators=int(_get(config, "gbm.n_estimators", default=300)),
+        min_child_samples=int(_get(config, "gbm.min_child_samples", default=20)),
+    )
+    ensemble = EnsembleConfig(
+        use_gbm=bool(_get(config, "gbm.enable", default=False)),
+        meta=meta,
+        gbm=gbm,
+    )
+
+    contextual = ContextualAdjusterConfig(
+        enable_contextual_layer=bool(
+            _get(config, "contextual.enable_contextual_layer", default=False)
+        ),
+        num_leaves=int(_get(config, "contextual.context_num_leaves", default=15)),
+        n_estimators=int(_get(config, "contextual.context_n_estimators", default=100)),
+        toggle_xg_overperformance=bool(
+            _get(config, "contextual.toggle_xg_overperformance", default=True)
+        ),
+        toggle_draw_pressure=bool(_get(config, "contextual.toggle_draw_pressure", default=True)),
+    )
+
+    return BacktestConfigs(base=base, ensemble=ensemble, contextual=contextual)
 
 
 @dataclass(slots=True)
@@ -69,9 +119,14 @@ def config_to_metrics(
 ) -> ExperimentMetrics:
     """Evaluate one config via the leave-one-tournament-out backtest."""
 
-    base, meta = config_to_configs(config)
+    configs = config_to_configs(config)
     result = run_leave_one_tournament_out(
-        matches, tournaments, base_config=base, meta_config=meta, market_odds=market_odds
+        matches,
+        tournaments,
+        base_config=configs.base,
+        ensemble_config=configs.ensemble,
+        contextual_config=configs.contextual,
+        market_odds=market_odds,
     )
     return ExperimentMetrics(
         mean_rps=result.mean_rps,
