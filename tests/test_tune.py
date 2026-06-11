@@ -87,6 +87,8 @@ def test_config_to_configs_maps_params() -> None:
             "gbm.num_leaves": 40,
             "contextual.enable_contextual_layer": True,
             "contextual.context_n_estimators": 80,
+            "contextual.toggle_cohesion": False,
+            "contextual.toggle_manager": False,
         }
     )
     assert configs.base.dixon_coles.xi == 0.001
@@ -97,6 +99,8 @@ def test_config_to_configs_maps_params() -> None:
     assert configs.ensemble.gbm.num_leaves == 40
     assert configs.contextual.enable_contextual_layer is True
     assert configs.contextual.n_estimators == 80
+    assert configs.contextual.toggle_cohesion is False
+    assert configs.contextual.toggle_manager is False
 
 
 def test_config_to_configs_defaults_to_baseline() -> None:
@@ -104,11 +108,15 @@ def test_config_to_configs_defaults_to_baseline() -> None:
     assert configs.ensemble.use_gbm is False
     assert configs.ensemble.meta.learner == "logistic"
     assert configs.contextual.enable_contextual_layer is False
+    assert configs.contextual.toggle_cohesion is True
+    assert configs.contextual.toggle_manager is True
 
 
 def test_search_space_loads_and_samples() -> None:
     space = load_search_space()
     assert any(p.name == "dixon_coles.xi" for p in space.params)
+    assert any(p.name == "contextual.toggle_cohesion" for p in space.params)
+    assert any(p.name == "contextual.toggle_manager" for p in space.params)
 
     class _Trial:
         def suggest_float(self, name, low, high, log=False):
@@ -123,6 +131,8 @@ def test_search_space_loads_and_samples() -> None:
     sample = space.sample(_Trial())
     assert "dixon_coles.xi" in sample
     assert sample["dixon_coles.max_goals"] == 8
+    assert sample["contextual.toggle_cohesion"] is True
+    assert sample["contextual.toggle_manager"] is True
 
 
 def test_leaderboard_roundtrip(tmp_path) -> None:

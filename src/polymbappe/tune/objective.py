@@ -96,6 +96,8 @@ def config_to_configs(config: dict[str, Any]) -> BacktestConfigs:
             _get(config, "contextual.toggle_xg_overperformance", default=True)
         ),
         toggle_draw_pressure=bool(_get(config, "contextual.toggle_draw_pressure", default=True)),
+        toggle_cohesion=bool(_get(config, "contextual.toggle_cohesion", default=True)),
+        toggle_manager=bool(_get(config, "contextual.toggle_manager", default=True)),
     )
 
     return BacktestConfigs(base=base, ensemble=ensemble, contextual=contextual)
