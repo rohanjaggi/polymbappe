@@ -246,9 +246,11 @@ def ingest_team_xg(settings: Settings | None = None) -> int:
 def ingest_squads(settings: Settings | None = None) -> int:
     """Ingest per-player squad call-ups into the ``squads`` table (cohesion inputs).
 
-    Prefers ``data/raw/squads.csv`` (reproducible, offline); else runs the Transfermarkt
-    squad scraper (:func:`~polymbappe.data.sources.fetch_transfermarkt_squad`). Either way
-    expects/produces columns ``team, tournament, player, club, age``. ``team`` is
+    Prefers ``data/raw/squads.csv`` (reproducible, offline); else scrapes each manifest team
+    Transfermarkt-first (:func:`~polymbappe.data.sources.fetch_transfermarkt_squad`) with a
+    Wikipedia fallback (:func:`~polymbappe.data.sources.fetch_wikipedia_squad`) when
+    Transfermarkt is unavailable. Either way expects/produces columns
+    ``team, tournament, player, club, age``. ``team`` is
     canonicalized via :func:`normalize_team_expr`; ``club`` is trimmed; ``tournament`` must
     already equal a ``Tournament.name`` (e.g. ``"WC2018"``) and is passed through as-is;
     ``age`` is cast to ``Float64``. Market value is NOT ingested here (cohesion needs only
@@ -288,12 +290,13 @@ def ingest_squads(settings: Settings | None = None) -> int:
 
 
 def _scrape_squads(settings: Settings) -> list[dict[str, object]]:
-    """Run the Transfermarkt scraper for each ``(tournament, team, ...)`` in the manifest.
+    """Scrape each ``(tournament, team, ...)`` in the manifest, Transfermarkt-first.
 
     Reads optional ``data/raw/squads_manifest.csv`` (columns ``tournament, team`` plus
-    optional ``tm_id, saison_id, url``) and fetches each team's squad page. Returns the
-    concatenated raw rows (``[]`` when no manifest or nothing fetched). Keeping the manifest
-    out of code lets the local-CSV path stay the default and tests stay offline.
+    optional ``tm_id, saison_id, url, wiki_page``) and fetches each team's squad,
+    Transfermarkt-first with a **Wikipedia fallback** (see :func:`_scrape_one_squad`).
+    Returns the concatenated raw rows (``[]`` when no manifest or nothing fetched). Keeping
+    the manifest out of code lets the local-CSV path stay the default and tests stay offline.
     """
 
     manifest_path = settings.raw_data_dir / "squads_manifest.csv"
@@ -302,15 +305,43 @@ def _scrape_squads(settings: Settings) -> list[dict[str, object]]:
     manifest = pl.read_csv(io.BytesIO(manifest_path.read_bytes()))
     rows: list[dict[str, object]] = []
     for entry in manifest.iter_rows(named=True):
-        kwargs: dict[str, object] = {"settings": settings}
-        for key in ("tm_id", "saison_id", "url"):
-            if key in entry and entry[key] is not None:
-                kwargs[key] = entry[key]
-        rows.extend(
-            sources.fetch_transfermarkt_squad(
-                str(entry["tournament"]), str(entry["team"]), **kwargs
-            )
-        )
+        rows.extend(_scrape_one_squad(entry, settings))
+    return rows
+
+
+def _scrape_one_squad(
+    entry: dict[str, object], settings: Settings
+) -> list[dict[str, object]]:
+    """Fetch one team's squad: Transfermarkt first, Wikipedia fallback if it yields nothing.
+
+    Transfermarkt is the primary source (richer, per-club). When it is unavailable — blocked,
+    no ``tm_id``/``url`` in the manifest entry, or a layout change makes it return no rows —
+    the Wikipedia "<tournament> squads" page is scraped instead
+    (:func:`~polymbappe.data.sources.fetch_wikipedia_squad`). Both fetchers already isolate
+    their own failures and return ``[]``, so this only chooses between them.
+    """
+
+    tournament = str(entry["tournament"])
+    team = str(entry["team"])
+
+    tm_kwargs: dict[str, object] = {"settings": settings}
+    for key in ("tm_id", "saison_id", "url"):
+        if key in entry and entry[key] is not None:
+            tm_kwargs[key] = entry[key]
+    rows = sources.fetch_transfermarkt_squad(tournament, team, **tm_kwargs)
+    if rows:
+        logger.info("ingest.squads.source", team=team, source="transfermarkt", rows=len(rows))
+        return rows
+
+    wiki_page = entry.get("wiki_page") if "wiki_page" in entry else None
+    rows = sources.fetch_wikipedia_squad(
+        tournament, team, settings=settings,
+        page=str(wiki_page) if wiki_page is not None else None,
+    )
+    logger.info(
+        "ingest.squads.source", team=team,
+        source="wikipedia" if rows else "none", rows=len(rows),
+    )
     return rows
 
 
