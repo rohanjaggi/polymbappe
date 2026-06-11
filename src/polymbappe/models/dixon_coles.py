@@ -169,8 +169,10 @@ class DixonColesModel(MatchModel):
             attack, defense, home_advantage, rho = unpack(params)
 
             home_term = np.where(neutral, 0.0, home_advantage)
-            lam = np.exp(home_term + attack[home_idx] + defense[away_idx])
-            mu = np.exp(attack[away_idx] + defense[home_idx])
+            lam_log = np.clip(home_term + attack[home_idx] + defense[away_idx], -30.0, 30.0)
+            mu_log = np.clip(attack[away_idx] + defense[home_idx], -30.0, 30.0)
+            lam = np.exp(lam_log)
+            mu = np.exp(mu_log)
 
             log_lik = poisson.logpmf(home_goals, lam) + poisson.logpmf(away_goals, mu)
 
@@ -243,8 +245,12 @@ class DixonColesModel(MatchModel):
             teams, n_teams, prev_attack, prev_defense,
             prev_team_to_index, self.home_advantage, self.rho,
         )
-        bounds: list[tuple[float | None, float | None]] = [(None, None)] * len(initial)
-        bounds[-1] = (-0.25, 0.25)
+        initial = np.clip(initial, -2.9, 2.9)
+        initial[-2] = np.clip(initial[-2], -0.9, 0.9)
+        initial[-1] = np.clip(initial[-1], -0.24, 0.24)
+        bounds: list[tuple[float | None, float | None]] = [(-5.0, 5.0)] * len(initial)
+        bounds[-2] = (-1.0, 1.0)  # home advantage
+        bounds[-1] = (-0.25, 0.25)  # rho
         result = minimize(
             objective_and_grad,
             initial,
