@@ -10,7 +10,8 @@ from polymbappe.eval.base_probs import (
     elo_probabilities,
 )
 from polymbappe.eval.market import compute_edges, kelly_fraction
-from polymbappe.models.meta import MetaLearner
+from polymbappe.models.meta import MetaConfig, MetaLearner
+from polymbappe.tune.objective import config_to_configs
 
 TEAMS = ["A", "B", "C", "D"]
 _ATTACK = {"A": 1.7, "B": 1.3, "C": 1.0, "D": 0.7}
@@ -98,6 +99,48 @@ def test_meta_learner_predicts_simplex() -> None:
     assert np.all(proba >= 0.0)
 
 
+def test_meta_learner_alternate_families_predict_simplex() -> None:
+    df = pl.DataFrame(
+        {
+            "dc_home": [0.5, 0.2, 0.4, 0.6, 0.33, 0.1],
+            "dc_draw": [0.3, 0.3, 0.3, 0.25, 0.34, 0.3],
+            "dc_away": [0.2, 0.5, 0.3, 0.15, 0.33, 0.6],
+            "elo_home": [0.45, 0.25, 0.42, 0.58, 0.34, 0.12],
+            "elo_draw": [0.30, 0.30, 0.28, 0.27, 0.33, 0.28],
+            "elo_away": [0.25, 0.45, 0.30, 0.15, 0.33, 0.60],
+            "label": ["H", "A", "D", "H", "D", "A"],
+        }
+    )
+    cols = ["dc_home", "dc_draw", "dc_away", "elo_home", "elo_draw", "elo_away"]
+    for learner in ("isotonic", "weighted_average"):
+        meta = MetaLearner(cols, MetaConfig(learner=learner)).fit(df)
+        proba = meta.predict_proba(df)
+        assert proba.shape == (6, 3), learner
+        assert np.allclose(proba.sum(axis=1), 1.0), learner
+        assert np.all(proba >= 0.0), learner
+
+
+def test_backtest_full_stack_gbm_and_contextual() -> None:
+    configs = config_to_configs(
+        {
+            "gbm.enable": True,
+            "ensemble.meta_learner": "logistic",
+            "contextual.enable_contextual_layer": True,
+        }
+    )
+    result = run_leave_one_tournament_out(
+        _make_matches(),
+        TOURNAMENTS,
+        base_config=configs.base,
+        ensemble_config=configs.ensemble,
+        contextual_config=configs.contextual,
+    )
+    assert set(result.per_tournament) == {"WC2016", "EU2018", "CA2020"}
+    for metrics in result.per_tournament.values():
+        assert 0.0 <= metrics["rps"] <= 1.2
+    assert np.isfinite(result.mean_rps)
+
+
 def test_compute_tournament_base_probs() -> None:
     matches = _make_matches()
     fixtures = select_fixtures(matches, TOURNAMENTS[0])
@@ -112,9 +155,11 @@ def test_compute_tournament_base_probs() -> None:
     assert set(probs["label"].to_list()) <= {"H", "D", "A"}
 
     # Directional sanity: strong A vs weak D favors A in both base models (no inversion).
-    a_vs_d = probs.join(fixtures, on="match_id").filter(
-        (pl.col("home_team") == "A") & (pl.col("away_team") == "D")
-    ).row(0, named=True)
+    a_vs_d = (
+        probs.join(fixtures, on="match_id")
+        .filter((pl.col("home_team") == "A") & (pl.col("away_team") == "D"))
+        .row(0, named=True)
+    )
     assert a_vs_d["dc_home"] > a_vs_d["dc_away"]
     assert a_vs_d["elo_home"] > a_vs_d["elo_away"]
 

@@ -63,3 +63,39 @@ def fixture_feature_row(
         "away_xg_overperf": overperf.get(away, 0.0),
         "draw_pressure": stage_elo_interaction(is_knockout, gap),
     }
+
+
+def build_tournament_context_features(matches: pl.DataFrame, tournaments: object) -> pl.DataFrame:
+    """Per-fixture contextual features (keyed by ``match_id``) for a set of tournaments.
+
+    For each tournament, computes xG-overperformance and Elo as of its start (history
+    only), then the per-fixture feature row — the same :data:`SIM_CONTEXT_FEATURES`
+    columns the simulation builds at prediction time, so the contextual adjuster sees an
+    identical feature set when fit (here) and when applied live. Shared by training
+    (:mod:`polymbappe.models.train`) and the backtest objective.
+    """
+
+    from polymbappe.eval.backtest import select_fixtures
+    from polymbappe.features.elo import build_elo_snapshots
+
+    rows: list[dict[str, object]] = []
+    for tournament in tournaments:  # type: ignore[attr-defined]
+        fixtures = select_fixtures(matches, tournament)
+        if fixtures.is_empty():
+            continue
+        history = matches.filter(pl.col("date") < tournament.start)
+        if history.is_empty():
+            continue
+        overperf = latest_overperformance(history)
+        snaps = (
+            build_elo_snapshots(history)
+            .sort(["team", "date"])
+            .group_by("team")
+            .agg(pl.col("rating").last())
+        )
+        elo = {r["team"]: float(r["rating"]) for r in snaps.iter_rows(named=True)}
+        for fx in fixtures.iter_rows(named=True):
+            feats = fixture_feature_row(fx["home_team"], fx["away_team"], overperf, elo)
+            rows.append({"match_id": fx["match_id"], **feats})
+    cols = {"match_id": pl.Utf8, **{c: pl.Float64 for c in SIM_CONTEXT_FEATURES}}
+    return pl.DataFrame(rows, schema=cols)

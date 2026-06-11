@@ -33,10 +33,16 @@ def _matches() -> pl.DataFrame:
         nonlocal idx
         rows.append(
             {
-                "match_id": f"m{idx}", "date": d, "home_team": h, "away_team": a,
+                "match_id": f"m{idx}",
+                "date": d,
+                "home_team": h,
+                "away_team": a,
                 "home_goals": int(rng.poisson(_ATTACK[h] + (0 if neutral else 0.25))),
                 "away_goals": int(rng.poisson(_ATTACK[a])),
-                "competition": comp, "is_knockout": False, "neutral_site": neutral, "group": None,
+                "competition": comp,
+                "is_knockout": False,
+                "neutral_site": neutral,
+                "group": None,
             }
         )
         idx += 1
@@ -71,12 +77,33 @@ def test_acceptance_gate() -> None:
 
 
 def test_config_to_configs_maps_params() -> None:
-    base, meta = config_to_configs(
-        {"dixon_coles.xi": 0.001, "features.elo_k_factor": 30.0, "ensemble.meta_C": 0.5}
+    configs = config_to_configs(
+        {
+            "dixon_coles.xi": 0.001,
+            "features.elo_k_factor": 30.0,
+            "ensemble.meta_C": 0.5,
+            "ensemble.meta_learner": "isotonic",
+            "gbm.enable": True,
+            "gbm.num_leaves": 40,
+            "contextual.enable_contextual_layer": True,
+            "contextual.context_n_estimators": 80,
+        }
     )
-    assert base.dixon_coles.xi == 0.001
-    assert base.elo.k_factor == 30.0
-    assert meta.C == 0.5
+    assert configs.base.dixon_coles.xi == 0.001
+    assert configs.base.elo.k_factor == 30.0
+    assert configs.ensemble.meta.C == 0.5
+    assert configs.ensemble.meta.learner == "isotonic"
+    assert configs.ensemble.use_gbm is True
+    assert configs.ensemble.gbm.num_leaves == 40
+    assert configs.contextual.enable_contextual_layer is True
+    assert configs.contextual.n_estimators == 80
+
+
+def test_config_to_configs_defaults_to_baseline() -> None:
+    configs = config_to_configs({})
+    assert configs.ensemble.use_gbm is False
+    assert configs.ensemble.meta.learner == "logistic"
+    assert configs.contextual.enable_contextual_layer is False
 
 
 def test_search_space_loads_and_samples() -> None:
@@ -126,7 +153,11 @@ def test_parse_budget() -> None:
 def test_autotune_end_to_end(tmp_path) -> None:
     board = Leaderboard(Settings(data_dir=tmp_path))
     result = autotune(
-        _matches(), tournaments=_TOURNAMENTS, n_structural=2, n_trials=3, leaderboard=board,
+        _matches(),
+        tournaments=_TOURNAMENTS,
+        n_structural=2,
+        n_trials=3,
+        leaderboard=board,
     )
     assert np.isfinite(result.baseline_metrics.mean_rps)
     assert np.isfinite(result.best_metrics.mean_rps)

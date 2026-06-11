@@ -86,52 +86,13 @@ def assemble_stacked_frame(
     return pl.concat(frames, how="vertical_relaxed")
 
 
-def _all_history_dixon_coles(
-    matches: pl.DataFrame, base_config: BaseProbConfig
-) -> DixonColesModel:
+def _all_history_dixon_coles(matches: pl.DataFrame, base_config: BaseProbConfig) -> DixonColesModel:
     from polymbappe.eval.base_probs import matches_to_observations
 
     reference = matches["date"].max()
     assert isinstance(reference, date)
     obs = matches_to_observations(matches, reference)
     return DixonColesModel(base_config.dixon_coles).fit(matches=obs)
-
-
-def _tournament_context_features(
-    matches: pl.DataFrame, tournaments: tuple[Tournament, ...]
-) -> pl.DataFrame:
-    """Per-fixture contextual features (keyed by match_id) for the training tournaments.
-
-    For each tournament, computes xG-overperformance and Elo as of its start (history
-    only), then the per-fixture feature row — the same columns the simulation builds at
-    prediction time (:mod:`polymbappe.context.runtime`).
-    """
-
-    from polymbappe.context.runtime import (
-        SIM_CONTEXT_FEATURES,
-        fixture_feature_row,
-        latest_overperformance,
-    )
-    from polymbappe.features.elo import build_elo_snapshots
-
-    rows: list[dict[str, object]] = []
-    for tournament in tournaments:
-        fixtures = select_fixtures(matches, tournament)
-        if fixtures.is_empty():
-            continue
-        history = matches.filter(pl.col("date") < tournament.start)
-        if history.is_empty():
-            continue
-        overperf = latest_overperformance(history)
-        snaps = build_elo_snapshots(history).sort(["team", "date"]).group_by("team").agg(
-            pl.col("rating").last()
-        )
-        elo = {r["team"]: float(r["rating"]) for r in snaps.iter_rows(named=True)}
-        for fx in fixtures.iter_rows(named=True):
-            feats = fixture_feature_row(fx["home_team"], fx["away_team"], overperf, elo)
-            rows.append({"match_id": fx["match_id"], **feats})
-    cols = {"match_id": pl.Utf8, **{c: pl.Float64 for c in SIM_CONTEXT_FEATURES}}
-    return pl.DataFrame(rows, schema=cols)
 
 
 def _fit_contextual_adjuster(
@@ -183,7 +144,9 @@ def train_full_stack(
     adjuster: object | None = None
     if fit_contextual:
         try:
-            context_features = _tournament_context_features(matches, tournaments)
+            from polymbappe.context.runtime import build_tournament_context_features
+
+            context_features = build_tournament_context_features(matches, tournaments)
             adjuster = _fit_contextual_adjuster(frame, calibration, context_features)
         except Exception as exc:  # noqa: BLE001 - contextual layer is optional, never fatal
             logger.warning("train.context_skip", error=str(exc))
