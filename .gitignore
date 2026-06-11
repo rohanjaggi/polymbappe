@@ -11,6 +11,8 @@ data/raw/*
 data/processed/*
 data/outputs/*
 !data/**/.gitkeep
+!data/raw/polymarket_query.txt
+!data/raw/football_data_urls.txt
 
 # Autotuner-generated best config (search space is tracked)
 configs/best_config.yaml

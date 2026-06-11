@@ -1,8 +1,9 @@
 import time
+import warnings
 
 import numpy as np
 
-from polymbappe.models.dixon_coles import DixonColesModel, MatchObservation
+from polymbappe.models.dixon_coles import DixonColesConfig, DixonColesModel, MatchObservation
 
 
 def test_dixon_coles_fit_and_predict_probabilities_sum_to_one() -> None:
@@ -88,5 +89,36 @@ def test_dixon_coles_scales_to_1000_matches() -> None:
     assert elapsed < 30.0, f"Fitting took {elapsed:.1f}s (budget: 30s)"
     assert model.attack is not None
     assert len(model.index_to_team) == 50
+    probs = model.predict_match(teams[0], teams[1])
+    assert abs(sum(probs.values()) - 1.0) < 1e-6
+
+
+def test_fit_no_overflow_warnings_large_dataset() -> None:
+    """Fitting a realistically-sized dataset must not produce overflow RuntimeWarnings."""
+    rng = np.random.default_rng(42)
+    teams = [f"T{i}" for i in range(80)]
+    competitions = ["FIFA World Cup", "Friendly", "Nations League", "World Cup Qualifier"]
+    matches = []
+    for i in range(2000):
+        h, a = rng.choice(teams, size=2, replace=False)
+        matches.append(
+            MatchObservation(
+                home_team=h,
+                away_team=a,
+                home_goals=int(rng.poisson(1.3)),
+                away_goals=int(rng.poisson(1.1)),
+                days_ago=float(rng.integers(1, 4000)),
+                competition=str(rng.choice(competitions)),
+                neutral_site=bool(rng.integers(0, 2)),
+            )
+        )
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)
+        model = DixonColesModel(DixonColesConfig(max_history_days=5000)).fit(matches=matches)
+
+    assert model.attack is not None
+    assert not np.any(np.isnan(model.attack))
+    assert not np.any(np.isinf(model.attack))
     probs = model.predict_match(teams[0], teams[1])
     assert abs(sum(probs.values()) - 1.0) < 1e-6

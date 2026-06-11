@@ -23,16 +23,19 @@ def multiclass_log_loss(y_true_idx: np.ndarray, y_prob: np.ndarray, eps: float =
 
 
 def ranked_probability_score(y_true_idx: np.ndarray, y_prob: np.ndarray) -> float:
-    """Ranked probability score for ordered categorical outcomes."""
+    """Ranked probability score for ordered categorical outcomes.
+
+    Normalized by 1/(K-1) per the standard convention (Epstein 1969, Constantinou 2019).
+    For 3 outcomes (H/D/A), divides by 2 so the scale matches literature benchmarks.
+    """
 
     n_classes = y_prob.shape[1]
     one_hot = np.zeros_like(y_prob)
     one_hot[np.arange(len(y_true_idx)), y_true_idx] = 1.0
     cdf_prob = np.cumsum(y_prob, axis=1)
     cdf_true = np.cumsum(one_hot, axis=1)
-    return float(
-        np.mean(np.sum((cdf_prob[:, : n_classes - 1] - cdf_true[:, : n_classes - 1]) ** 2, axis=1))
-    )
+    raw = np.mean(np.sum((cdf_prob[:, : n_classes - 1] - cdf_true[:, : n_classes - 1]) ** 2, axis=1))
+    return float(raw / (n_classes - 1))
 
 
 def calibration_curve(y_true: np.ndarray, y_prob: np.ndarray, n_bins: int = 10) -> pl.DataFrame:
