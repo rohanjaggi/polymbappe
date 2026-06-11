@@ -67,6 +67,32 @@ def test_assemble_stacked_frame() -> None:
         assert col in frame.columns
 
 
+def test_gbm_stacker_wired_into_ensembles() -> None:
+    import pytest
+
+    pytest.importorskip("lightgbm")
+
+    matches = _make_matches()
+    # Synthetic market odds keyed by match_id so the calibration GBM can see them.
+    odds = matches.select(
+        "match_id",
+        pl.lit(0.45).alias("home_win_prob"),
+        pl.lit(0.27).alias("draw_prob"),
+        pl.lit(0.28).alias("away_win_prob"),
+    )
+    artifacts = train_full_stack(matches, tournaments=_TOURNAMENTS, market_odds=odds)
+
+    # The GBM out-of-fold columns reach the meta-learner in both pipelines...
+    for ens in (artifacts.calibration, artifacts.edge):
+        assert {"gbm_home", "gbm_draw", "gbm_away"}.issubset(ens.meta_features)
+        # ...and the GBM was fed real core features, not just base probabilities.
+        assert "elo_diff" in ens.gbm_feature_columns
+
+    # The edge GBM stays market-blind; the calibration GBM may use market columns.
+    assert not any("mkt" in c for c in artifacts.edge._gbm_columns())
+    assert any("mkt" in c for c in artifacts.calibration._gbm_columns())
+
+
 def test_train_full_stack_and_persist(tmp_path) -> None:
     from polymbappe.config import Settings
 

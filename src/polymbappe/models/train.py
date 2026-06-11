@@ -15,6 +15,7 @@ reporter can load them without re-fitting.
 
 from __future__ import annotations
 
+import importlib.util
 import pickle
 from dataclasses import dataclass, field
 from datetime import date
@@ -26,7 +27,12 @@ from polymbappe.config import Settings
 from polymbappe.eval.backtest import DEFAULT_TOURNAMENTS, Tournament, select_fixtures
 from polymbappe.eval.base_probs import BaseProbConfig, compute_tournament_base_probs
 from polymbappe.models.dixon_coles import DixonColesModel
-from polymbappe.models.ensemble import Ensemble, EnsembleConfig, build_dual_pipelines
+from polymbappe.models.ensemble import (
+    BASE_GROUPS,
+    Ensemble,
+    EnsembleConfig,
+    build_dual_pipelines,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -84,6 +90,38 @@ def assemble_stacked_frame(
     if not frames:
         raise ValueError("No tournaments with both fixtures and history were found.")
     return pl.concat(frames, how="vertical_relaxed")
+
+
+#: Core-feature dtypes the GBM stacker accepts (all cast to Float64 before fitting).
+_GBM_NUMERIC = (
+    pl.Int8, pl.Int16, pl.Int32, pl.Int64,
+    pl.UInt8, pl.UInt16, pl.UInt32, pl.UInt64,
+    pl.Float32, pl.Float64, pl.Boolean,
+)
+
+
+def _attach_core_features(
+    frame: pl.DataFrame, matches: pl.DataFrame, team_xg: pl.DataFrame | None
+) -> tuple[pl.DataFrame, list[str]]:
+    """Join the leakage-safe core (Tier 1-3) features onto the stacked frame by ``match_id``.
+
+    These are the non-linear inputs the GBM stacker needs (Elo diffs, rolling form, rest,
+    H2H, xG, host flags). Every core builder is point-in-time, so joining by ``match_id``
+    adds no leakage. Market columns are intentionally excluded so the edge pipeline's GBM
+    stays market-blind. Returns the enriched frame and the list of GBM feature columns.
+    """
+
+    from polymbappe.features.pipeline import _ID_COLUMNS, FeaturePipeline
+
+    core = FeaturePipeline().build_core_matrix(matches, team_xg=team_xg)
+    drop = set(_ID_COLUMNS) | {"home_goals", "away_goals", "label"}
+    feature_cols = [
+        c
+        for c, dtype in zip(core.columns, core.dtypes, strict=True)
+        if c not in drop and not c.endswith("_right") and dtype in _GBM_NUMERIC
+    ]
+    core_sel = core.select("match_id", *(pl.col(c).cast(pl.Float64) for c in feature_cols))
+    return frame.join(core_sel, on="match_id", how="left"), feature_cols
 
 
 def _all_history_dixon_coles(
@@ -158,9 +196,15 @@ def train_full_stack(
     base_config: BaseProbConfig | None = None,
     ensemble_config: EnsembleConfig | None = None,
     market_odds: pl.DataFrame | None = None,
+    team_xg: pl.DataFrame | None = None,
     fit_contextual: bool = True,
 ) -> TrainArtifacts:
-    """Fit the Dixon-Coles engine, the dual ensembles, and the contextual adjuster."""
+    """Fit the Dixon-Coles engine, the dual ensembles, and the contextual adjuster.
+
+    The ensembles stack a LightGBM base model over the core (Tier 1-3) features whenever
+    ``lightgbm`` is installed; without it the stack degrades gracefully to the linear
+    meta-learner over the base-probability groups.
+    """
 
     base_config = base_config or BaseProbConfig()
     frame = assemble_stacked_frame(
@@ -171,11 +215,21 @@ def train_full_stack(
         == 0
     )
 
+    # Attach core features and stack a GBM over them + the base-probability groups. The
+    # edge pipeline drops market columns (see ``Ensemble._gbm_columns``) for a true
+    # market-blind GBM. Falls back to the linear stack if lightgbm is unavailable.
+    frame, core_cols = _attach_core_features(frame, matches, team_xg)
+    base_groups = ("dc", "elo", "mkt") if has_market else ("dc", "elo")
+    gbm_cols = [c for g in base_groups for c in BASE_GROUPS[g] if c in frame.columns] + core_cols
+    gbm_available = importlib.util.find_spec("lightgbm") is not None
+    if core_cols and not gbm_available:
+        logger.warning("train.gbm_skip", reason="lightgbm not installed")
+
     cfg = ensemble_config or EnsembleConfig(
-        base_groups=("dc", "elo", "mkt") if has_market else ("dc", "elo"),
-        use_gbm=False,  # base-prob frame has no core GBM features by default
+        base_groups=base_groups,
+        use_gbm=gbm_available and bool(gbm_cols),
     )
-    calibration, edge = build_dual_pipelines(cfg)
+    calibration, edge = build_dual_pipelines(cfg, gbm_feature_columns=gbm_cols)
     calibration.fit(frame)
     edge.fit(frame)
     dc = _all_history_dixon_coles(matches, base_config)
@@ -240,6 +294,9 @@ def train_models(model: str | None = None) -> None:
         if table_exists(Table.MARKET_ODDS, settings)
         else None
     )
+    team_xg = (
+        read_table(Table.TEAM_XG, settings) if table_exists(Table.TEAM_XG, settings) else None
+    )
 
     if model == "dixon_coles":
         dc = _all_history_dixon_coles(matches, BaseProbConfig())
@@ -250,6 +307,6 @@ def train_models(model: str | None = None) -> None:
         logger.info("train.persisted", artifact="dixon_coles", path=str(path))
         return
 
-    artifacts = train_full_stack(matches, market_odds=market_odds)
+    artifacts = train_full_stack(matches, market_odds=market_odds, team_xg=team_xg)
     persist_artifacts(artifacts, settings)
     logger.info("train.done", rows=artifacts.stacked_frame.height)
