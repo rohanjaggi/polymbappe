@@ -24,6 +24,7 @@ class Table(StrEnum):
     SQUADS = "squads"
     MANAGER_RECORDS = "manager_records"
     TEAM_XG = "team_xg"
+    TEAM_PPDA = "team_ppda"
 
 
 #: Columns each normalized table is expected to expose. Used for empty-frame
@@ -68,6 +69,7 @@ TABLE_COLUMNS: dict[Table, tuple[str, ...]] = {
         "tournament_order",
     ),
     Table.TEAM_XG: ("team", "date", "xg", "xga"),
+    Table.TEAM_PPDA: ("team", "date", "ppda"),
 }
 
 

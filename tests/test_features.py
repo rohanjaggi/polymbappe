@@ -9,7 +9,11 @@ from polymbappe.features.context import (
     build_structural_features,
 )
 from polymbappe.features.elo import EloConfig, build_elo_features
-from polymbappe.features.pipeline import FeaturePipeline, result_label
+from polymbappe.features.pipeline import (
+    FeaturePipeline,
+    build_contextual_matrix,
+    result_label,
+)
 from polymbappe.features.xg import build_xg_features
 
 # Chronological synthetic history. A is strong, plays B twice and C once.
@@ -107,3 +111,29 @@ def test_pipeline_assembles_matrix_with_label_and_diff() -> None:
     assert "home_elo_pre" in matrix.columns
     assert "away_gs_5" in matrix.columns
     assert "h2h_home_winrate" in matrix.columns
+
+
+def test_contextual_matrix_ppda_diff_null_without_table() -> None:
+    # Without a team_ppda table, ppda is null on both sides -> ppda_diff is all-null.
+    matrix = build_contextual_matrix(MATCHES)
+    assert "ppda_diff" in matrix.columns
+    assert matrix["ppda_diff"].null_count() == matrix.height
+
+
+def test_contextual_matrix_ppda_diff_populated_with_table() -> None:
+    # Supplying team_ppda lights up the otherwise-dead ppda_diff feature.
+    long_dates = [date(2020, 1, 1), date(2020, 1, 10), date(2020, 1, 20), date(2020, 2, 1)]
+    team_ppda = pl.DataFrame(
+        {
+            "team": ["A", "B", "A", "B", "A", "C", "A", "B"],
+            "date": [long_dates[0]] * 2
+            + [long_dates[1]] * 2
+            + [long_dates[2]] * 2
+            + [long_dates[3]] * 2,
+            "ppda": [9.0, 12.0, 8.0, 11.0, 10.0, 13.0, 9.5, 12.5],
+        }
+    )
+    matrix = build_contextual_matrix(MATCHES, team_ppda=team_ppda)
+    # The rolling PPDA excludes a team's own current match, so m1 (first appearance for both)
+    # is still null, but later matches carry a real difference.
+    assert matrix["ppda_diff"].null_count() < matrix.height
