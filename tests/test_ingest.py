@@ -13,6 +13,7 @@ from polymbappe.data.ingest import (
     ingest_elo,
     ingest_manager_records,
     ingest_market_odds,
+    ingest_squad_valuations,
     ingest_squads,
     ingest_team_xg,
 )
@@ -233,6 +234,111 @@ def test_scrape_squads_prefers_transfermarkt(tmp_path: Path, monkeypatch) -> Non
 
     assert ingest_squads(settings) == 1
     assert wiki_called is False
+
+
+def test_ingest_squad_valuations_from_local(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    (settings.raw_data_dir / "squad_valuations.csv").write_text(
+        "team,tournament,total_value,median_value,player_count\n"
+        "USA,WC2018,150000000,5000000,23\n"
+        "Brazil,WC2018,900000000,40000000,23\n"
+    )
+    n = ingest_squad_valuations(settings)
+    assert n == 2
+    vals = read_table(Table.SQUAD_VALUATIONS, settings)
+    assert tuple(vals.columns) == TABLE_COLUMNS[Table.SQUAD_VALUATIONS]
+    assert vals.schema["total_value"] == pl.Float64
+    assert vals.schema["player_count"] == pl.Int64
+    # team normalized via alias (USA -> United States).
+    usa = vals.filter(pl.col("tournament") == "WC2018").filter(
+        pl.col("total_value") == 150000000.0
+    ).row(0, named=True)
+    assert usa["team"] == "United States"
+    assert "USA" not in set(vals["team"].to_list())
+
+
+def test_ingest_squad_valuations_skips_when_absent(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    assert ingest_squad_valuations(settings) == 0
+    assert not table_exists(Table.SQUAD_VALUATIONS, settings)
+
+
+def test_scrape_squad_valuations_aggregates_transfermarkt(tmp_path: Path, monkeypatch) -> None:
+    """Manifest teams are scraped from Transfermarkt and aggregated per (team, tournament)."""
+
+    from polymbappe.data import ingest as ingest_mod
+
+    settings = _settings(tmp_path)
+    (settings.raw_data_dir / "squads_manifest.csv").write_text(
+        "tournament,team,tm_id\nWC2022,Brazil,3439\n"
+    )
+
+    def _fake_tm_value(tournament, team, **kwargs):
+        return [
+            {"player": "Neymar", "market_value": 80_000_000.0,
+             "team": team, "tournament": tournament},
+            {"player": "Casemiro", "market_value": 40_000_000.0,
+             "team": team, "tournament": tournament},
+            # A player with no listed value still counts toward player_count, not the totals.
+            {"player": "Weverton", "market_value": None,
+             "team": team, "tournament": tournament},
+        ]
+
+    monkeypatch.setattr(
+        ingest_mod.sources, "fetch_transfermarkt_squad_valuation", _fake_tm_value
+    )
+
+    n = ingest_squad_valuations(settings)
+    assert n == 1
+    vals = read_table(Table.SQUAD_VALUATIONS, settings)
+    row = vals.row(0, named=True)
+    assert row["team"] == "Brazil"
+    assert row["total_value"] == 120_000_000.0
+    assert row["median_value"] == 60_000_000.0  # median of the two valued players
+    assert row["player_count"] == 3
+
+
+def test_parse_transfermarkt_valuations_extracts_market_value() -> None:
+    from polymbappe.data.sources import _parse_transfermarkt_valuations
+
+    html = """
+    <table class="items"><tbody>
+      <tr>
+        <td class="posrela">
+          <table class="inline-table"><tr><td class="hauptlink">
+            <a href="/neymar/profil/spieler/68290">Neymar</a>
+          </td></tr></table>
+        </td>
+        <td class="zentriert">31</td>
+        <td class="rechts hauptlink"><a href="#">€60.00m</a></td>
+      </tr>
+      <tr>
+        <td class="posrela">
+          <table class="inline-table"><tr><td class="hauptlink">
+            <a href="/weverton/profil/spieler/0">Weverton</a>
+          </td></tr></table>
+        </td>
+        <td class="zentriert">35</td>
+        <td class="rechts hauptlink">-</td>
+      </tr>
+    </tbody></table>
+    """
+    rows = _parse_transfermarkt_valuations(html, team="Brazil", tournament="WC2022")
+    assert [r["player"] for r in rows] == ["Neymar", "Weverton"]
+    assert rows[0]["market_value"] == 60_000_000.0
+    assert rows[1]["market_value"] is None
+    assert rows[0]["team"] == "Brazil" and rows[0]["tournament"] == "WC2022"
+
+
+def test_parse_market_value_handles_suffixes() -> None:
+    from polymbappe.data.sources import _parse_market_value
+
+    assert _parse_market_value("€80.00m") == 80_000_000.0
+    assert _parse_market_value("€500k") == 500_000.0
+    assert _parse_market_value("€1.20bn") == 1_200_000_000.0
+    assert _parse_market_value("-") is None
+    assert _parse_market_value("") is None
+    assert _parse_market_value("n/a") is None
 
 
 def test_ingest_manager_records_from_local(tmp_path: Path) -> None:

@@ -277,6 +277,128 @@ def _parse_transfermarkt_squad(
     return rows
 
 
+def fetch_transfermarkt_squad_valuation(
+    tournament: str,
+    team: str,
+    *,
+    settings: Settings | None = None,
+    url: str | None = None,
+    tm_id: str | None = None,
+    saison_id: str = "",
+    min_interval: float = 2.5,
+    timeout: float = 20.0,
+) -> list[dict[str, object]]:
+    """Fetch one national team's Transfermarkt squad page → raw per-player market values.
+
+    Returns a list of ``{"player", "market_value", "team", "tournament"}`` dicts (one per
+    called-up player) where ``market_value`` is the player's Transfermarkt value in euros
+    (``None`` when the page lists no value, e.g. ``"-"``). The caller aggregates these into
+    the per-team ``squad_valuations`` table (total / median / count).
+
+    This reads the **same** kader page as :func:`fetch_transfermarkt_squad` (which drops the
+    value column because cohesion only needs player/club/age); both go through
+    :func:`cached_get` so a single fetch serves both. Brittle selectors are isolated: any
+    parse/layout failure logs and returns ``[]`` rather than raising, so an upstream redesign
+    degrades to "no rows" instead of breaking ingestion.
+
+    Args:
+        tournament: ``Tournament.name`` this snapshot belongs to (passed through onto rows).
+        team: Source team name (canonicalization happens at ingest time).
+        url: Explicit squad URL; overrides the ``slug``/``tm_id`` template.
+        tm_id / saison_id: Components of the default :data:`TRANSFERMARKT_SQUAD_URL`.
+        min_interval: Per-host throttle seconds (pass ``0`` in tests).
+    """
+
+    if url is None:
+        if tm_id is None:
+            logger.warning(
+                "sources.transfermarkt.no_url", team=team, reason="no url or tm_id provided"
+            )
+            return []
+        slug = team.lower().replace(" ", "-")
+        url = TRANSFERMARKT_SQUAD_URL.format(slug=slug, tm_id=tm_id, saison_id=saison_id)
+
+    try:
+        html = cached_get(
+            url, settings=settings, timeout=timeout, min_interval=min_interval
+        ).decode("utf-8", errors="replace")
+    except Exception as exc:  # noqa: BLE001 - network failure isolated, degrade to empty
+        logger.warning("sources.transfermarkt.fetch_failed", team=team, url=url, error=str(exc))
+        return []
+
+    try:
+        return _parse_transfermarkt_valuations(html, team=team, tournament=tournament)
+    except Exception as exc:  # noqa: BLE001 - brittle selectors isolated
+        logger.warning("sources.transfermarkt.parse_failed", team=team, error=str(exc))
+        return []
+
+
+def _parse_transfermarkt_valuations(
+    html: str, *, team: str, tournament: str
+) -> list[dict[str, object]]:
+    """Parse a Transfermarkt squad table into ``player``/``market_value`` rows.
+
+    Selector-isolated helper for :func:`fetch_transfermarkt_squad_valuation`. Each kader row
+    (``table.items > tbody > tr``) carries the player name in the ``hauptlink`` cell and the
+    market value in the trailing right-aligned ``td.rechts.hauptlink`` cell (e.g. ``€80.00m``).
+    """
+
+    soup = BeautifulSoup(html, "html.parser")
+    table = soup.select_one("table.items")
+    if table is None:
+        return []
+
+    rows: list[dict[str, object]] = []
+    for tr in table.select("tbody > tr"):
+        name_cell = tr.select_one("td.hauptlink a") or tr.select_one(".inline-table a")
+        if name_cell is None:
+            continue
+        player = name_cell.get_text(strip=True)
+        if not player:
+            continue
+
+        value_cell = tr.select_one("td.rechts.hauptlink")
+        market_value = (
+            _parse_market_value(value_cell.get_text(strip=True))
+            if value_cell is not None
+            else None
+        )
+
+        rows.append(
+            {
+                "player": player,
+                "market_value": market_value,
+                "team": team,
+                "tournament": tournament,
+            }
+        )
+    return rows
+
+
+def _parse_market_value(text: str) -> float | None:
+    """Parse a Transfermarkt market-value string (``€80.00m``, ``€500k``, ``-``) into euros.
+
+    Returns ``None`` for empty / placeholder (``"-"``) cells or anything unparseable, so a
+    missing value never crashes aggregation. Handles the English-site suffixes ``k`` / ``m`` /
+    ``bn``.
+    """
+
+    text = text.strip().replace("€", "").replace(",", "")
+    if not text or text == "-":
+        return None
+    multiplier = 1.0
+    if text.endswith("bn"):
+        multiplier, text = 1_000_000_000.0, text[:-2]
+    elif text.endswith("m"):
+        multiplier, text = 1_000_000.0, text[:-1]
+    elif text.endswith("k"):
+        multiplier, text = 1_000.0, text[:-1]
+    try:
+        return float(text) * multiplier
+    except ValueError:
+        return None
+
+
 #: Wikipedia "<tournament> squads" article per internal ``Tournament.name``. These pages
 #: list every nation's call-up (player, club, date-of-birth/age) and are the **fallback**
 #: squad source when Transfermarkt is unavailable (blocked / no ``tm_id``). Extend as new
