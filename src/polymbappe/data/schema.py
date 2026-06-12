@@ -51,8 +51,41 @@ class Match(BaseModel):
     is_knockout: bool = False
     neutral_site: bool = False
     group: str | None = None
+    city: str | None = None
+    country: str | None = None
     fair_play_home: int = 0
     fair_play_away: int = 0
+
+
+class Venue(BaseModel):
+    """Tournament venue with host-city coordinates (openfootball stadiums feed)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    venue: str
+    city: str
+    country: str | None = None
+    latitude: float = Field(ge=-90.0, le=90.0)
+    longitude: float = Field(ge=-180.0, le=180.0)
+
+
+class ScheduledMatch(BaseModel):
+    """A single fixture in the tournament schedule (openfootball worldcup feed).
+
+    ``home_team`` / ``away_team`` are real nations for group-stage fixtures and bracket
+    placeholders (e.g. ``"2A"``, ``"W73"``) for knockout fixtures whose participants are
+    not yet known. ``city`` is the openfootball host-city string and joins :class:`Venue`.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    match_id: str
+    date: date
+    stage: str
+    group: str | None = None
+    home_team: str
+    away_team: str
+    city: str
 
 
 class GroupStanding(BaseModel):

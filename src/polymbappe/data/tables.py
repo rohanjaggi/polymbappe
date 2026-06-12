@@ -24,6 +24,9 @@ class Table(StrEnum):
     SQUADS = "squads"
     MANAGER_RECORDS = "manager_records"
     TEAM_XG = "team_xg"
+    SCHEDULE = "schedule"
+    VENUES = "venues"
+    CITY_COORDS = "city_coords"
 
 
 #: Columns each normalized table is expected to expose. Used for empty-frame
@@ -40,6 +43,8 @@ TABLE_COLUMNS: dict[Table, tuple[str, ...]] = {
         "is_knockout",
         "neutral_site",
         "group",
+        "city",
+        "country",
     ),
     Table.ELO_SNAPSHOTS: ("team", "date", "rating"),
     Table.MARKET_ODDS: (
@@ -68,6 +73,17 @@ TABLE_COLUMNS: dict[Table, tuple[str, ...]] = {
         "tournament_order",
     ),
     Table.TEAM_XG: ("team", "date", "xg", "xga"),
+    Table.SCHEDULE: (
+        "match_id",
+        "date",
+        "stage",
+        "group",
+        "home_team",
+        "away_team",
+        "city",
+    ),
+    Table.VENUES: ("venue", "city", "country", "latitude", "longitude"),
+    Table.CITY_COORDS: ("city", "country", "latitude", "longitude", "population"),
 }
 
 

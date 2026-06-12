@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import polars as pl
+import pytest
 
 from polymbappe.config import Settings
 from polymbappe.data.ingest import (
@@ -13,9 +14,11 @@ from polymbappe.data.ingest import (
     ingest_elo,
     ingest_manager_records,
     ingest_market_odds,
+    ingest_schedule,
     ingest_squad_valuations,
     ingest_squads,
     ingest_team_xg,
+    ingest_venues,
 )
 from polymbappe.data.store import read_table, table_exists
 from polymbappe.data.tables import TABLE_COLUMNS, Table
@@ -487,12 +490,167 @@ def test_ingest_all_sources_orchestration(tmp_path: Path) -> None:
         "date,home_team,away_team,home_odds,draw_odds,away_odds\n"
         "2018-06-14,Russia,Saudi Arabia,1.5,4.0,7.0\n"
     )
+    # venues/schedule prefer a local CSV (mirrors results.csv) so the run stays offline.
+    (settings.raw_data_dir / "venues.csv").write_text(
+        "venue,city,country,latitude,longitude\n"
+        "Estadio Azteca,Mexico City,mx,19.3029,-99.1505\n"
+        "SoFi Stadium,Los Angeles (Inglewood),us,33.953,-118.339\n"
+    )
+    (settings.raw_data_dir / "schedule.csv").write_text(
+        "match_id,date,stage,group,home_team,away_team,city\n"
+        "x,2026-06-11,Matchday 1,A,Mexico,South Africa,Mexico City\n"
+    )
+    (settings.raw_data_dir / "city_coords.csv").write_text(
+        "city,country,latitude,longitude,population\n"
+        "moscow,RU,55.7522,37.6156,10381222\n"
+    )
     report = ingest_all_sources(settings=settings)
     assert report["results"] == 3
     assert report["elo"] == 6
     assert report["market_odds"] == 1
     assert report["team_xg"] == 0  # optional, no file -> skipped cleanly
+    assert report["venues"] == 2
+    assert report["schedule"] == 1
+    assert report["city_coords"] == 1
     assert report["squads"] == 0  # optional, no file/scraper -> skipped cleanly
     assert report["manager_records"] == 0  # optional, no file/scraper -> skipped cleanly
     for table in (Table.MATCHES, Table.ELO_SNAPSHOTS, Table.MARKET_ODDS):
         assert table_exists(table, settings)
+
+
+# -- venues + schedule (openfootball) ------------------------------------------
+
+def test_ingest_venues_from_local(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    (settings.raw_data_dir / "venues.csv").write_text(
+        "venue,city,country,latitude,longitude\n"
+        "Estadio Azteca,Mexico City,mx,19.3029,-99.1505\n"
+        "SoFi Stadium,Los Angeles (Inglewood),us,33.953,-118.339\n"
+    )
+    n = ingest_venues(settings)
+    assert n == 2
+    venues = read_table(Table.VENUES, settings)
+    assert set(venues.columns) == set(TABLE_COLUMNS[Table.VENUES])
+    assert venues.filter(pl.col("city") == "Mexico City").row(0, named=True)["latitude"] == 19.3029
+
+
+def test_ingest_venues_skips_when_absent(tmp_path: Path, monkeypatch) -> None:
+    from polymbappe.data import ingest as ingest_mod
+
+    settings = _settings(tmp_path)
+    # No local file and the openfootball feed yields nothing -> clean skip (no network).
+    monkeypatch.setattr(ingest_mod.sources, "fetch_openfootball_stadiums", lambda **k: [])
+    assert ingest_venues(settings) == 0
+    assert not table_exists(Table.VENUES, settings)
+
+
+def test_ingest_venues_from_openfootball(tmp_path: Path, monkeypatch) -> None:
+    from polymbappe.data import ingest as ingest_mod
+
+    settings = _settings(tmp_path)
+
+    def _fake_stadiums(**kwargs):
+        return [
+            {"city": "Mexico City", "cc": "mx", "name": "Estadio Azteca",
+             "coords": "19°18'11\"N 99°09'02\"W"},
+            {"city": "Vancouver", "cc": "ca", "name": "BC Place",
+             "coords": "49°16'36\"N 123°6'43\"W"},
+        ]
+
+    monkeypatch.setattr(ingest_mod.sources, "fetch_openfootball_stadiums", _fake_stadiums)
+    n = ingest_venues(settings)
+    assert n == 2
+    venues = read_table(Table.VENUES, settings)
+    van = venues.filter(pl.col("city") == "Vancouver").row(0, named=True)
+    assert van["latitude"] == pytest.approx(49.2767, abs=1e-3)
+
+
+def test_ingest_schedule_from_local(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    (settings.raw_data_dir / "schedule.csv").write_text(
+        "match_id,date,stage,group,home_team,away_team,city\n"
+        "seed,2026-06-11,Matchday 1,A,Mexico,South Africa,Mexico City\n"
+    )
+    n = ingest_schedule(settings)
+    assert n == 1
+    sched = read_table(Table.SCHEDULE, settings)
+    assert set(sched.columns) == set(TABLE_COLUMNS[Table.SCHEDULE])
+    row = sched.row(0, named=True)
+    # match_id is rebuilt on the date__home__away convention (not the CSV's "seed").
+    assert row["match_id"] == "2026-06-11__Mexico__South Africa"
+    assert sched.schema["date"] == pl.Date
+
+
+def test_ingest_schedule_skips_when_absent(tmp_path: Path, monkeypatch) -> None:
+    from polymbappe.data import ingest as ingest_mod
+
+    settings = _settings(tmp_path)
+    # No local file and the openfootball feed yields nothing -> clean skip (no network).
+    monkeypatch.setattr(ingest_mod.sources, "fetch_openfootball_schedule", lambda **k: [])
+    assert ingest_schedule(settings) == 0
+    assert not table_exists(Table.SCHEDULE, settings)
+
+
+def test_ingest_schedule_from_openfootball(tmp_path: Path, monkeypatch) -> None:
+    from polymbappe.data import ingest as ingest_mod
+
+    settings = _settings(tmp_path)
+
+    def _fake_matches(**kwargs):
+        return [
+            {"round": "Matchday 1", "date": "2026-06-11", "team1": "Mexico",
+             "team2": "South Africa", "group": "Group A", "ground": "Mexico City"},
+            {"round": "Round of 32", "date": "2026-06-28", "team1": "2A", "team2": "2B",
+             "ground": "Los Angeles (Inglewood)"},
+        ]
+
+    monkeypatch.setattr(ingest_mod.sources, "fetch_openfootball_schedule", _fake_matches)
+    n = ingest_schedule(settings)
+    assert n == 2
+    sched = read_table(Table.SCHEDULE, settings)
+    assert sched.filter(pl.col("stage") == "Matchday 1").row(0, named=True)["group"] == "A"
+
+
+# -- city gazetteer (GeoNames) -------------------------------------------------
+
+def test_ingest_city_coords_from_local(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    (settings.raw_data_dir / "city_coords.csv").write_text(
+        "city,country,latitude,longitude,population\n"
+        "Moscow,RU,55.7522,37.6156,10381222\n"
+        "London,GB,51.5085,-0.1257,8961989\n"
+    )
+    from polymbappe.data.ingest import ingest_city_coords
+
+    n = ingest_city_coords(settings)
+    assert n == 2
+    coords = read_table(Table.CITY_COORDS, settings)
+    assert set(coords.columns) == set(TABLE_COLUMNS[Table.CITY_COORDS])
+    # city is lower-cased on ingest so the resolver keys match.
+    assert "moscow" in coords["city"].to_list()
+
+
+def test_ingest_city_coords_skips_when_absent(tmp_path: Path, monkeypatch) -> None:
+    from polymbappe.data import ingest as ingest_mod
+
+    settings = _settings(tmp_path)
+    # No local file and an empty GeoNames fetch -> clean skip (no network).
+    monkeypatch.setattr(
+        ingest_mod.sources, "fetch_geonames_cities", lambda *a, **k: pl.DataFrame()
+    )
+    from polymbappe.data.ingest import ingest_city_coords
+
+    assert ingest_city_coords(settings) == 0
+    assert not table_exists(Table.CITY_COORDS, settings)
+
+
+def test_ingest_results_preserves_city_country(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    _write_results(settings)
+    from polymbappe.data.ingest import ingest_results
+
+    ingest_results(settings)
+    matches = read_table(Table.MATCHES, settings)
+    assert {"city", "country"}.issubset(matches.columns)
+    moscow = matches.filter(pl.col("home_team") == "Russia").sort("date").row(0, named=True)
+    assert moscow["city"] == "Moscow"

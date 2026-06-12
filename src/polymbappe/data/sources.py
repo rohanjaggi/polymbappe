@@ -28,6 +28,32 @@ KAGGLE_RESULTS_RAW_URL = (
     "https://raw.githubusercontent.com/martj42/international_results/master/results.csv"
 )
 
+#: openfootball public-domain JSON for the 2026 World Cup (GitHub raw, no API key). The
+#: schedule carries one object per fixture (``round``/``date``/``team1``/``team2``/``group``/
+#: ``ground``); the stadiums file carries the 16 host venues with coordinates. Both are
+#: regenerated from upstream ``.txt`` sources, so the shapes are stable across editions.
+OPENFOOTBALL_SCHEDULE_URL = (
+    "https://raw.githubusercontent.com/openfootball/worldcup.json/master/2026/worldcup.json"
+)
+OPENFOOTBALL_STADIUMS_URL = (
+    "https://raw.githubusercontent.com/openfootball/worldcup.json/master"
+    "/2026/worldcup.stadiums.json"
+)
+
+#: GeoNames gazetteer dump (CC-BY, no API key). ``{dataset}`` selects a population floor —
+#: ``cities15000`` (~26k cities, covers every WC/Euro/Copa host city), ``cities5000`` /
+#: ``cities1000`` for denser coverage. Each ``.zip`` holds one tab-separated ``.txt`` with the
+#: 19 standard GeoNames columns (no header).
+GEONAMES_CITIES_URL = "https://download.geonames.org/export/dump/{dataset}.zip"
+
+#: The 19 columns of a GeoNames ``cities*.txt`` dump, in order (the file carries no header).
+GEONAMES_COLUMNS: tuple[str, ...] = (
+    "geonameid", "name", "asciiname", "alternatenames", "latitude", "longitude",
+    "feature_class", "feature_code", "country_code", "cc2", "admin1_code", "admin2_code",
+    "admin3_code", "admin4_code", "population", "elevation", "dem", "timezone",
+    "modification_date",
+)
+
 _DEFAULT_HEADERS = {"User-Agent": "polymbappe/0.1 (+https://github.com/)"}
 
 #: Realistic desktop-browser headers for anti-bot-sensitive sources (Transfermarkt,
@@ -159,6 +185,120 @@ def fetch_football_data_csv(url: str, timeout: float = 60.0) -> pl.DataFrame:
     """Download a Football-Data.co.uk CSV of bookmaker odds into Polars."""
 
     return pl.read_csv(io.BytesIO(_get(url, timeout).content), ignore_errors=True)
+
+
+def _fetch_openfootball_array(
+    url: str,
+    key: str,
+    *,
+    settings: Settings | None = None,
+    min_interval: float = 1.0,
+    timeout: float = 30.0,
+) -> list[dict[str, object]]:
+    """Fetch an openfootball JSON document and return its top-level ``key`` array.
+
+    The document is fetched through :func:`cached_get` (on-disk cache + per-host throttle).
+    Any fetch / JSON-decode failure logs and returns ``[]`` (graceful degrade), so a network
+    outage or an upstream layout change degrades ingestion to "no rows" rather than raising.
+    """
+
+    import json
+
+    try:
+        body = cached_get(
+            url, settings=settings, timeout=timeout, min_interval=min_interval
+        ).decode("utf-8", errors="replace")
+    except Exception as exc:  # noqa: BLE001 - network isolated, degrade to empty
+        logger.warning("sources.openfootball.fetch_failed", url=url, error=str(exc))
+        return []
+
+    try:
+        payload = json.loads(body)
+        rows = payload.get(key, []) if isinstance(payload, dict) else []
+        return [r for r in rows if isinstance(r, dict)]
+    except Exception as exc:  # noqa: BLE001 - brittle parse isolated
+        logger.warning("sources.openfootball.parse_failed", url=url, key=key, error=str(exc))
+        return []
+
+
+def fetch_geonames_cities(
+    dataset: str = "cities15000",
+    *,
+    settings: Settings | None = None,
+    min_interval: float = 1.0,
+    timeout: float = 120.0,
+) -> pl.DataFrame:
+    """Fetch a GeoNames ``cities*`` dump → raw frame with :data:`GEONAMES_COLUMNS`.
+
+    Downloads the ``{dataset}.zip`` (through :func:`cached_get`), unzips the single
+    tab-separated ``.txt`` in-memory, and loads it as a Polars frame. The TSV is unquoted
+    (city names contain apostrophes/quotes), so quoting is disabled. Fetch / unzip failures
+    log and return an empty frame (graceful degrade), keeping ingestion offline-safe.
+    """
+
+    import zipfile
+
+    url = GEONAMES_CITIES_URL.format(dataset=dataset)
+    try:
+        content = cached_get(url, settings=settings, timeout=timeout, min_interval=min_interval)
+        with zipfile.ZipFile(io.BytesIO(content)) as zf:
+            data = zf.read(f"{dataset}.txt")
+    except Exception as exc:  # noqa: BLE001 - network / unzip isolated, degrade to empty
+        logger.warning("sources.geonames.fetch_failed", url=url, error=str(exc))
+        return pl.DataFrame(schema={c: pl.Utf8 for c in GEONAMES_COLUMNS})
+
+    try:
+        return pl.read_csv(
+            io.BytesIO(data),
+            separator="\t",
+            has_header=False,
+            new_columns=list(GEONAMES_COLUMNS),
+            quote_char=None,
+            infer_schema_length=0,
+        )
+    except Exception as exc:  # noqa: BLE001 - brittle parse isolated
+        logger.warning("sources.geonames.parse_failed", url=url, error=str(exc))
+        return pl.DataFrame(schema={c: pl.Utf8 for c in GEONAMES_COLUMNS})
+
+
+def fetch_openfootball_schedule(
+    url: str = OPENFOOTBALL_SCHEDULE_URL,
+    *,
+    settings: Settings | None = None,
+    min_interval: float = 1.0,
+    timeout: float = 30.0,
+) -> list[dict[str, object]]:
+    """Fetch the openfootball 2026 World Cup fixtures → raw ``matches`` array.
+
+    Returns the list of raw fixture dicts (``round``, ``date``, ``team1``, ``team2``,
+    ``group``, ``ground``, ...); shaping into the ``schedule`` table happens in
+    :func:`~polymbappe.data.normalize.normalize_openfootball_schedule`. Failures degrade to
+    ``[]`` (see :func:`_fetch_openfootball_array`).
+    """
+
+    return _fetch_openfootball_array(
+        url, "matches", settings=settings, min_interval=min_interval, timeout=timeout
+    )
+
+
+def fetch_openfootball_stadiums(
+    url: str = OPENFOOTBALL_STADIUMS_URL,
+    *,
+    settings: Settings | None = None,
+    min_interval: float = 1.0,
+    timeout: float = 30.0,
+) -> list[dict[str, object]]:
+    """Fetch the openfootball 2026 World Cup venues → raw ``stadiums`` array.
+
+    Returns the list of raw stadium dicts (``name``, ``city``, ``cc``, ``coords``, ...);
+    shaping + coordinate parsing happens in
+    :func:`~polymbappe.data.normalize.normalize_openfootball_stadiums`. Failures degrade to
+    ``[]`` (see :func:`_fetch_openfootball_array`).
+    """
+
+    return _fetch_openfootball_array(
+        url, "stadiums", settings=settings, min_interval=min_interval, timeout=timeout
+    )
 
 
 #: Transfermarkt squad/kader page template. ``{slug}`` is the team's URL slug and

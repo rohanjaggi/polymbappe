@@ -171,6 +171,15 @@ def normalize_kaggle_results(raw: pl.DataFrame) -> pl.DataFrame:
     )
     df = df.with_columns(infer_knockout_stage(df))
 
+    # ``city`` / ``country`` are the match venue, carried straight from the feed (they are the
+    # per-match venue signal the travel feature backfills against). Absent columns are filled
+    # null so the matches schema stays dense for older mirrors that omit them.
+    for col in ("city", "country"):
+        if col in df.columns:
+            df = df.with_columns(pl.col(col).cast(pl.Utf8).str.strip_chars().alias(col))
+        else:
+            df = df.with_columns(pl.lit(None, dtype=pl.Utf8).alias(col))
+
     return df.select(TABLE_COLUMNS[Table.MATCHES])
 
 
@@ -341,3 +350,213 @@ def normalize_odds_frame(
         (inv_a / overround).alias("away_win_prob"),
         timestamp_expr.alias("timestamp"),
     )
+
+
+# ---------------------------------------------------------------------------
+# openfootball 2026 World Cup (schedule + venue coordinates)
+# ---------------------------------------------------------------------------
+
+#: One coordinate of a ``"LAT LON"`` pair, e.g. ``49°16'36"N`` or ``37.403°N`` or
+#: ``40°48'48.7"N``. Degrees are mandatory; minutes/seconds (with optional decimals) and the
+#: N/S/E/W hemisphere letter are optional. Both ASCII (``'`` ``"``) and unicode (``′`` ``″``)
+#: minute/second marks are accepted.
+_COORD_RE = re.compile(
+    r"(?P<deg>\d+(?:\.\d+)?)°"
+    r"(?:(?P<min>\d+(?:\.\d+)?)['′])?"
+    r"(?:(?P<sec>\d+(?:\.\d+)?)[\"″])?"
+    r"\s*(?P<hemi>[NSEWnsew])?"
+)
+
+
+def _parse_one_coord(token: str) -> float | None:
+    """Parse a single DMS-or-decimal coordinate token into signed decimal degrees."""
+
+    match = _COORD_RE.search(token)
+    if match is None:
+        return None
+    deg = float(match.group("deg"))
+    deg += float(match.group("min") or 0.0) / 60.0
+    deg += float(match.group("sec") or 0.0) / 3600.0
+    hemi = (match.group("hemi") or "").upper()
+    if hemi in ("S", "W"):
+        deg = -deg
+    return deg
+
+
+def parse_geo_coords(text: str | None) -> tuple[float | None, float | None]:
+    """Parse an openfootball ``coords`` string (``"<lat> <lon>"``) into ``(lat, lon)``.
+
+    Handles both DMS (``49°16'36"N 123°6'43"W``) and decimal-degree (``37.403°N 121.970°W``)
+    forms, including DMS with a decimal seconds component. Returns ``(None, None)`` when the
+    string is empty or does not contain two parseable coordinates.
+    """
+
+    if not text:
+        return None, None
+    parts = text.split()
+    if len(parts) < 2:
+        return None, None
+    return _parse_one_coord(parts[0]), _parse_one_coord(parts[1])
+
+
+def normalize_openfootball_stadiums(stadiums: list[dict[str, object]]) -> pl.DataFrame:
+    """Normalize openfootball ``stadiums`` dicts into the ``venues`` schema.
+
+    Each raw dict carries ``name`` (stadium), ``city`` (the host-city string, e.g.
+    ``"Boston (Foxborough)"`` — kept verbatim so it joins the schedule's ``ground``), ``cc``
+    (ISO country code), and ``coords`` (a DMS-or-decimal ``"<lat> <lon>"`` string parsed by
+    :func:`parse_geo_coords`). Venues whose coordinates do not parse are dropped (a venue with
+    no usable location cannot contribute a travel distance).
+    """
+
+    rows: list[dict[str, object]] = []
+    for s in stadiums:
+        city = str(s.get("city") or "").strip()
+        if not city:
+            continue
+        lat, lon = parse_geo_coords(str(s.get("coords")) if s.get("coords") else None)
+        if lat is None or lon is None:
+            continue
+        rows.append(
+            {
+                "venue": str(s.get("name") or "").strip(),
+                "city": city,
+                "country": (str(s.get("cc")).strip() or None) if s.get("cc") else None,
+                "latitude": float(lat),
+                "longitude": float(lon),
+            }
+        )
+    return pl.DataFrame(
+        rows,
+        schema={
+            "venue": pl.Utf8,
+            "city": pl.Utf8,
+            "country": pl.Utf8,
+            "latitude": pl.Float64,
+            "longitude": pl.Float64,
+        },
+    ).select(TABLE_COLUMNS[Table.VENUES])
+
+
+#: City names are matched case-folded; this keeps only Latin-script aliases (after
+#: lowercasing) so transliterations like "Munich"/"Cologne" survive while non-Latin
+#: alternatenames (Cyrillic/Arabic/CJK) are dropped — bounding the exploded gazetteer.
+_LATIN_CITY_RE = r"^[a-z0-9 .'\-]+$"
+
+
+def normalize_geonames_cities(raw: pl.DataFrame) -> pl.DataFrame:
+    """Normalize a GeoNames ``cities*`` dump into the ``city_coords`` gazetteer schema.
+
+    Produces one ``(city, country, latitude, longitude, population)`` row per *name alias* of
+    each city — its ``name``, ``asciiname``, and every Latin-script ``alternatenames`` entry —
+    so a match's English city string resolves even when it differs from the local spelling
+    (``"Munich"`` -> München). ``city`` is lower-cased and ``country`` is the ISO-2 code; rows
+    are de-duplicated on ``(city, country)`` keeping the highest population (the resolver later
+    breaks tournament-host ambiguities by population). Empty input yields the empty schema.
+    """
+
+    if raw.is_empty():
+        return pl.DataFrame(
+            schema={
+                "city": pl.Utf8, "country": pl.Utf8, "latitude": pl.Float64,
+                "longitude": pl.Float64, "population": pl.Int64,
+            }
+        ).select(TABLE_COLUMNS[Table.CITY_COORDS])
+
+    base = raw.select(
+        pl.col("name").cast(pl.Utf8),
+        pl.col("asciiname").cast(pl.Utf8),
+        pl.col("alternatenames").cast(pl.Utf8),
+        pl.col("latitude").cast(pl.Float64, strict=False),
+        pl.col("longitude").cast(pl.Float64, strict=False),
+        pl.col("country_code").cast(pl.Utf8).alias("country"),
+        pl.col("population").cast(pl.Int64, strict=False).fill_null(0),
+    ).drop_nulls(["latitude", "longitude"])
+
+    def _alias(expr: pl.Expr) -> pl.DataFrame:
+        return base.select(
+            expr.alias("city"), "country", "latitude", "longitude", "population"
+        )
+
+    aliases = pl.concat(
+        [
+            _alias(pl.col("name")),
+            _alias(pl.col("asciiname")),
+            base.select(
+                pl.col("alternatenames").str.split(",").alias("city"),
+                "country", "latitude", "longitude", "population",
+            ).explode("city"),
+        ],
+        how="vertical",
+    ).with_columns(pl.col("city").str.strip_chars().str.to_lowercase())
+
+    aliases = aliases.filter(
+        (pl.col("city").str.len_chars() > 0) & pl.col("city").str.contains(_LATIN_CITY_RE)
+    )
+    # Highest-population entry wins each (city, country) collision.
+    aliases = aliases.sort("population", descending=True).unique(
+        subset=["city", "country"], keep="first"
+    )
+    return aliases.select(TABLE_COLUMNS[Table.CITY_COORDS])
+
+
+def normalize_openfootball_schedule(matches: list[dict[str, object]]) -> pl.DataFrame:
+    """Normalize openfootball ``matches`` dicts into the ``schedule`` schema.
+
+    Each raw dict carries ``round`` (e.g. ``"Matchday 1"`` / ``"Round of 32"`` → ``stage``),
+    ``date``, ``team1`` / ``team2`` (real nations for group games, bracket placeholders such
+    as ``"2A"`` for knockouts), an optional ``group`` (``"Group A"`` → ``"A"``; absent for
+    knockouts), and ``ground`` (the host-city string → ``city``, joining the ``venues``
+    table). Team names are canonicalized via :func:`normalize_team_expr` so group-stage
+    fixtures join the matches / Elo tables; placeholders pass through unchanged. ``match_id``
+    follows the ``date__home__away`` convention shared with the matches and odds tables.
+
+    Rows missing a date or either team are dropped.
+    """
+
+    from polymbappe.data.aliases import normalize_team_expr
+
+    rows = [
+        {
+            "stage": str(m.get("round") or "").strip(),
+            "date": str(m.get("date") or "").strip(),
+            "group": str(m.get("group")).strip() if m.get("group") else None,
+            "home_team": str(m.get("team1") or "").strip(),
+            "away_team": str(m.get("team2") or "").strip(),
+            "city": str(m.get("ground") or "").strip(),
+        }
+        for m in matches
+    ]
+    df = pl.DataFrame(
+        rows,
+        schema={
+            "stage": pl.Utf8,
+            "date": pl.Utf8,
+            "group": pl.Utf8,
+            "home_team": pl.Utf8,
+            "away_team": pl.Utf8,
+            "city": pl.Utf8,
+        },
+    )
+    if df.is_empty():
+        return df.with_columns(pl.lit(None, dtype=pl.Utf8).alias("match_id")).select(
+            TABLE_COLUMNS[Table.SCHEDULE]
+        )
+
+    df = df.with_columns(
+        pl.col("date").str.to_date(strict=False).alias("date"),
+        # Drop the "Group " prefix so the label matches the draw config (A..L).
+        pl.col("group").str.replace(r"(?i)^group\s+", "").alias("group"),
+        normalize_team_expr("home_team").alias("home_team"),
+        normalize_team_expr("away_team").alias("away_team"),
+    )
+    df = df.filter(
+        pl.col("date").is_not_null()
+        & (pl.col("home_team").str.len_chars() > 0)
+        & (pl.col("away_team").str.len_chars() > 0)
+    )
+    df = df.with_columns(
+        pl.format("{}__{}__{}", pl.col("date"), pl.col("home_team"), pl.col("away_team"))
+        .alias("match_id")
+    )
+    return df.select(TABLE_COLUMNS[Table.SCHEDULE])
