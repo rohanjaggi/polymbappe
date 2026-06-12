@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+from datetime import date
 from pathlib import Path
 
 import polars as pl
@@ -17,8 +19,9 @@ from polymbappe.data.ingest import (
     ingest_squads,
     ingest_team_xg,
 )
-from polymbappe.data.store import read_table, table_exists
+from polymbappe.data.store import read_parquet, read_table, table_exists, write_table
 from polymbappe.data.tables import TABLE_COLUMNS, Table
+from polymbappe.features.pipeline import build_feature_matrix
 
 _RESULTS_CSV = (
     "date,home_team,away_team,home_score,away_score,tournament,city,country,neutral\n"
@@ -261,6 +264,66 @@ def test_ingest_squad_valuations_skips_when_absent(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
     assert ingest_squad_valuations(settings) == 0
     assert not table_exists(Table.SQUAD_VALUATIONS, settings)
+
+
+_MATCHES_SCHEMA = {
+    "match_id": pl.Utf8,
+    "date": pl.Date,
+    "home_team": pl.Utf8,
+    "away_team": pl.Utf8,
+    "home_goals": pl.Int64,
+    "away_goals": pl.Int64,
+    "competition": pl.Utf8,
+    "is_knockout": pl.Boolean,
+    "neutral_site": pl.Boolean,
+    "group": pl.Utf8,
+}
+
+
+def test_ingest_squad_valuations_then_build_features_end_to_end(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Ingest squad valuations from raw, then build the core matrix: the Tier-1 squad
+    value ratio must reach the written feature table, end to end."""
+
+    settings = _settings(tmp_path)
+    # A WC2018 fixture (window 2018-06-14..07-15). Team names are already canonical so they
+    # line up with the valuation table after normalization (USA -> United States).
+    matches = pl.DataFrame(
+        {
+            "match_id": ["wc18_1"],
+            "date": [date(2018, 6, 17)],
+            "home_team": ["Brazil"],
+            "away_team": ["United States"],
+            "home_goals": [2],
+            "away_goals": [0],
+            "competition": ["FIFA World Cup"],
+            "is_knockout": [False],
+            "neutral_site": [True],
+            "group": ["E"],
+        },
+        schema=_MATCHES_SCHEMA,
+    )
+    write_table(Table.MATCHES, matches, settings=settings)
+    (settings.raw_data_dir / "squad_valuations.csv").write_text(
+        "team,tournament,total_value,median_value,player_count\n"
+        "Brazil,WC2018,900000000,40000000,23\n"
+        "USA,WC2018,150000000,5000000,23\n"
+    )
+    assert ingest_squad_valuations(settings) == 2
+
+    # build_feature_matrix resolves its own Settings(); point it at tmp_path via the env.
+    monkeypatch.setenv("POLYMBAPPE_DATA_DIR", str(tmp_path))
+    build_feature_matrix()
+
+    matrix = read_parquet(settings.processed_data_dir / "core_features.parquet")
+    assert "squad_value_ratio" in matrix.columns
+    row = matrix.row(0, named=True)
+    assert row["home_log_total_value"] == math.log1p(900000000.0)
+    assert row["away_log_total_value"] == math.log1p(150000000.0)
+    # log(value_home / value_away) > 0: Brazil (home) is more valuable than the USA (away).
+    assert row["squad_value_ratio"] == math.log1p(900000000.0) - math.log1p(150000000.0)
+    assert row["squad_value_ratio"] > 0
 
 
 def test_scrape_squad_valuations_aggregates_transfermarkt(tmp_path: Path, monkeypatch) -> None:
