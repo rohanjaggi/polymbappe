@@ -21,6 +21,7 @@ class Table(StrEnum):
     ELO_SNAPSHOTS = "elo_snapshots"
     MARKET_ODDS = "market_odds"
     SQUAD_VALUATIONS = "squad_valuations"
+    PLAYER_ATTRIBUTES = "player_attributes"
     SQUADS = "squads"
     MANAGER_RECORDS = "manager_records"
     TEAM_XG = "team_xg"
@@ -57,6 +58,7 @@ TABLE_COLUMNS: dict[Table, tuple[str, ...]] = {
         "median_value",
         "player_count",
     ),
+    Table.PLAYER_ATTRIBUTES: ("team", "player", "overall"),
     Table.SQUADS: ("team", "tournament", "player", "club", "age"),
     Table.MANAGER_RECORDS: (
         "manager",

@@ -13,6 +13,7 @@ from polymbappe.data.ingest import (
     ingest_elo,
     ingest_manager_records,
     ingest_market_odds,
+    ingest_player_attributes,
     ingest_squad_valuations,
     ingest_squads,
     ingest_team_xg,
@@ -296,6 +297,63 @@ def test_scrape_squad_valuations_aggregates_transfermarkt(tmp_path: Path, monkey
     assert row["total_value"] == 120_000_000.0
     assert row["median_value"] == 60_000_000.0  # median of the two valued players
     assert row["player_count"] == 3
+
+
+def test_ingest_player_attributes_from_local(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    (settings.raw_data_dir / "player_attributes.csv").write_text(
+        "team,player,overall\nUSA,Christian Pulisic,82\nBrazil,Vinicius Junior,89\n"
+    )
+    n = ingest_player_attributes(settings)
+    assert n == 2
+    attrs = read_table(Table.PLAYER_ATTRIBUTES, settings)
+    assert tuple(attrs.columns) == TABLE_COLUMNS[Table.PLAYER_ATTRIBUTES]
+    assert attrs.schema["overall"] == pl.Int64
+    # team normalized via alias (USA -> United States).
+    pulisic = attrs.filter(pl.col("player") == "Christian Pulisic").row(0, named=True)
+    assert pulisic["team"] == "United States"
+    assert "USA" not in set(attrs["team"].to_list())
+
+
+def test_ingest_player_attributes_skips_when_absent(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    assert ingest_player_attributes(settings) == 0
+    assert not table_exists(Table.PLAYER_ATTRIBUTES, settings)
+
+
+def test_ingest_player_attributes_from_kaggle(tmp_path: Path, monkeypatch) -> None:
+    """The Kaggle config file triggers a fetch whose EA-FC columns are reconciled."""
+
+    from polymbappe.data import ingest as ingest_mod
+
+    settings = _settings(tmp_path)
+    (settings.raw_data_dir / "player_attributes_kaggle.txt").write_text(
+        "stefanoleone992/fc-24\nfile=male_players.csv\n"
+    )
+
+    def _fake_kaggle(dataset, *, file=None):
+        assert dataset == "stefanoleone992/fc-24"
+        assert file == "male_players.csv"
+        # Raw EA FC schema: short_name / nationality_name / overall (+ noise columns).
+        return pl.DataFrame(
+            {
+                "short_name": ["L. Messi", "K. Mbappé"],
+                "nationality_name": ["Argentina", "France"],
+                "overall": [90, 91],
+                "club_name": ["Inter Miami", "Real Madrid"],
+            }
+        )
+
+    monkeypatch.setattr(ingest_mod.sources, "fetch_kaggle_player_attributes", _fake_kaggle)
+
+    n = ingest_player_attributes(settings)
+    assert n == 2
+    attrs = read_table(Table.PLAYER_ATTRIBUTES, settings)
+    assert tuple(attrs.columns) == TABLE_COLUMNS[Table.PLAYER_ATTRIBUTES]
+    assert set(attrs["player"].to_list()) == {"L. Messi", "K. Mbappé"}
+    mbappe = attrs.filter(pl.col("player") == "K. Mbappé").row(0, named=True)
+    assert mbappe["team"] == "France"
+    assert mbappe["overall"] == 91
 
 
 def test_parse_transfermarkt_valuations_extracts_market_value() -> None:

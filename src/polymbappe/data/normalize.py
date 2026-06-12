@@ -341,3 +341,82 @@ def normalize_odds_frame(
         (inv_a / overround).alias("away_win_prob"),
         timestamp_expr.alias("timestamp"),
     )
+
+
+# ---------------------------------------------------------------------------
+# Player attributes (EA FC / FIFA via stefanoleone992, FM25)
+# ---------------------------------------------------------------------------
+
+#: Candidate raw column names per logical field, in priority order. EA FC / FIFA exports
+#: use ``short_name`` / ``nationality_name`` / ``overall`` (older editions: ``nationality``);
+#: Football Manager exports are not standardized — common spellings are listed so a single
+#: reconciler covers both without per-source branching. See
+#: ``docs/.../2026-06-09-data-ingestion-requirements-spec.md`` ("Player attributes").
+_PLAYER_ATTR_CANDIDATES: dict[str, tuple[str, ...]] = {
+    "player": ("short_name", "long_name", "name", "Name", "player", "Player"),
+    "team": (
+        "nationality_name",
+        "nationality",
+        "nation",
+        "Nation",
+        "country",
+        "Country",
+        "team",
+    ),
+    "overall": ("overall", "Overall", "overall_rating", "CA", "ability"),
+}
+
+
+def _resolve_attr_column(field: str, override: str | None, columns: list[str]) -> str:
+    """Resolve the raw column for a logical field (``override`` wins, else candidates).
+
+    Raises ``ValueError`` (listing the available columns) when neither the override nor any
+    candidate from :data:`_PLAYER_ATTR_CANDIDATES` is present.
+    """
+
+    if override is not None:
+        return override
+    present = set(columns)
+    found = next((c for c in _PLAYER_ATTR_CANDIDATES[field] if c in present), None)
+    if found is None:
+        raise ValueError(
+            f"player attributes source missing a column for {field!r}; "
+            f"available columns: {sorted(columns)}"
+        )
+    return found
+
+
+def normalize_player_attributes(
+    raw: pl.DataFrame,
+    *,
+    player_col: str | None = None,
+    team_col: str | None = None,
+    overall_col: str | None = None,
+) -> pl.DataFrame:
+    """Reconcile an EA FC / FM player-attributes export to ``team, player, overall`` rows.
+
+    Pure column-reconciliation: EA FC and Football Manager exports name the same fields
+    differently (and FM names are not standardized), so the player / national-team / rating
+    columns are resolved from :data:`_PLAYER_ATTR_CANDIDATES` unless explicitly overridden.
+    ``team`` is the player's *national* team (canonicalized to a tournament squad later, at
+    ingest); ``overall`` is cast to ``Int64``. Rows missing a name or rating are dropped.
+    Team-name canonicalization is **not** done here (it happens in
+    :func:`~polymbappe.data.ingest.ingest_player_attributes`, mirroring the squad sources).
+
+    Raises ``ValueError`` if a required column can't be resolved.
+    """
+
+    columns = raw.columns
+    team = _resolve_attr_column("team", team_col, columns)
+    player = _resolve_attr_column("player", player_col, columns)
+    overall = _resolve_attr_column("overall", overall_col, columns)
+
+    return (
+        raw.select(
+            pl.col(team).cast(pl.Utf8).str.strip_chars().alias("team"),
+            pl.col(player).cast(pl.Utf8).str.strip_chars().alias("player"),
+            pl.col(overall).cast(pl.Int64, strict=False).alias("overall"),
+        )
+        .drop_nulls(subset=["player", "overall"])
+        .filter(pl.col("player") != "")
+    )

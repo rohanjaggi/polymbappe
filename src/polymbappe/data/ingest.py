@@ -19,7 +19,11 @@ import structlog
 from polymbappe.config import Settings
 from polymbappe.data import sources
 from polymbappe.data.aliases import normalize_team_expr
-from polymbappe.data.normalize import normalize_kaggle_results, normalize_odds_frame
+from polymbappe.data.normalize import (
+    normalize_kaggle_results,
+    normalize_odds_frame,
+    normalize_player_attributes,
+)
 from polymbappe.data.store import read_table, table_exists, write_table
 from polymbappe.data.tables import TABLE_COLUMNS, Table
 
@@ -454,6 +458,86 @@ def _aggregate_squad_valuations(
     return out
 
 
+def ingest_player_attributes(settings: Settings | None = None) -> int:
+    """Ingest EA FC / FM player attributes into the ``player_attributes`` table.
+
+    Prefers ``data/raw/player_attributes.csv`` (reproducible, offline) whose columns equal
+    ``TABLE_COLUMNS[Table.PLAYER_ATTRIBUTES]`` (``team, player, overall``); else fetches the
+    Kaggle dataset named in ``data/raw/player_attributes_kaggle.txt`` (first line: the Kaggle
+    slug, optional second line ``file=<name>.csv``) via
+    :func:`~polymbappe.data.sources.fetch_kaggle_player_attributes` and reconciles its columns
+    with :func:`~polymbappe.data.normalize.normalize_player_attributes`. ``team`` is the
+    player's national team, canonicalized via :func:`normalize_team_expr` so it joins the squad
+    tables; ``overall`` is cast to ``Int64``. Powers the agent's player-importance tiers
+    (:func:`~polymbappe.features.players.build_player_tiers`), not the prediction model
+    (unified spec, "Player attribute data strategy").
+
+    Skips (returns 0) when the local file is absent AND no Kaggle config / fetch yields rows.
+    """
+
+    settings = settings or Settings()
+    required = set(TABLE_COLUMNS[Table.PLAYER_ATTRIBUTES])
+    local = settings.raw_data_dir / "player_attributes.csv"
+    if local.exists():
+        raw = pl.read_csv(io.BytesIO(local.read_bytes()))
+        logger.info("ingest.player_attributes.local", path=str(local), rows=raw.height)
+    else:
+        fetched = _fetch_player_attributes(settings)
+        if fetched is None or fetched.height == 0:
+            logger.info(
+                "ingest.player_attributes.skip",
+                reason="no data/raw/player_attributes.csv and Kaggle fetch empty",
+            )
+            return 0
+        raw = fetched
+        logger.info("ingest.player_attributes.fetched", rows=raw.height)
+
+    missing = required - set(raw.columns)
+    if missing:
+        raise ValueError(f"player_attributes source missing columns: {sorted(missing)}")
+
+    normalized = raw.select(
+        normalize_team_expr("team").alias("team"),
+        pl.col("player").cast(pl.Utf8),
+        pl.col("overall").cast(pl.Int64),
+    ).select(TABLE_COLUMNS[Table.PLAYER_ATTRIBUTES])
+    write_table(Table.PLAYER_ATTRIBUTES, normalized, mode="overwrite", settings=settings)
+    logger.info("ingest.player_attributes.stored", rows=normalized.height)
+    return normalized.height
+
+
+def _fetch_player_attributes(settings: Settings) -> pl.DataFrame | None:
+    """Fetch + reconcile EA FC / FM attributes from the Kaggle dataset in the config file.
+
+    Reads optional ``data/raw/player_attributes_kaggle.txt`` (first non-comment line: the
+    Kaggle dataset slug; optional ``file=<name>.csv`` line selects the CSV inside it). Returns
+    ``None`` when the config is absent — so the local-CSV path stays the default and tests stay
+    offline — or when the fetch/reconcile yields nothing. The heavy, auth-bound ``kagglehub``
+    import lives in the source fetcher and is only triggered on this path.
+    """
+
+    config_path = settings.raw_data_dir / "player_attributes_kaggle.txt"
+    if not config_path.exists():
+        return None
+    dataset: str | None = None
+    file: str | None = None
+    for line in config_path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("file="):
+            file = line[len("file=") :].strip()
+        elif dataset is None:
+            dataset = line
+    if dataset is None:
+        return None
+
+    raw = sources.fetch_kaggle_player_attributes(dataset, file=file)
+    reconciled = normalize_player_attributes(raw)
+    logger.info("ingest.player_attributes.source", dataset=dataset, rows=reconciled.height)
+    return reconciled if reconciled.height > 0 else None
+
+
 def derive_manager_records(
     tenure_rows: list[dict[str, object]] | pl.DataFrame,
     matches: pl.DataFrame,
@@ -685,6 +769,7 @@ def ingest_all_sources(live: bool = False, settings: Settings | None = None) -> 
         ("team_xg", ingest_team_xg, False),
         ("squads", ingest_squads, False),
         ("squad_valuations", ingest_squad_valuations, False),
+        ("player_attributes", ingest_player_attributes, False),
         ("manager_records", ingest_manager_records, False),
     )
     for name, fn, takes_live in steps:
