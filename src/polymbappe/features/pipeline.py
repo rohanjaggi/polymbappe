@@ -87,6 +87,8 @@ class FeaturePipeline:
         as_of_date: date | None = None,
         team_xg: pl.DataFrame | None = None,
         market_odds: pl.DataFrame | None = None,
+        squad_valuations: pl.DataFrame | None = None,
+        tournaments: object | None = None,
     ) -> pl.DataFrame:
         """Build the core feature matrix with the H/D/A label.
 
@@ -95,6 +97,12 @@ class FeaturePipeline:
             as_of_date: Cap the history used to matches strictly before this date.
             team_xg: Optional FBref team-match xG table (enables real rolling xG).
             market_odds: Optional ``market_odds`` table; joined by ``match_id`` when given.
+            squad_valuations: Optional ``squad_valuations`` table; when given, the Tier-1
+                ``squad_value_ratio`` (``log(value_home / value_away)``) and the home/away
+                log squad values are attached per tournament snapshot.
+            tournaments: Tournament set locating each fixture's squad snapshot (defaults to
+                :data:`~polymbappe.eval.backtest.DEFAULT_TOURNAMENTS`); only used when
+                ``squad_valuations`` is given.
 
         Returns:
             One row per match: identity columns, ``home_*``/``away_*`` features, derived
@@ -121,6 +129,20 @@ class FeaturePipeline:
             matrix = _join_team_table(
                 matrix, build_xg_features(matches, team_xg, as_of_date)
             )
+
+        if squad_valuations is not None:
+            from polymbappe.eval.backtest import DEFAULT_TOURNAMENTS
+            from polymbappe.features.squad import build_squad_match_features
+
+            tours = tournaments if tournaments is not None else DEFAULT_TOURNAMENTS
+            squad = build_squad_match_features(matches, squad_valuations, tours)
+            if not squad.is_empty():
+                matrix = _join_team_table(matrix, squad)
+                matrix = matrix.with_columns(
+                    (
+                        pl.col("home_log_total_value") - pl.col("away_log_total_value")
+                    ).alias("squad_value_ratio")
+                )
 
         h2h = build_h2h_features(matches, as_of_date)
         structural = build_structural_features(matches, self.hosts)
@@ -215,8 +237,17 @@ def build_feature_matrix(as_of: date | None = None, contextual: bool = False) ->
             if table_exists(Table.MARKET_ODDS, settings)
             else None
         )
+        squad_valuations = (
+            read_table(Table.SQUAD_VALUATIONS, settings)
+            if table_exists(Table.SQUAD_VALUATIONS, settings)
+            else None
+        )
         matrix = FeaturePipeline().build_core_matrix(
-            matches, as_of_date=as_of, team_xg=team_xg, market_odds=market_odds
+            matches,
+            as_of_date=as_of,
+            team_xg=team_xg,
+            market_odds=market_odds,
+            squad_valuations=squad_valuations,
         )
         out_path = settings.processed_data_dir / "core_features.parquet"
 
