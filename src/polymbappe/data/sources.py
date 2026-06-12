@@ -193,6 +193,35 @@ def fetch_football_data_csv(url: str, timeout: float = 60.0) -> pl.DataFrame:
     return pl.read_csv(io.BytesIO(_get(url, timeout).content), ignore_errors=True)
 
 
+def fetch_kaggle_player_attributes(dataset: str, *, file: str | None = None) -> pl.DataFrame:
+    """Download an EA FC / FM player-attributes CSV from a Kaggle dataset into Polars.
+
+    Used for agent player-importance tiering only (not as model features) — see the
+    unified spec ("Player attribute data strategy"). ``dataset`` is a Kaggle slug such as
+    ``"stefanoleone992/ea-sports-fc-24-complete-player-dataset"``; ``file`` selects which
+    CSV inside it (e.g. ``"male_players.csv"``), defaulting to the first ``*.csv`` found.
+
+    Requires the optional ``kagglehub`` package and a Kaggle API token (``~/.kaggle/
+    kaggle.json``). ``kagglehub`` is imported lazily so the dependency is needed only when
+    this network path is actually taken; the local-CSV path in
+    :func:`~polymbappe.data.ingest.ingest_player_attributes` never imports it. The raw
+    columns are reconciled to the table schema by
+    :func:`~polymbappe.data.normalize.normalize_player_attributes`.
+    """
+
+    import kagglehub  # lazy: optional, network/auth-bound dependency
+
+    path = Path(kagglehub.dataset_download(dataset))
+    if file is not None:
+        csv_path = path / file
+    else:
+        csvs = sorted(path.glob("*.csv"))
+        if not csvs:
+            raise FileNotFoundError(f"no CSV found in Kaggle dataset {dataset!r} at {path}")
+        csv_path = csvs[0]
+    return pl.read_csv(csv_path, infer_schema_length=10_000, ignore_errors=True)
+
+
 #: Transfermarkt squad/kader page template. ``{slug}`` is the team's URL slug and
 #: ``{tm_id}`` its numeric club id; appended ``saison_id`` selects the season. Layout is
 #: anti-bot-sensitive, so fetches go through :func:`cached_get` (browser headers + cache).
