@@ -17,3 +17,5 @@ data/outputs/*
 
 # Autotuner-generated best config (search space is tracked)
 configs/best_config.yaml
+
+.env
