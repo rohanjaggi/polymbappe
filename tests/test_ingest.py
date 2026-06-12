@@ -9,6 +9,7 @@ from pathlib import Path
 import polars as pl
 
 from polymbappe.config import Settings
+from polymbappe.data import ingest as ingest_mod
 from polymbappe.data.ingest import (
     derive_manager_records,
     ingest_all_sources,
@@ -16,6 +17,7 @@ from polymbappe.data.ingest import (
     ingest_manager_records,
     ingest_market_odds,
     ingest_player_attributes,
+    ingest_ppda,
     ingest_squad_valuations,
     ingest_squads,
     ingest_team_xg,
@@ -207,6 +209,111 @@ def test_ingest_team_xg_from_local(tmp_path: Path) -> None:
     xg = read_table(Table.TEAM_XG, settings)
     assert set(xg.columns) == set(TABLE_COLUMNS[Table.TEAM_XG])
     assert xg.row(0, named=True)["xg"] == 2.7
+
+
+def test_ingest_team_xg_skips_when_absent(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    assert ingest_team_xg(settings) == 0
+    assert not table_exists(Table.TEAM_XG, settings)
+
+
+def test_ingest_ppda_from_local(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    (settings.raw_data_dir / "team_ppda.csv").write_text(
+        "team,date,ppda\nUSA,2018-06-14,8.5\n"  # "USA" -> canonicalized to "United States"
+    )
+    n = ingest_ppda(settings)
+    assert n == 1
+    ppda = read_table(Table.TEAM_PPDA, settings)
+    assert set(ppda.columns) == set(TABLE_COLUMNS[Table.TEAM_PPDA])
+    row = ppda.row(0, named=True)
+    assert row["team"] == "United States" and row["ppda"] == 8.5
+
+
+def test_ingest_ppda_skips_when_absent(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    assert ingest_ppda(settings) == 0
+    assert not table_exists(Table.TEAM_PPDA, settings)
+
+
+# -- StatsBomb open-data live path (synthetic events, no network) ---------------
+
+def _sb_event(type_name, team, *, x=None, xg=None, duel_type=None, period=1):
+    e = {"type": {"name": type_name}, "team": {"name": team}, "period": period}
+    if x is not None:
+        e["location"] = [x, 40.0]
+    if xg is not None:
+        e["shot"] = {"statsbomb_xg": xg}
+    if duel_type is not None:
+        e["duel"] = {"type": {"name": duel_type}}
+    return e
+
+
+# One synthetic match (zone_fraction=0.6 -> build-up x<=72, pressing x>=48):
+#   xG: Home 0.3+0.2=0.5 (shootout 0.8 in period 5 excluded), Away 0.1
+#   PPDA_home = Away build-up passes (6) / Home defensive actions (3) = 2.0
+#   PPDA_away = Home build-up passes (4) / Away defensive actions (2) = 2.0
+_SB_EVENTS = [
+    _sb_event("Shot", "Home", xg=0.3),
+    _sb_event("Shot", "Home", xg=0.2),
+    _sb_event("Shot", "Away", xg=0.1),
+    _sb_event("Shot", "Home", xg=0.8, period=5),  # shootout -> excluded
+    *[_sb_event("Pass", "Away", x=30.0) for _ in range(6)],
+    *[_sb_event("Interception", "Home", x=60.0) for _ in range(3)],
+    *[_sb_event("Pass", "Home", x=20.0) for _ in range(4)],
+    *[_sb_event("Duel", "Away", x=55.0, duel_type="Tackle") for _ in range(2)],
+    _sb_event("Pass", "Away", x=90.0),  # final-third pass -> not build-up
+    _sb_event("Duel", "Home", x=60.0, duel_type="Aerial Lost"),  # aerial -> not a tackle
+]
+_SB_MATCHES = [
+    {
+        "match_id": 999,
+        "match_date": "2022-12-01",
+        "home_team": {"home_team_name": "Home"},
+        "away_team": {"away_team_name": "Away"},
+    }
+]
+
+
+def _patch_statsbomb(monkeypatch) -> None:
+    monkeypatch.setattr(ingest_mod.sources, "STATSBOMB_COMPETITIONS", ((43, 3),))
+    monkeypatch.setattr(
+        ingest_mod.sources, "fetch_statsbomb_matches", lambda *a, **k: _SB_MATCHES
+    )
+    monkeypatch.setattr(
+        ingest_mod.sources, "fetch_statsbomb_events", lambda *a, **k: _SB_EVENTS
+    )
+
+
+def test_ingest_team_xg_live_statsbomb(tmp_path: Path, monkeypatch) -> None:
+    settings = _settings(tmp_path)
+    _patch_statsbomb(monkeypatch)
+    n = ingest_team_xg(settings, live=True)
+    assert n == 2  # one match -> two team rows
+    xg = read_table(Table.TEAM_XG, settings)
+    assert set(xg.columns) == set(TABLE_COLUMNS[Table.TEAM_XG])
+    home = xg.filter(pl.col("team") == "Home").row(0, named=True)
+    assert round(home["xg"], 4) == 0.5 and round(home["xga"], 4) == 0.1
+    away = xg.filter(pl.col("team") == "Away").row(0, named=True)
+    assert round(away["xg"], 4) == 0.1 and round(away["xga"], 4) == 0.5
+
+
+def test_ingest_ppda_live_statsbomb(tmp_path: Path, monkeypatch) -> None:
+    settings = _settings(tmp_path)
+    _patch_statsbomb(monkeypatch)
+    n = ingest_ppda(settings, live=True)
+    assert n == 2
+    ppda = read_table(Table.TEAM_PPDA, settings)
+    assert set(ppda.columns) == set(TABLE_COLUMNS[Table.TEAM_PPDA])
+    assert ppda.filter(pl.col("team") == "Home").row(0, named=True)["ppda"] == 2.0
+    assert ppda.filter(pl.col("team") == "Away").row(0, named=True)["ppda"] == 2.0
+
+
+def test_ingest_team_xg_skips_without_live(tmp_path: Path) -> None:
+    # No local CSV and live not requested -> clean skip, no StatsBomb pull, no table.
+    settings = _settings(tmp_path)
+    assert ingest_team_xg(settings, live=False) == 0
+    assert not table_exists(Table.TEAM_XG, settings)
 
 
 def test_ingest_squads_from_local(tmp_path: Path) -> None:
@@ -715,6 +822,7 @@ def test_ingest_all_sources_orchestration(tmp_path: Path) -> None:
     assert report["elo"] == 6
     assert report["market_odds"] == 1
     assert report["team_xg"] == 0  # optional, no file -> skipped cleanly
+    assert report["team_ppda"] == 0  # optional, no file -> skipped cleanly
     assert report["squads"] == 0  # optional, no file/scraper -> skipped cleanly
     assert report["manager_records"] == 0  # optional, no file/scraper -> skipped cleanly
     for table in (Table.MATCHES, Table.ELO_SNAPSHOTS, Table.MARKET_ODDS):

@@ -13,6 +13,7 @@ already-ingested ``matches`` table only when no published source is available.
 from __future__ import annotations
 
 import io
+from collections.abc import Callable
 from datetime import date
 
 import polars as pl
@@ -25,6 +26,8 @@ from polymbappe.data.normalize import (
     normalize_kaggle_results,
     normalize_odds_frame,
     normalize_player_attributes,
+    statsbomb_team_match_ppda,
+    statsbomb_team_match_xg,
 )
 from polymbappe.data.store import read_table, table_exists, write_table
 from polymbappe.data.tables import TABLE_COLUMNS, Table
@@ -330,36 +333,166 @@ def ingest_market_odds(settings: Settings | None = None, *, live: bool = False) 
     return combined.height
 
 
-def ingest_team_xg(settings: Settings | None = None) -> int:
-    """Ingest team-level xG into the ``team_xg`` table from ``data/raw/team_xg.csv``.
+def _statsbomb_team_match_rows(
+    settings: Settings,
+    row_builder: Callable[..., list[dict[str, object]]],
+    *,
+    competitions: tuple[tuple[int, int], ...] | None = None,
+) -> list[dict[str, object]]:
+    """Walk StatsBomb open data → per-team-match rows via ``row_builder``.
 
-    Expects columns ``team, date, xg, xga`` (FBref team-match xG, 2018+). Live FBref
-    scraping via :func:`~polymbappe.data.sources.get_fbref_matches` is available but heavy
-    and network-dependent, so the default path is the reproducible local file. Skips
-    (returns 0) when the file is absent.
+    For each configured ``(competition, season)`` fetches the match list, then each match's
+    event stream, and applies ``row_builder(events, home_team=, away_team=, match_date=)``.
+    Network/parse failures are isolated per competition and per match (logged, skipped). The
+    on-disk HTTP cache means a second pass (e.g. PPDA after xG) re-reads events from disk with
+    no network.
+    """
+
+    competitions = competitions or sources.STATSBOMB_COMPETITIONS
+    rows: list[dict[str, object]] = []
+    for competition_id, season_id in competitions:
+        try:
+            matches = sources.fetch_statsbomb_matches(
+                competition_id, season_id, settings=settings
+            )
+        except Exception as exc:  # noqa: BLE001 — isolate per-competition fetch failure
+            logger.warning(
+                "ingest.statsbomb.matches_failed",
+                competition=competition_id,
+                season=season_id,
+                error=str(exc),
+            )
+            continue
+        for match in matches:
+            match_id = match.get("match_id")
+            home = match.get("home_team", {}).get("home_team_name")
+            away = match.get("away_team", {}).get("away_team_name")
+            match_date = match.get("match_date")
+            if not (match_id and home and away and match_date):
+                continue
+            try:
+                events = sources.fetch_statsbomb_events(match_id, settings=settings)
+            except Exception as exc:  # noqa: BLE001 — isolate per-match fetch failure
+                logger.warning("ingest.statsbomb.events_failed", match_id=match_id, error=str(exc))
+                continue
+            rows.extend(
+                row_builder(events, home_team=home, away_team=away, match_date=match_date)
+            )
+    return rows
+
+
+def ingest_team_xg(settings: Settings | None = None, *, live: bool = False) -> int:
+    """Ingest team-level xG into the ``team_xg`` table (``[team, date, xg, xga]``).
+
+    Prefers a reproducible local ``data/raw/team_xg.csv`` (columns ``team, date, xg, xga``).
+    When that file is absent and ``live=True``, derives real xG from StatsBomb Open Data —
+    summing ``shot.statsbomb_xg`` per team across each covered international match (World Cup
+    2018/2022, Euro 2020/2024, Copa América 2024; the public xG that FBref re-publishes). The
+    fetch is pinned to a commit for reproducibility but heavy (~260 event files), so offline
+    runs (no ``live``) skip cleanly. Note: StatsBomb open data is released *after* tournaments,
+    so this is the historical/backtest source, not a live 2026 feed.
     """
 
     settings = settings or Settings()
     local = settings.raw_data_dir / "team_xg.csv"
-    if not local.exists():
-        logger.info("ingest.xg.skip", reason="no data/raw/team_xg.csv")
+    if local.exists():
+        raw = pl.read_csv(io.BytesIO(local.read_bytes()))
+        required = {"team", "date", "xg", "xga"}
+        missing = required - set(raw.columns)
+        if missing:
+            raise ValueError(f"team_xg.csv missing columns: {sorted(missing)}")
+        normalized = raw.select(
+            normalize_team_expr("team").alias("team"),
+            pl.col("date").cast(pl.Utf8).str.to_date(strict=False),
+            pl.col("xg").cast(pl.Float64),
+            pl.col("xga").cast(pl.Float64),
+        ).select(TABLE_COLUMNS[Table.TEAM_XG])
+        write_table(Table.TEAM_XG, normalized, mode="overwrite", settings=settings)
+        logger.info("ingest.xg.stored", rows=normalized.height, source="local")
+        return normalized.height
+
+    if not live:
+        logger.info(
+            "ingest.xg.skip",
+            reason="no data/raw/team_xg.csv (pass live=True to pull StatsBomb open data)",
+        )
         return 0
 
-    raw = pl.read_csv(io.BytesIO(local.read_bytes()))
-    required = {"team", "date", "xg", "xga"}
-    missing = required - set(raw.columns)
-    if missing:
-        raise ValueError(f"team_xg.csv missing columns: {sorted(missing)}")
+    rows = _statsbomb_team_match_rows(settings, statsbomb_team_match_xg)
+    if not rows:
+        logger.info("ingest.xg.skip", reason="StatsBomb open data produced no xG rows")
+        return 0
 
-    normalized = raw.select(
-        pl.col("team").cast(pl.Utf8),
-        pl.col("date").cast(pl.Utf8).str.to_date(strict=False),
-        pl.col("xg").cast(pl.Float64),
-        pl.col("xga").cast(pl.Float64),
-    ).select(TABLE_COLUMNS[Table.TEAM_XG])
-    write_table(Table.TEAM_XG, normalized, mode="overwrite", settings=settings)
-    logger.info("ingest.xg.stored", rows=normalized.height)
-    return normalized.height
+    frame = (
+        pl.DataFrame(
+            rows,
+            schema={"team": pl.Utf8, "date": pl.Utf8, "xg": pl.Float64, "xga": pl.Float64},
+        )
+        .with_columns(
+            normalize_team_expr("team").alias("team"),
+            pl.col("date").str.to_date(strict=False),
+        )
+        .unique(subset=["team", "date"], keep="first")
+        .select(TABLE_COLUMNS[Table.TEAM_XG])
+    )
+    write_table(Table.TEAM_XG, frame, mode="overwrite", settings=settings)
+    logger.info("ingest.xg.stored", rows=frame.height, source="statsbomb")
+    return frame.height
+
+
+def ingest_ppda(settings: Settings | None = None, *, live: bool = False) -> int:
+    """Ingest team-level PPDA into the ``team_ppda`` table (``[team, date, ppda]``).
+
+    PPDA — passes allowed per defensive action; lower = a more aggressive high press. Prefers
+    a reproducible local ``data/raw/team_ppda.csv`` (columns ``team, date, ppda``). When that
+    file is absent and ``live=True``, computes true zonal PPDA from StatsBomb Open Data event
+    streams (see :func:`~polymbappe.data.normalize.statsbomb_team_match_ppda`) over the same
+    covered tournaments as :func:`ingest_team_xg`. Team names are canonicalized so they join
+    the ``matches`` table; populating this table lights up the otherwise-null ``ppda_diff``
+    contextual feature. Offline runs (no ``live``) skip cleanly.
+    """
+
+    settings = settings or Settings()
+    local = settings.raw_data_dir / "team_ppda.csv"
+    if local.exists():
+        raw = pl.read_csv(io.BytesIO(local.read_bytes()))
+        required = {"team", "date", "ppda"}
+        missing = required - set(raw.columns)
+        if missing:
+            raise ValueError(f"team_ppda.csv missing columns: {sorted(missing)}")
+        normalized = raw.select(
+            normalize_team_expr("team").alias("team"),
+            pl.col("date").cast(pl.Utf8).str.to_date(strict=False),
+            pl.col("ppda").cast(pl.Float64),
+        ).select(TABLE_COLUMNS[Table.TEAM_PPDA])
+        write_table(Table.TEAM_PPDA, normalized, mode="overwrite", settings=settings)
+        logger.info("ingest.ppda.stored", rows=normalized.height, source="local")
+        return normalized.height
+
+    if not live:
+        logger.info(
+            "ingest.ppda.skip",
+            reason="no data/raw/team_ppda.csv (pass live=True to pull StatsBomb open data)",
+        )
+        return 0
+
+    rows = _statsbomb_team_match_rows(settings, statsbomb_team_match_ppda)
+    if not rows:
+        logger.info("ingest.ppda.skip", reason="StatsBomb open data produced no PPDA rows")
+        return 0
+
+    frame = (
+        pl.DataFrame(rows, schema={"team": pl.Utf8, "date": pl.Utf8, "ppda": pl.Float64})
+        .with_columns(
+            normalize_team_expr("team").alias("team"),
+            pl.col("date").str.to_date(strict=False),
+        )
+        .unique(subset=["team", "date"], keep="first")
+        .select(TABLE_COLUMNS[Table.TEAM_PPDA])
+    )
+    write_table(Table.TEAM_PPDA, frame, mode="overwrite", settings=settings)
+    logger.info("ingest.ppda.stored", rows=frame.height, source="statsbomb")
+    return frame.height
 
 
 def ingest_squads(settings: Settings | None = None) -> int:
@@ -858,10 +991,10 @@ def ingest_all_sources(live: bool = False, settings: Settings | None = None) -> 
     """Ingest all configured upstream datasets into normalized storage.
 
     Runs results first (the others depend on it or are optional overlays), then Elo
-    (self-computed from results), market odds, team xG, squads (Transfermarkt → cohesion
-    inputs), and manager records (Wikipedia tenure + match-join derivation → manager
-    pedigree). Each source is isolated: a failure or a skipped optional source is recorded
-    rather than aborting the run.
+    (self-computed from results), market odds, team xG and team PPDA (local CSV, or StatsBomb
+    Open Data when ``live``), squads (Transfermarkt → cohesion inputs), and manager records
+    (Wikipedia tenure + match-join derivation → manager pedigree). Each source is isolated: a
+    failure or a skipped optional source is recorded rather than aborting the run.
 
     Args:
         live: Incremental mode — append latest results/odds rather than overwrite.
@@ -881,7 +1014,8 @@ def ingest_all_sources(live: bool = False, settings: Settings | None = None) -> 
         ("results", ingest_results, True),
         ("elo", ingest_elo, False),
         ("market_odds", ingest_market_odds, True),
-        ("team_xg", ingest_team_xg, False),
+        ("team_xg", ingest_team_xg, True),
+        ("team_ppda", ingest_ppda, True),
         ("squads", ingest_squads, False),
         ("squad_valuations", ingest_squad_valuations, False),
         ("player_attributes", ingest_player_attributes, False),
@@ -894,12 +1028,12 @@ def ingest_all_sources(live: bool = False, settings: Settings | None = None) -> 
             logger.warning("ingest.source_failed", source=name, error=str(exc))
             report[name] = -1
 
-    # FBref *live* xG scraping remains manual/optional: its fetcher exists in `sources` but is
-    # heavy/network-dependent and off the minimum-viable-model critical path (the default
-    # team_xg path reads a local CSV). Every source above — results, odds, squads, squad
-    # valuations, manager records — prefers a local CSV and falls back to a cached/manifest
-    # scraper, so they are safe to run by default: an absent local file + empty scraper
-    # records `0` rather than failing.
+    # team_xg/team_ppda prefer a local CSV and, under `live`, derive real xG/PPDA from
+    # StatsBomb Open Data (event-level, the source FBref re-publishes; soccerdata exposes
+    # neither for the international comps). That pull is heavy (~260 event files) so it only
+    # runs in live mode; offline runs without a local CSV record `0`. StatsBomb open data is
+    # historical (released after a tournament) — the live 2026 feed is a separate TODO (see
+    # `sources.fetch_statsbomb_events` and the live-xg note beneath it).
 
     logger.info("ingest.done", report=report)
     return report

@@ -229,7 +229,14 @@ def build_feature_matrix(as_of: date | None = None, contextual: bool = False) ->
     )
 
     if contextual:
-        matrix = build_contextual_matrix(matches, as_of_date=as_of, team_xg=team_xg)
+        team_ppda = (
+            read_table(Table.TEAM_PPDA, settings)
+            if table_exists(Table.TEAM_PPDA, settings)
+            else None
+        )
+        matrix = build_contextual_matrix(
+            matches, as_of_date=as_of, team_xg=team_xg, team_ppda=team_ppda
+        )
         out_path = settings.processed_data_dir / "contextual_features.parquet"
     else:
         market_odds = (

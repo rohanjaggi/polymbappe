@@ -9,9 +9,11 @@ from __future__ import annotations
 
 import hashlib
 import io
+import json
 import time
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlsplit
 
 import polars as pl
@@ -793,3 +795,107 @@ def get_fbref_matches(
     else:
         pandas_df = fbref.read_team_match_stats(stat_type=stat_type)
     return pl.from_pandas(pandas_df.reset_index())
+
+
+# ---------------------------------------------------------------------------
+# StatsBomb Open Data (free event data → real xG and PPDA)
+# ---------------------------------------------------------------------------
+#
+# StatsBomb publishes free event-level JSON on GitHub. Unlike FBref it is not browser-gated
+# (plain raw.githubusercontent.com), exposes the shot model directly (``shot.statsbomb_xg``,
+# the figure FBref re-publishes), and carries event locations — so real team xG and true
+# zonal PPDA are both derivable. It is, however, RELEASED AFTER tournaments and only for a
+# curated set; it is the historical/backtest source (2018+ here), NOT a live 2026 feed. See
+# the live-xG scraper TODO below for the in-tournament gap.
+#
+# Coverage relevant to this model (competition_id, season_id):
+#   (43, 3)    FIFA World Cup 2018      (55, 43)   UEFA Euro 2020
+#   (43, 106)  FIFA World Cup 2022      (55, 282)  UEFA Euro 2024
+#   (223, 282) Copa América 2024
+
+#: Pinned commit of statsbomb/open-data, so ingested xG/PPDA are reproducible (the dataset's
+#: ``master`` branch advances as StatsBomb releases new competitions).
+STATSBOMB_OPEN_DATA_REF = "b0bc9f22dd77c206ddedc1d742893b3bbe64baec"
+
+#: Raw-file base; ``{ref}`` pins the commit, ``{path}`` is e.g. ``matches/43/106.json``.
+STATSBOMB_OPEN_DATA_URL = (
+    "https://raw.githubusercontent.com/statsbomb/open-data/{ref}/data/{path}"
+)
+
+#: Default (competition_id, season_id) pairs ingested — the international tournaments the
+#: model trains/backtests on that StatsBomb open data covers.
+STATSBOMB_COMPETITIONS: tuple[tuple[int, int], ...] = (
+    (43, 3),  # FIFA World Cup 2018
+    (43, 106),  # FIFA World Cup 2022
+    (55, 43),  # UEFA Euro 2020
+    (55, 282),  # UEFA Euro 2024
+    (223, 282),  # Copa América 2024
+)
+
+
+def _statsbomb_json(
+    path: str,
+    *,
+    settings: Settings | None = None,
+    ref: str = STATSBOMB_OPEN_DATA_REF,
+    timeout: float = 30.0,
+) -> Any:
+    """Fetch and parse one StatsBomb open-data JSON file (cached on disk).
+
+    Goes through :func:`cached_get` (so a pinned ``ref`` yields a stable cache and repeat
+    runs do no network). GitHub raw is not anti-bot, so the per-host throttle is disabled.
+    """
+
+    url = STATSBOMB_OPEN_DATA_URL.format(ref=ref, path=path)
+    body = cached_get(url, settings=settings, timeout=timeout, min_interval=0.0)
+    return json.loads(body.decode("utf-8"))
+
+
+def fetch_statsbomb_matches(
+    competition_id: int,
+    season_id: int,
+    *,
+    settings: Settings | None = None,
+    ref: str = STATSBOMB_OPEN_DATA_REF,
+    timeout: float = 30.0,
+) -> list[dict[str, Any]]:
+    """Fetch the match list for one StatsBomb (competition, season).
+
+    Each match dict carries ``match_id``, ``match_date`` (ISO ``YYYY-MM-DD``) and the
+    ``home_team``/``away_team`` objects whose ``*_team_name`` join the ``matches`` table.
+    """
+
+    data = _statsbomb_json(
+        f"matches/{competition_id}/{season_id}.json",
+        settings=settings,
+        ref=ref,
+        timeout=timeout,
+    )
+    return data if isinstance(data, list) else []
+
+
+def fetch_statsbomb_events(
+    match_id: int,
+    *,
+    settings: Settings | None = None,
+    ref: str = STATSBOMB_OPEN_DATA_REF,
+    timeout: float = 60.0,
+) -> list[dict[str, Any]]:
+    """Fetch the full event stream for one StatsBomb match (~3k events).
+
+    Shots carry ``shot.statsbomb_xg``; passes/interceptions/fouls/tackle-duels carry
+    ``location`` — the inputs :func:`~polymbappe.data.normalize.statsbomb_team_match_xg`
+    and :func:`~polymbappe.data.normalize.statsbomb_team_match_ppda` consume.
+    """
+
+    data = _statsbomb_json(
+        f"events/{match_id}.json", settings=settings, ref=ref, timeout=timeout
+    )
+    return data if isinstance(data, list) else []
+
+
+# TODO(live-xg): StatsBomb open data is published only AFTER a tournament, so it cannot feed
+# live 2026 xG/PPDA during the World Cup. A separate in-tournament scraper (e.g. Understat,
+# fotmob, or a paid feed) is needed for the live layer — kept in view, not yet built. It
+# would land here as a thin fetcher + a normalizer producing the same team_xg / team_ppda
+# rows, so the ingest wiring downstream stays unchanged.
