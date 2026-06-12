@@ -46,6 +46,47 @@ def test_simulation_runs_and_probabilities_normalize() -> None:
     assert all(chain[i] >= chain[i + 1] - 1e-9 for i in range(len(chain) - 1))
 
 
+def test_host_bonus_lifts_host_rate_at_neutral_venue() -> None:
+    # Two equal teams; only the host membership differs. The host should out-score.
+    model = StrengthModel(
+        attack={"USA": 0.0, "Brazil": 0.0},
+        defense={"USA": 0.0, "Brazil": 0.0},
+        home_advantage=0.25,
+        hosts=frozenset({"USA"}),
+        host_bonus=0.15,
+    )
+    # Host as the scheduled "away" team still gets the bonus (group order is arbitrary).
+    lam, mu = model.rates("Brazil", "USA", neutral=True)
+    assert mu > lam
+    assert abs(mu - np.exp(0.15)) < 1e-9  # away host carries exactly the bonus
+    assert abs(lam - 1.0) < 1e-9  # non-host baseline unchanged
+    # Disabling the bonus collapses the gap (proves it is the host_bonus doing the work).
+    flat = StrengthModel(
+        attack={"USA": 0.0, "Brazil": 0.0},
+        defense={"USA": 0.0, "Brazil": 0.0},
+        hosts=frozenset({"USA"}),
+        host_bonus=0.0,
+    )
+    assert flat.rates("Brazil", "USA", neutral=True) == (1.0, 1.0)
+
+
+def test_hosts_reach_knockout_more_with_bonus() -> None:
+    structure = placeholder_structure_2026()
+    teams = structure.teams
+    base = _model(teams)  # uniform-ish strengths, no hosts
+    # Promote a mid-pack team to host with a sizeable bonus.
+    host = teams[24]
+    hosted = StrengthModel(
+        attack=base.attack, defense=base.defense, home_advantage=0.0, rho=base.rho,
+        hosts=frozenset({host}), host_bonus=0.5,
+    )
+    r_base = simulate_tournament(structure, base, n_sims=600, rng=np.random.default_rng(7))
+    r_host = simulate_tournament(structure, hosted, n_sims=600, rng=np.random.default_rng(7))
+    p_base = {r["team"]: r["R16"] for r in r_base.stage_probabilities().iter_rows(named=True)}
+    p_host = {r["team"]: r["R16"] for r in r_host.stage_probabilities().iter_rows(named=True)}
+    assert p_host[host] > p_base[host]
+
+
 def test_group_finish_probabilities_sum_to_one() -> None:
     structure = placeholder_structure_2026()
     model = _model(structure.teams)
