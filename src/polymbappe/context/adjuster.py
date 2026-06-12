@@ -25,6 +25,8 @@ from dataclasses import dataclass
 import numpy as np
 import polars as pl
 
+from polymbappe.models._lgbm import silence_feature_name_warning
+
 OUTCOMES: tuple[str, str, str] = ("H", "D", "A")
 _LABEL_TO_IDX = {label: idx for idx, label in enumerate(OUTCOMES)}
 
@@ -162,7 +164,8 @@ class ContextualAdjuster:
         if not self._models:
             return np.zeros((df.height, len(OUTCOMES)))
         x = self._matrix(df)
-        cols = [np.asarray(m.predict(x), dtype=float) for m in self._models]  # type: ignore[attr-defined]
+        with silence_feature_name_warning():
+            cols = [np.asarray(m.predict(x), dtype=float) for m in self._models]  # type: ignore[attr-defined]
         return np.stack(cols, axis=1)
 
     def adjust(self, df: pl.DataFrame, base_probs: np.ndarray) -> np.ndarray:

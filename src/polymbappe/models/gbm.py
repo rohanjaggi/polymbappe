@@ -21,6 +21,8 @@ from dataclasses import dataclass
 import numpy as np
 import polars as pl
 
+from polymbappe.models._lgbm import silence_feature_name_warning
+
 OUTCOMES: tuple[str, str, str] = ("H", "D", "A")
 _LABEL_TO_IDX = {label: idx for idx, label in enumerate(OUTCOMES)}
 
@@ -95,7 +97,8 @@ class GBMStackedModel:
 
         if self._model is None:
             raise RuntimeError("GBMStackedModel must be fit before predicting.")
-        raw = self._model.predict_proba(self._matrix(df))  # type: ignore[attr-defined]
+        with silence_feature_name_warning():
+            raw = self._model.predict_proba(self._matrix(df))  # type: ignore[attr-defined]
         return self._reindex(raw, self._model.classes_)  # type: ignore[attr-defined]
 
     def oof_predict(
@@ -119,6 +122,7 @@ class GBMStackedModel:
         for train_idx, test_idx in skf.split(x, y):
             model = self._new_estimator()
             model.fit(x[train_idx], y[train_idx])  # type: ignore[attr-defined]
-            raw = model.predict_proba(x[test_idx])  # type: ignore[attr-defined]
+            with silence_feature_name_warning():
+                raw = model.predict_proba(x[test_idx])  # type: ignore[attr-defined]
             out[test_idx] = self._reindex(raw, model.classes_)  # type: ignore[attr-defined]
         return out

@@ -31,16 +31,45 @@ def parse_interval(interval: str) -> int:
     return value * 3600 if unit == "h" else value * 60
 
 
+def load_agent_config(settings: Any = None) -> AgentConfig:
+    """Build an :class:`AgentConfig` with player-importance tiers from ingested attributes.
+
+    Reads the ``player_attributes`` table (EA FC / FM ratings) and derives the flat
+    ``{player: tier}`` map the Assess node filters on
+    (:func:`~polymbappe.features.players.player_tier_map`). When the table is absent or
+    unreadable — attributes not ingested yet — it degrades to an empty-tier config (every
+    player treated as tier 3, i.e. below ``min_tier``), so the agent still runs. Imports of
+    the data/feature layers are lazy to keep the agent importable without them.
+    """
+
+    try:
+        from polymbappe.data.store import read_table, table_exists
+        from polymbappe.data.tables import Table
+        from polymbappe.features.players import player_tier_map
+
+        if not table_exists(Table.PLAYER_ATTRIBUTES, settings):
+            return AgentConfig()
+        attributes = read_table(Table.PLAYER_ATTRIBUTES, settings)
+        return AgentConfig(player_tiers=player_tier_map(attributes))
+    except Exception:  # noqa: BLE001 - missing/unreadable attributes degrade to empty tiers
+        return AgentConfig()
+
+
 def run_now(
     teams: list[str],
     config: AgentConfig | None = None,
     settings: Any = None,
     **kwargs: Any,
 ) -> dict[str, object]:
-    """Run a single agent cycle immediately (``polymbappe agent --run-now``)."""
+    """Run a single agent cycle immediately (``polymbappe agent --run-now``).
+
+    When no ``config`` is supplied, player-importance tiers are loaded from the ingested
+    ``player_attributes`` table via :func:`load_agent_config`.
+    """
 
     state = AgentState(settings)
     try:
+        config = config if config is not None else load_agent_config(settings)
         summary = run_agent_cycle(state, teams, config, now=datetime.now(), **kwargs)
         state.export_changelog_parquet()
         return summary

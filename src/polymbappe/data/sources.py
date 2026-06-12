@@ -139,10 +139,42 @@ def cached_get(
     return content
 
 
+#: EloRatings.net world ranking page — default source for published international Elo.
+#: The ranking table is often JS-populated, so a plain fetch can return an empty table;
+#: ingestion treats an empty parse as "no published data" and self-computes instead.
+ELORATINGS_WORLD_URL = "https://www.eloratings.net/"
+
+#: EloRatings.net backend data files. The world ranking page is a client-side SlickGrid app
+#: that loads its ratings from these TSVs rather than rendering an HTML table, so scraping
+#: the page (:func:`fetch_eloratings_html`) only ever sees an empty shell. ``World.tsv`` has
+#: one row per team keyed by a 2-letter team **code** (column 3) with the current Elo rating
+#: (column 4); ``en.teams.tsv`` maps each code to its English name(s). Fetching both and
+#: joining on the code yields the live published Elo — see
+#: :func:`~polymbappe.data.normalize.parse_eloratings_tsv`.
+ELORATINGS_WORLD_TSV_URL = "https://www.eloratings.net/World.tsv"
+ELORATINGS_TEAMS_TSV_URL = "https://www.eloratings.net/en.teams.tsv"
+
+
 def fetch_eloratings_html(url: str, timeout: float = 20.0) -> BeautifulSoup:
     """Fetch and parse an Elo ratings page."""
 
     return BeautifulSoup(_get(url, timeout).text, "html.parser")
+
+
+def fetch_eloratings_tsv(
+    world_url: str = ELORATINGS_WORLD_TSV_URL,
+    teams_url: str = ELORATINGS_TEAMS_TSV_URL,
+    timeout: float = 20.0,
+) -> tuple[str, str]:
+    """Fetch the EloRatings.net ``World.tsv`` ranking + ``en.teams.tsv`` code dictionary.
+
+    Returns ``(world_tsv, teams_tsv)`` as raw decoded text. This is the live published-Elo
+    source (the HTML page is a JS shell with no table). Parsing/joining the two TSVs into
+    ``(team, date, rating)`` rows lives in
+    :func:`~polymbappe.data.normalize.parse_eloratings_tsv` (pure, unit-tested).
+    """
+
+    return _get(world_url, timeout).text, _get(teams_url, timeout).text
 
 
 def load_kaggle_results_csv(csv_bytes: bytes) -> pl.DataFrame:
@@ -161,6 +193,35 @@ def fetch_football_data_csv(url: str, timeout: float = 60.0) -> pl.DataFrame:
     """Download a Football-Data.co.uk CSV of bookmaker odds into Polars."""
 
     return pl.read_csv(io.BytesIO(_get(url, timeout).content), ignore_errors=True)
+
+
+def fetch_kaggle_player_attributes(dataset: str, *, file: str | None = None) -> pl.DataFrame:
+    """Download an EA FC / FM player-attributes CSV from a Kaggle dataset into Polars.
+
+    Used for agent player-importance tiering only (not as model features) — see the
+    unified spec ("Player attribute data strategy"). ``dataset`` is a Kaggle slug such as
+    ``"stefanoleone992/ea-sports-fc-24-complete-player-dataset"``; ``file`` selects which
+    CSV inside it (e.g. ``"male_players.csv"``), defaulting to the first ``*.csv`` found.
+
+    Requires the optional ``kagglehub`` package and a Kaggle API token (``~/.kaggle/
+    kaggle.json``). ``kagglehub`` is imported lazily so the dependency is needed only when
+    this network path is actually taken; the local-CSV path in
+    :func:`~polymbappe.data.ingest.ingest_player_attributes` never imports it. The raw
+    columns are reconciled to the table schema by
+    :func:`~polymbappe.data.normalize.normalize_player_attributes`.
+    """
+
+    import kagglehub  # lazy: optional, network/auth-bound dependency
+
+    path = Path(kagglehub.dataset_download(dataset))
+    if file is not None:
+        csv_path = path / file
+    else:
+        csvs = sorted(path.glob("*.csv"))
+        if not csvs:
+            raise FileNotFoundError(f"no CSV found in Kaggle dataset {dataset!r} at {path}")
+        csv_path = csvs[0]
+    return pl.read_csv(csv_path, infer_schema_length=10_000, ignore_errors=True)
 
 
 #: Transfermarkt squad/kader page template. ``{slug}`` is the team's URL slug and

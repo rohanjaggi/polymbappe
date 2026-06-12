@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+from datetime import date
 from pathlib import Path
 
 import polars as pl
@@ -14,13 +16,15 @@ from polymbappe.data.ingest import (
     ingest_elo,
     ingest_manager_records,
     ingest_market_odds,
+    ingest_player_attributes,
     ingest_ppda,
     ingest_squad_valuations,
     ingest_squads,
     ingest_team_xg,
 )
-from polymbappe.data.store import read_table, table_exists
+from polymbappe.data.store import read_parquet, read_table, table_exists, write_table
 from polymbappe.data.tables import TABLE_COLUMNS, Table
+from polymbappe.features.pipeline import build_feature_matrix
 
 _RESULTS_CSV = (
     "date,home_team,away_team,home_score,away_score,tournament,city,country,neutral\n"
@@ -63,6 +67,108 @@ def test_ingest_elo_requires_matches(tmp_path: Path) -> None:
         pass
     else:  # pragma: no cover
         raise AssertionError("expected FileNotFoundError without a matches table")
+
+
+# A trimmed EloRatings.net ranking table: each row's first anchor is the team and the
+# first standalone integer cell its rating (see normalize.parse_eloratings).
+_ELO_HTML = """
+<table>
+  <tr><th>Rank</th><th>Team</th><th>Rating</th></tr>
+  <tr><td>1</td><td><a href="/Brazil">Brazil</a></td><td>2169</td></tr>
+  <tr><td>2</td><td><a href="/USA">USA</a></td><td>1821</td></tr>
+</table>
+"""
+
+# Trimmed EloRatings.net backend feeds: World.tsv has the 2-letter team code in column 3
+# and the rating in column 4; en.teams.tsv maps each code to its English name (the first
+# name column). "US" -> "USA" exercises the USA -> United States alias downstream, and the
+# unused "XX" code confirms a code with no World.tsv row is harmless.
+_ELO_WORLD_TSV = "1\t1\tBR\t2169\t1\t2200\n2\t2\tUS\t1821\t1\t1850\n"
+_ELO_TEAMS_TSV = "BR\tBrazil\nUS\tUSA\nXX\tNowhere\n"
+
+
+def test_ingest_elo_prefers_local_tsv(tmp_path: Path) -> None:
+    from datetime import date
+
+    settings = _settings(tmp_path)
+    _write_results(settings)
+    from polymbappe.data.ingest import ingest_results
+
+    ingest_results(settings)
+    (settings.raw_data_dir / "elo_world.tsv").write_text(_ELO_WORLD_TSV)
+    (settings.raw_data_dir / "elo_teams.tsv").write_text(_ELO_TEAMS_TSV)
+
+    n = ingest_elo(settings, as_of=date(2026, 6, 1))
+    assert n == 2  # published TSV snapshot, not the 6-row self-computed series
+    snaps = read_table(Table.ELO_SNAPSHOTS, settings)
+    assert set(snaps.columns) == set(TABLE_COLUMNS[Table.ELO_SNAPSHOTS])
+    assert set(snaps["date"].to_list()) == {date(2026, 6, 1)}
+    # Code resolved (US -> "USA") and alias canonicalized (USA -> United States).
+    usa = snaps.filter(pl.col("team") == "United States").row(0, named=True)
+    assert usa["rating"] == 1821.0
+    assert "USA" not in set(snaps["team"].to_list())
+    assert snaps.filter(pl.col("team") == "Brazil").row(0, named=True)["rating"] == 2169.0
+
+
+def test_ingest_elo_prefers_published_local(tmp_path: Path) -> None:
+    from datetime import date
+
+    settings = _settings(tmp_path)
+    _write_results(settings)
+    from polymbappe.data.ingest import ingest_results
+
+    ingest_results(settings)
+    (settings.raw_data_dir / "elo.html").write_text(_ELO_HTML)
+
+    n = ingest_elo(settings, as_of=date(2026, 6, 1))
+    assert n == 2  # published snapshot, not the 6-row self-computed series
+    snaps = read_table(Table.ELO_SNAPSHOTS, settings)
+    assert set(snaps.columns) == set(TABLE_COLUMNS[Table.ELO_SNAPSHOTS])
+    # All rows stamped with the as_of date; team alias canonicalized (USA -> United States).
+    assert set(snaps["date"].to_list()) == {date(2026, 6, 1)}
+    usa = snaps.filter(pl.col("team") == "United States").row(0, named=True)
+    assert usa["rating"] == 1821.0  # published value, not self-computed
+    assert "USA" not in set(snaps["team"].to_list())
+
+
+def test_ingest_elo_published_empty_falls_back(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    _write_results(settings)
+    from polymbappe.data.ingest import ingest_results
+
+    ingest_results(settings)
+    # A page with no parseable rating rows (JS-populated table) -> self-compute fallback.
+    (settings.raw_data_dir / "elo.html").write_text("<html><body>loading...</body></html>")
+
+    n = ingest_elo(settings)
+    assert n == 6  # fell back to the self-computed 3-matches x 2-teams series
+
+
+def test_ingest_elo_fetches_when_url_configured(tmp_path: Path, monkeypatch) -> None:
+    from datetime import date
+
+    from polymbappe.data import ingest as ingest_mod
+
+    settings = _settings(tmp_path)
+    # No local matches and no local elo files: the only source is the opt-in TSV fetch.
+    (settings.raw_data_dir / "elo_url.txt").write_text("https://www.eloratings.net/World.tsv\n")
+
+    calls: list[str] = []
+
+    def _fake_fetch(
+        world_url: str = "", teams_url: str = "", timeout: float = 20.0
+    ) -> tuple[str, str]:
+        calls.append(world_url)
+        return _ELO_WORLD_TSV, _ELO_TEAMS_TSV
+
+    monkeypatch.setattr(ingest_mod.sources, "fetch_eloratings_tsv", _fake_fetch)
+
+    n = ingest_elo(settings, as_of=date(2026, 6, 1))
+    assert n == 2
+    assert calls == ["https://www.eloratings.net/World.tsv"]  # used the configured World.tsv URL
+    snaps = read_table(Table.ELO_SNAPSHOTS, settings)
+    assert snaps.filter(pl.col("team") == "Brazil").row(0, named=True)["rating"] == 2169.0
+    assert snaps.filter(pl.col("team") == "United States").row(0, named=True)["rating"] == 1821.0
 
 
 def test_ingest_market_odds_aligns_match_ids(tmp_path: Path) -> None:
@@ -370,6 +476,66 @@ def test_ingest_squad_valuations_skips_when_absent(tmp_path: Path) -> None:
     assert not table_exists(Table.SQUAD_VALUATIONS, settings)
 
 
+_MATCHES_SCHEMA = {
+    "match_id": pl.Utf8,
+    "date": pl.Date,
+    "home_team": pl.Utf8,
+    "away_team": pl.Utf8,
+    "home_goals": pl.Int64,
+    "away_goals": pl.Int64,
+    "competition": pl.Utf8,
+    "is_knockout": pl.Boolean,
+    "neutral_site": pl.Boolean,
+    "group": pl.Utf8,
+}
+
+
+def test_ingest_squad_valuations_then_build_features_end_to_end(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Ingest squad valuations from raw, then build the core matrix: the Tier-1 squad
+    value ratio must reach the written feature table, end to end."""
+
+    settings = _settings(tmp_path)
+    # A WC2018 fixture (window 2018-06-14..07-15). Team names are already canonical so they
+    # line up with the valuation table after normalization (USA -> United States).
+    matches = pl.DataFrame(
+        {
+            "match_id": ["wc18_1"],
+            "date": [date(2018, 6, 17)],
+            "home_team": ["Brazil"],
+            "away_team": ["United States"],
+            "home_goals": [2],
+            "away_goals": [0],
+            "competition": ["FIFA World Cup"],
+            "is_knockout": [False],
+            "neutral_site": [True],
+            "group": ["E"],
+        },
+        schema=_MATCHES_SCHEMA,
+    )
+    write_table(Table.MATCHES, matches, settings=settings)
+    (settings.raw_data_dir / "squad_valuations.csv").write_text(
+        "team,tournament,total_value,median_value,player_count\n"
+        "Brazil,WC2018,900000000,40000000,23\n"
+        "USA,WC2018,150000000,5000000,23\n"
+    )
+    assert ingest_squad_valuations(settings) == 2
+
+    # build_feature_matrix resolves its own Settings(); point it at tmp_path via the env.
+    monkeypatch.setenv("POLYMBAPPE_DATA_DIR", str(tmp_path))
+    build_feature_matrix()
+
+    matrix = read_parquet(settings.processed_data_dir / "core_features.parquet")
+    assert "squad_value_ratio" in matrix.columns
+    row = matrix.row(0, named=True)
+    assert row["home_log_total_value"] == math.log1p(900000000.0)
+    assert row["away_log_total_value"] == math.log1p(150000000.0)
+    # log(value_home / value_away) > 0: Brazil (home) is more valuable than the USA (away).
+    assert row["squad_value_ratio"] == math.log1p(900000000.0) - math.log1p(150000000.0)
+    assert row["squad_value_ratio"] > 0
+
+
 def test_scrape_squad_valuations_aggregates_transfermarkt(tmp_path: Path, monkeypatch) -> None:
     """Manifest teams are scraped from Transfermarkt and aggregated per (team, tournament)."""
 
@@ -403,6 +569,63 @@ def test_scrape_squad_valuations_aggregates_transfermarkt(tmp_path: Path, monkey
     assert row["total_value"] == 120_000_000.0
     assert row["median_value"] == 60_000_000.0  # median of the two valued players
     assert row["player_count"] == 3
+
+
+def test_ingest_player_attributes_from_local(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    (settings.raw_data_dir / "player_attributes.csv").write_text(
+        "team,player,overall\nUSA,Christian Pulisic,82\nBrazil,Vinicius Junior,89\n"
+    )
+    n = ingest_player_attributes(settings)
+    assert n == 2
+    attrs = read_table(Table.PLAYER_ATTRIBUTES, settings)
+    assert tuple(attrs.columns) == TABLE_COLUMNS[Table.PLAYER_ATTRIBUTES]
+    assert attrs.schema["overall"] == pl.Int64
+    # team normalized via alias (USA -> United States).
+    pulisic = attrs.filter(pl.col("player") == "Christian Pulisic").row(0, named=True)
+    assert pulisic["team"] == "United States"
+    assert "USA" not in set(attrs["team"].to_list())
+
+
+def test_ingest_player_attributes_skips_when_absent(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    assert ingest_player_attributes(settings) == 0
+    assert not table_exists(Table.PLAYER_ATTRIBUTES, settings)
+
+
+def test_ingest_player_attributes_from_kaggle(tmp_path: Path, monkeypatch) -> None:
+    """The Kaggle config file triggers a fetch whose EA-FC columns are reconciled."""
+
+    from polymbappe.data import ingest as ingest_mod
+
+    settings = _settings(tmp_path)
+    (settings.raw_data_dir / "player_attributes_kaggle.txt").write_text(
+        "stefanoleone992/fc-24\nfile=male_players.csv\n"
+    )
+
+    def _fake_kaggle(dataset, *, file=None):
+        assert dataset == "stefanoleone992/fc-24"
+        assert file == "male_players.csv"
+        # Raw EA FC schema: short_name / nationality_name / overall (+ noise columns).
+        return pl.DataFrame(
+            {
+                "short_name": ["L. Messi", "K. Mbappé"],
+                "nationality_name": ["Argentina", "France"],
+                "overall": [90, 91],
+                "club_name": ["Inter Miami", "Real Madrid"],
+            }
+        )
+
+    monkeypatch.setattr(ingest_mod.sources, "fetch_kaggle_player_attributes", _fake_kaggle)
+
+    n = ingest_player_attributes(settings)
+    assert n == 2
+    attrs = read_table(Table.PLAYER_ATTRIBUTES, settings)
+    assert tuple(attrs.columns) == TABLE_COLUMNS[Table.PLAYER_ATTRIBUTES]
+    assert set(attrs["player"].to_list()) == {"L. Messi", "K. Mbappé"}
+    mbappe = attrs.filter(pl.col("player") == "K. Mbappé").row(0, named=True)
+    assert mbappe["team"] == "France"
+    assert mbappe["overall"] == 91
 
 
 def test_parse_transfermarkt_valuations_extracts_market_value() -> None:

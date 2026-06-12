@@ -34,6 +34,7 @@ def _item(title: str, team: str | None = "France") -> NewsItem:
 
 # -- state ---------------------------------------------------------------------
 
+
 def test_state_upsert_and_cooling(tmp_path) -> None:
     with _state(tmp_path) as state:
         assert state.get_player_status("Mbappe") is None
@@ -52,7 +53,39 @@ def test_state_changelog_export(tmp_path) -> None:
     assert out.exists()
 
 
+# -- config / player tiers -----------------------------------------------------
+
+
+def test_load_agent_config_empty_without_attributes(tmp_path) -> None:
+    from polymbappe.agent.scheduler import load_agent_config
+
+    config = load_agent_config(Settings(data_dir=tmp_path))
+    assert config.player_tiers == {}
+
+
+def test_load_agent_config_loads_tiers_from_table(tmp_path) -> None:
+    import polars as pl
+
+    from polymbappe.agent.scheduler import load_agent_config
+    from polymbappe.data.store import write_table
+    from polymbappe.data.tables import Table
+
+    settings = Settings(data_dir=tmp_path)
+    write_table(
+        Table.PLAYER_ATTRIBUTES,
+        pl.DataFrame(
+            {"team": ["France", "France"], "player": ["Mbappe", "Sub"], "overall": [91, 65]}
+        ),
+        settings=settings,
+    )
+    config = load_agent_config(settings)
+    # Default tier sizes (top 3 = tier 1); both of two players fall in tier 1.
+    assert config.player_tiers["Mbappe"] == 1
+    assert config.player_tiers["Sub"] == 1
+
+
 # -- sources -------------------------------------------------------------------
+
 
 def test_scan_tags_team() -> None:
     items = scan_sources(
@@ -63,6 +96,7 @@ def test_scan_tags_team() -> None:
 
 
 # -- assess --------------------------------------------------------------------
+
 
 def test_severity_ordering() -> None:
     assert severity_at_least("out", "doubt")
@@ -87,6 +121,7 @@ def test_heuristic_classifier_and_assess_filter() -> None:
 
 # -- cross-reference -----------------------------------------------------------
 
+
 def test_cross_reference_dedup_and_cooling(tmp_path) -> None:
     config = _config()
     with _state(tmp_path) as state:
@@ -101,6 +136,7 @@ def test_cross_reference_dedup_and_cooling(tmp_path) -> None:
 
 # -- reflect -------------------------------------------------------------------
 
+
 def test_reflect_flags_significant_shift() -> None:
     config = _config()
     sig = reflect_node({"France": 0.12}, {"France": 0.13, "Brazil": 0.10}, config)
@@ -110,6 +146,7 @@ def test_reflect_flags_significant_shift() -> None:
 
 
 # -- full cycle ----------------------------------------------------------------
+
 
 def test_run_cycle_end_to_end(tmp_path) -> None:
     config = _config()
