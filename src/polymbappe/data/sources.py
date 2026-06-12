@@ -137,10 +137,42 @@ def cached_get(
     return content
 
 
+#: EloRatings.net world ranking page — default source for published international Elo.
+#: The ranking table is often JS-populated, so a plain fetch can return an empty table;
+#: ingestion treats an empty parse as "no published data" and self-computes instead.
+ELORATINGS_WORLD_URL = "https://www.eloratings.net/"
+
+#: EloRatings.net backend data files. The world ranking page is a client-side SlickGrid app
+#: that loads its ratings from these TSVs rather than rendering an HTML table, so scraping
+#: the page (:func:`fetch_eloratings_html`) only ever sees an empty shell. ``World.tsv`` has
+#: one row per team keyed by a 2-letter team **code** (column 3) with the current Elo rating
+#: (column 4); ``en.teams.tsv`` maps each code to its English name(s). Fetching both and
+#: joining on the code yields the live published Elo — see
+#: :func:`~polymbappe.data.normalize.parse_eloratings_tsv`.
+ELORATINGS_WORLD_TSV_URL = "https://www.eloratings.net/World.tsv"
+ELORATINGS_TEAMS_TSV_URL = "https://www.eloratings.net/en.teams.tsv"
+
+
 def fetch_eloratings_html(url: str, timeout: float = 20.0) -> BeautifulSoup:
     """Fetch and parse an Elo ratings page."""
 
     return BeautifulSoup(_get(url, timeout).text, "html.parser")
+
+
+def fetch_eloratings_tsv(
+    world_url: str = ELORATINGS_WORLD_TSV_URL,
+    teams_url: str = ELORATINGS_TEAMS_TSV_URL,
+    timeout: float = 20.0,
+) -> tuple[str, str]:
+    """Fetch the EloRatings.net ``World.tsv`` ranking + ``en.teams.tsv`` code dictionary.
+
+    Returns ``(world_tsv, teams_tsv)`` as raw decoded text. This is the live published-Elo
+    source (the HTML page is a JS shell with no table). Parsing/joining the two TSVs into
+    ``(team, date, rating)`` rows lives in
+    :func:`~polymbappe.data.normalize.parse_eloratings_tsv` (pure, unit-tested).
+    """
+
+    return _get(world_url, timeout).text, _get(teams_url, timeout).text
 
 
 def load_kaggle_results_csv(csv_bytes: bytes) -> pl.DataFrame:
