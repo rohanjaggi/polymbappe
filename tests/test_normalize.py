@@ -199,6 +199,49 @@ def test_parse_eloratings_extracts_team_and_rating() -> None:
     assert out["date"].to_list() == [date(2026, 6, 1), date(2026, 6, 1)]
 
 
+def test_parse_eloratings_team_codes_maps_code_to_first_name() -> None:
+    from polymbappe.data.normalize import parse_eloratings_team_codes
+
+    teams_tsv = (
+        "AR\tArgentina\n"
+        "AG\tAntigua and Barbuda\tAntigua & Barbuda\tAntigua/Barb\n"  # alt names ignored
+        "US\tUSA\n"
+        "\n"  # blank line skipped
+        "BADLINE_NO_TAB\n"  # no name column -> skipped
+    )
+    codes = parse_eloratings_team_codes(teams_tsv)
+    assert codes == {"AR": "Argentina", "AG": "Antigua and Barbuda", "US": "USA"}
+
+
+def test_parse_eloratings_tsv_joins_codes_and_ratings() -> None:
+    from polymbappe.data.normalize import parse_eloratings_tsv
+
+    # World.tsv: code in column 3 (index 2), rating in column 4 (index 3).
+    world_tsv = (
+        "1\t1\tBR\t2169\t1\t2200\n"
+        "2\t2\tAR\t2145\t1\t2180\n"
+        "3\t3\tZZ\t1500\t1\t1500\n"  # unknown code -> dropped
+        "4\t4\tNR\tnope\t1\t1\n"  # unparseable rating -> dropped
+        "short\tline\n"  # too few columns -> dropped
+    )
+    teams_tsv = "BR\tBrazil\nAR\tArgentina\nNR\tNoRating\n"
+    out = parse_eloratings_tsv(world_tsv, teams_tsv, as_of=date(2026, 6, 1))
+    assert out.height == 2
+    assert out["team"].to_list() == ["Brazil", "Argentina"]
+    assert out["rating"].to_list() == [2169.0, 2145.0]
+    assert out["date"].to_list() == [date(2026, 6, 1), date(2026, 6, 1)]
+
+
+def test_parse_eloratings_tsv_empty_when_no_codes_match() -> None:
+    from polymbappe.data.normalize import parse_eloratings_tsv
+
+    # A code dictionary that matches nothing in World.tsv -> empty frame (ingest then
+    # self-computes), with the correct schema preserved.
+    out = parse_eloratings_tsv("1\t1\tBR\t2169\n", "US\tUSA\n", as_of=date(2026, 6, 1))
+    assert out.is_empty()
+    assert out.schema == {"team": pl.Utf8, "date": pl.Date, "rating": pl.Float64}
+
+
 def test_parse_market_outcomes_handles_json_arrays() -> None:
     raw = {
         "id": "0xabc",

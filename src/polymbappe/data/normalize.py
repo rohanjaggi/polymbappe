@@ -220,6 +220,68 @@ def parse_eloratings(soup: BeautifulSoup, as_of: date) -> pl.DataFrame:
     )
 
 
+def parse_eloratings_team_codes(teams_tsv: str) -> dict[str, str]:
+    """Build a ``team-code -> English name`` map from EloRatings.net ``en.teams.tsv``.
+
+    Each line is tab-separated ``CODE\\tName[\\tAlternateName...]``; the first name column is
+    the canonical English spelling (alternate columns are short/casual variants and are
+    ignored — alias normalization happens downstream at ingest). Blank or malformed lines
+    (no code or no name) are skipped. Codes are taken verbatim, including the rare
+    non-2-letter ones (e.g. ``US_loc``), which simply never match a ``World.tsv`` row.
+    """
+
+    mapping: dict[str, str] = {}
+    for line in teams_tsv.splitlines():
+        if not line.strip():
+            continue
+        parts = line.split("\t")
+        if len(parts) < 2:
+            continue
+        code, name = parts[0].strip(), parts[1].strip()
+        if code and name:
+            mapping[code] = name
+    return mapping
+
+
+def parse_eloratings_tsv(world_tsv: str, teams_tsv: str, as_of: date) -> pl.DataFrame:
+    """Extract ``(team, date, rating)`` rows from EloRatings.net ``World.tsv`` + ``en.teams.tsv``.
+
+    ``World.tsv`` is the backend ranking feed for the JS-rendered ranking page: each line is
+    tab-separated with the 2-letter team **code** in column 3 (index 2) and the current Elo
+    rating in column 4 (index 3). Codes are resolved to English names via
+    :func:`parse_eloratings_team_codes`; rows whose code is unknown or whose rating won't
+    parse as a number are skipped. Team names are returned as-is (the site's English
+    spelling) and canonicalized through the alias map downstream at ingest time. All rows are
+    stamped with ``as_of``.
+    """
+
+    codes = parse_eloratings_team_codes(teams_tsv)
+    teams: list[str] = []
+    ratings: list[float] = []
+    for line in world_tsv.splitlines():
+        parts = line.split("\t")
+        if len(parts) < 4:
+            continue
+        name = codes.get(parts[2].strip())
+        if not name:
+            continue
+        try:
+            rating = float(parts[3].strip())
+        except ValueError:
+            continue
+        teams.append(name)
+        ratings.append(rating)
+
+    return pl.DataFrame(
+        {
+            "team": teams,
+            "date": [as_of] * len(teams),
+            "rating": ratings,
+        },
+        schema={"team": pl.Utf8, "date": pl.Date, "rating": pl.Float64},
+    )
+
+
 # ---------------------------------------------------------------------------
 # Market odds (decimal odds -> overround-removed probabilities)
 # ---------------------------------------------------------------------------

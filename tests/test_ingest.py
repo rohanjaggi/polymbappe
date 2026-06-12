@@ -73,6 +73,36 @@ _ELO_HTML = """
 </table>
 """
 
+# Trimmed EloRatings.net backend feeds: World.tsv has the 2-letter team code in column 3
+# and the rating in column 4; en.teams.tsv maps each code to its English name (the first
+# name column). "US" -> "USA" exercises the USA -> United States alias downstream, and the
+# unused "XX" code confirms a code with no World.tsv row is harmless.
+_ELO_WORLD_TSV = "1\t1\tBR\t2169\t1\t2200\n2\t2\tUS\t1821\t1\t1850\n"
+_ELO_TEAMS_TSV = "BR\tBrazil\nUS\tUSA\nXX\tNowhere\n"
+
+
+def test_ingest_elo_prefers_local_tsv(tmp_path: Path) -> None:
+    from datetime import date
+
+    settings = _settings(tmp_path)
+    _write_results(settings)
+    from polymbappe.data.ingest import ingest_results
+
+    ingest_results(settings)
+    (settings.raw_data_dir / "elo_world.tsv").write_text(_ELO_WORLD_TSV)
+    (settings.raw_data_dir / "elo_teams.tsv").write_text(_ELO_TEAMS_TSV)
+
+    n = ingest_elo(settings, as_of=date(2026, 6, 1))
+    assert n == 2  # published TSV snapshot, not the 6-row self-computed series
+    snaps = read_table(Table.ELO_SNAPSHOTS, settings)
+    assert set(snaps.columns) == set(TABLE_COLUMNS[Table.ELO_SNAPSHOTS])
+    assert set(snaps["date"].to_list()) == {date(2026, 6, 1)}
+    # Code resolved (US -> "USA") and alias canonicalized (USA -> United States).
+    usa = snaps.filter(pl.col("team") == "United States").row(0, named=True)
+    assert usa["rating"] == 1821.0
+    assert "USA" not in set(snaps["team"].to_list())
+    assert snaps.filter(pl.col("team") == "Brazil").row(0, named=True)["rating"] == 2169.0
+
 
 def test_ingest_elo_prefers_published_local(tmp_path: Path) -> None:
     from datetime import date
@@ -111,27 +141,28 @@ def test_ingest_elo_published_empty_falls_back(tmp_path: Path) -> None:
 def test_ingest_elo_fetches_when_url_configured(tmp_path: Path, monkeypatch) -> None:
     from datetime import date
 
-    from bs4 import BeautifulSoup
-
     from polymbappe.data import ingest as ingest_mod
 
     settings = _settings(tmp_path)
-    # No local matches and no elo.html: the only source is the opt-in fetch URL.
-    (settings.raw_data_dir / "elo_url.txt").write_text("https://www.eloratings.net/\n")
+    # No local matches and no local elo files: the only source is the opt-in TSV fetch.
+    (settings.raw_data_dir / "elo_url.txt").write_text("https://www.eloratings.net/World.tsv\n")
 
     calls: list[str] = []
 
-    def _fake_fetch(url: str, timeout: float = 20.0) -> BeautifulSoup:
-        calls.append(url)
-        return BeautifulSoup(_ELO_HTML, "html.parser")
+    def _fake_fetch(
+        world_url: str = "", teams_url: str = "", timeout: float = 20.0
+    ) -> tuple[str, str]:
+        calls.append(world_url)
+        return _ELO_WORLD_TSV, _ELO_TEAMS_TSV
 
-    monkeypatch.setattr(ingest_mod.sources, "fetch_eloratings_html", _fake_fetch)
+    monkeypatch.setattr(ingest_mod.sources, "fetch_eloratings_tsv", _fake_fetch)
 
     n = ingest_elo(settings, as_of=date(2026, 6, 1))
     assert n == 2
-    assert calls == ["https://www.eloratings.net/"]  # used the configured URL
+    assert calls == ["https://www.eloratings.net/World.tsv"]  # used the configured World.tsv URL
     snaps = read_table(Table.ELO_SNAPSHOTS, settings)
     assert snaps.filter(pl.col("team") == "Brazil").row(0, named=True)["rating"] == 2169.0
+    assert snaps.filter(pl.col("team") == "United States").row(0, named=True)["rating"] == 1821.0
 
 
 def test_ingest_market_odds_aligns_match_ids(tmp_path: Path) -> None:
