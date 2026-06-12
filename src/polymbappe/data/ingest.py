@@ -66,17 +66,21 @@ def ingest_elo(
 
     Resolution order (first that yields data wins):
 
-    1. **Published ratings** — a local ``data/raw/elo.html`` page, else an opt-in network
-       fetch (see :func:`_published_elo`). Parsed via
-       :func:`~polymbappe.data.normalize.parse_eloratings`, team names canonicalized, and
-       stamped with ``as_of`` (today by default).
+    1. **Published ratings** — local raw TSVs (``elo_world.tsv`` + ``elo_teams.tsv``), else a
+       local ``data/raw/elo.html`` page, else an opt-in network fetch of EloRatings.net's
+       ``World.tsv`` + ``en.teams.tsv`` (see :func:`_published_elo`). TSVs are joined on the
+       2-letter team code and parsed via
+       :func:`~polymbappe.data.normalize.parse_eloratings_tsv` (HTML via
+       :func:`~polymbappe.data.normalize.parse_eloratings`); team names are canonicalized and
+       rows stamped with ``as_of`` (today by default).
     2. **Self-computed** — walk the ``matches`` table chronologically, recording each
        team's post-match rating. Requires the ``matches`` table (run :func:`ingest_results`
        first) and no network access.
 
     The dashboard reads only the latest rating per team, so either a single published
-    snapshot or the self-computed time series serves it. ``url`` forces a specific fetch
-    source; ``as_of`` overrides the published snapshot date (useful for reproducibility).
+    snapshot or the self-computed time series serves it. ``url`` forces a specific
+    ``World.tsv`` fetch URL; ``as_of`` overrides the published snapshot date (useful for
+    reproducibility).
 
     Returns the number of snapshot rows written.
     """
@@ -102,12 +106,12 @@ def ingest_elo(
 
 
 def _elo_url(settings: Settings) -> str | None:
-    """Opt-in network source for published Elo: the URL in ``data/raw/elo_url.txt``.
+    """Opt-in network source for published Elo: the ``World.tsv`` URL in ``data/raw/elo_url.txt``.
 
-    Returns the first non-comment line as the fetch URL, or
-    :data:`~polymbappe.data.sources.ELORATINGS_WORLD_URL` if the file exists but names none
-    (so merely creating the file enables the default EloRatings.net page). An absent file
-    returns ``None`` — keeping network fetches opt-in so the default path stays offline,
+    Returns the first non-comment line as the ``World.tsv`` fetch URL, or
+    :data:`~polymbappe.data.sources.ELORATINGS_WORLD_TSV_URL` if the file exists but names
+    none (so merely creating the file enables the default EloRatings.net feed). An absent
+    file returns ``None`` — keeping network fetches opt-in so the default path stays offline,
     reproducible, and test-safe.
     """
 
@@ -118,48 +122,66 @@ def _elo_url(settings: Settings) -> str | None:
         line = line.strip()
         if line and not line.startswith("#"):
             return line
-    return sources.ELORATINGS_WORLD_URL
+    return sources.ELORATINGS_WORLD_TSV_URL
 
 
 def _published_elo(
     settings: Settings, *, url: str | None, as_of: date | None
 ) -> pl.DataFrame | None:
-    """Published EloRatings.net snapshot from a local raw HTML file or a configured URL.
+    """Published EloRatings.net snapshot from local raw files or an opt-in network fetch.
 
-    Prefers ``data/raw/elo.html`` (reproducible, offline). Otherwise fetches ``url`` if
-    given, else the opt-in URL from :func:`_elo_url`. The parsed ratings are stamped with
-    ``as_of`` (today by default), team names canonicalized via :func:`normalize_team_expr`,
-    deduped per ``(team, date)``, and returned in the ``elo_snapshots`` schema.
+    Resolution order (first that yields rows wins); every path stamps rows with ``as_of``
+    (today by default), canonicalizes team names via :func:`normalize_team_expr`, dedupes per
+    ``(team, date)``, and returns the ``elo_snapshots`` schema:
 
-    Returns ``None`` when no published source is configured, a fetch fails, or the page
-    yields no rows (EloRatings.net populates its table via JavaScript, so a plain scrape can
-    come back empty) — the caller then self-computes from ``matches``.
+    1. **Local TSV** — ``data/raw/elo_world.tsv`` + ``data/raw/elo_teams.tsv`` (the site's
+       ``World.tsv`` / ``en.teams.tsv``), parsed via :func:`parse_eloratings_tsv`.
+    2. **Local HTML** — ``data/raw/elo.html`` (any saved/rendered ranking table), parsed via
+       :func:`parse_eloratings`.
+    3. **Network TSV (opt-in)** — fetches ``World.tsv`` + ``en.teams.tsv`` when ``url`` is
+       given or ``data/raw/elo_url.txt`` exists (see :func:`_elo_url`). This is the live
+       published source: the ranking page itself is a JS shell that serves its ratings from
+       these TSVs (keyed by 2-letter team code), so the HTML parser only ever sees an empty
+       table.
+
+    Returns ``None`` when no published source is configured, a fetch fails, or the parse
+    yields no rows — the caller then self-computes from ``matches``.
     """
 
-    from polymbappe.data.normalize import parse_eloratings
+    from polymbappe.data.normalize import parse_eloratings, parse_eloratings_tsv
 
-    local = settings.raw_data_dir / "elo.html"
-    if local.exists():
+    as_of = as_of or date.today()
+    local_world = settings.raw_data_dir / "elo_world.tsv"
+    local_teams = settings.raw_data_dir / "elo_teams.tsv"
+    local_html = settings.raw_data_dir / "elo.html"
+
+    if local_world.exists() and local_teams.exists():
+        parsed = parse_eloratings_tsv(
+            local_world.read_text(), local_teams.read_text(), as_of=as_of
+        )
+        logger.info("ingest.elo.local_tsv", path=str(local_world))
+    elif local_html.exists():
         from bs4 import BeautifulSoup
 
-        soup = BeautifulSoup(local.read_bytes(), "html.parser")
-        logger.info("ingest.elo.local", path=str(local))
+        soup = BeautifulSoup(local_html.read_bytes(), "html.parser")
+        parsed = parse_eloratings(soup, as_of=as_of)
+        logger.info("ingest.elo.local", path=str(local_html))
     else:
         url = url or _elo_url(settings)
         if url is None:
             return None
         try:
-            soup = sources.fetch_eloratings_html(url)
+            world_tsv, teams_tsv = sources.fetch_eloratings_tsv(world_url=url)
         except Exception as exc:  # noqa: BLE001 - network isolated; fall back to self-compute
             logger.warning("ingest.elo.fetch_failed", url=url, error=str(exc))
             return None
+        parsed = parse_eloratings_tsv(world_tsv, teams_tsv, as_of=as_of)
         logger.info("ingest.elo.fetched", url=url)
 
-    parsed = parse_eloratings(soup, as_of=as_of or date.today())
     if parsed.is_empty():
         logger.warning(
             "ingest.elo.published_empty",
-            hint="EloRatings.net table may be JS-populated; self-computing instead",
+            hint="EloRatings.net returned no parseable ratings; self-computing instead",
         )
         return None
 
