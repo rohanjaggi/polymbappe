@@ -103,19 +103,25 @@ _GBM_NUMERIC = (
 
 
 def _attach_core_features(
-    frame: pl.DataFrame, matches: pl.DataFrame, team_xg: pl.DataFrame | None
+    frame: pl.DataFrame,
+    matches: pl.DataFrame,
+    team_xg: pl.DataFrame | None,
+    squad_valuations: pl.DataFrame | None = None,
 ) -> tuple[pl.DataFrame, list[str]]:
     """Join the leakage-safe core (Tier 1-3) features onto the stacked frame by ``match_id``.
 
     These are the non-linear inputs the GBM stacker needs (Elo diffs, rolling form, rest,
-    H2H, xG, host flags). Every core builder is point-in-time, so joining by ``match_id``
-    adds no leakage. Market columns are intentionally excluded so the edge pipeline's GBM
-    stays market-blind. Returns the enriched frame and the list of GBM feature columns.
+    H2H, xG, squad value, host flags). Every core builder is point-in-time, so joining by
+    ``match_id`` adds no leakage. Market columns are intentionally excluded so the edge
+    pipeline's GBM stays market-blind. Returns the enriched frame and the list of GBM
+    feature columns.
     """
 
     from polymbappe.features.pipeline import _ID_COLUMNS, FeaturePipeline
 
-    core = FeaturePipeline().build_core_matrix(matches, team_xg=team_xg)
+    core = FeaturePipeline().build_core_matrix(
+        matches, team_xg=team_xg, squad_valuations=squad_valuations
+    )
     drop = set(_ID_COLUMNS) | {"home_goals", "away_goals", "label"}
     feature_cols = [
         c
@@ -179,6 +185,7 @@ def train_full_stack(
     ensemble_config: EnsembleConfig | None = None,
     market_odds: pl.DataFrame | None = None,
     team_xg: pl.DataFrame | None = None,
+    squad_valuations: pl.DataFrame | None = None,
     fit_contextual: bool = True,
 ) -> TrainArtifacts:
     """Fit the Dixon-Coles engine, the dual ensembles, and the contextual adjuster.
@@ -205,7 +212,7 @@ def train_full_stack(
     # Attach core features and stack a GBM over them + the base-probability groups. The
     # edge pipeline drops market columns (see ``Ensemble._gbm_columns``) for a true
     # market-blind GBM. Falls back to the linear stack if lightgbm is unavailable.
-    frame, core_cols = _attach_core_features(frame, matches, team_xg)
+    frame, core_cols = _attach_core_features(frame, matches, team_xg, squad_valuations)
     base_groups = tuple(
         g
         for g, present in (("dc", True), ("bay", has_bay), ("elo", True), ("mkt", has_market))
@@ -300,6 +307,11 @@ def train_models(model: str | None = None, *, bayesian: bool = False) -> None:
     team_xg = (
         read_table(Table.TEAM_XG, settings) if table_exists(Table.TEAM_XG, settings) else None
     )
+    squad_valuations = (
+        read_table(Table.SQUAD_VALUATIONS, settings)
+        if table_exists(Table.SQUAD_VALUATIONS, settings)
+        else None
+    )
 
     if model == "dixon_coles":
         dc = _all_history_dixon_coles(matches, BaseProbConfig())
@@ -312,7 +324,11 @@ def train_models(model: str | None = None, *, bayesian: bool = False) -> None:
 
     base_config = BaseProbConfig(use_bayesian=bayesian)
     artifacts = train_full_stack(
-        matches, base_config=base_config, market_odds=market_odds, team_xg=team_xg
+        matches,
+        base_config=base_config,
+        market_odds=market_odds,
+        team_xg=team_xg,
+        squad_valuations=squad_valuations,
     )
     persist_artifacts(artifacts, settings)
     logger.info("train.done", rows=artifacts.stacked_frame.height, bayesian=bayesian)

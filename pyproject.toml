@@ -46,6 +46,9 @@ dashboard = [
   "streamlit>=1.38.0",
   "plotly>=5.22.0",
 ]
+kaggle = [
+  "kagglehub>=0.3.0",
+]
 dev = [
   "black>=24.8.0",
   "mypy>=1.11.1",
@@ -77,7 +80,16 @@ strict = true
 packages = ["polymbappe"]
 
 [[tool.mypy.overrides]]
-module = ["requests", "scipy", "scipy.*", "soccerdata", "soccerdata.*", "sklearn", "sklearn.*"]
+module = [
+  "requests",
+  "scipy",
+  "scipy.*",
+  "soccerdata",
+  "soccerdata.*",
+  "sklearn",
+  "sklearn.*",
+  "kagglehub",
+]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

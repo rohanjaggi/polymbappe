@@ -9,9 +9,11 @@ from __future__ import annotations
 
 import hashlib
 import io
+import json
 import time
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlsplit
 
 import polars as pl
@@ -163,10 +165,42 @@ def cached_get(
     return content
 
 
+#: EloRatings.net world ranking page — default source for published international Elo.
+#: The ranking table is often JS-populated, so a plain fetch can return an empty table;
+#: ingestion treats an empty parse as "no published data" and self-computes instead.
+ELORATINGS_WORLD_URL = "https://www.eloratings.net/"
+
+#: EloRatings.net backend data files. The world ranking page is a client-side SlickGrid app
+#: that loads its ratings from these TSVs rather than rendering an HTML table, so scraping
+#: the page (:func:`fetch_eloratings_html`) only ever sees an empty shell. ``World.tsv`` has
+#: one row per team keyed by a 2-letter team **code** (column 3) with the current Elo rating
+#: (column 4); ``en.teams.tsv`` maps each code to its English name(s). Fetching both and
+#: joining on the code yields the live published Elo — see
+#: :func:`~polymbappe.data.normalize.parse_eloratings_tsv`.
+ELORATINGS_WORLD_TSV_URL = "https://www.eloratings.net/World.tsv"
+ELORATINGS_TEAMS_TSV_URL = "https://www.eloratings.net/en.teams.tsv"
+
+
 def fetch_eloratings_html(url: str, timeout: float = 20.0) -> BeautifulSoup:
     """Fetch and parse an Elo ratings page."""
 
     return BeautifulSoup(_get(url, timeout).text, "html.parser")
+
+
+def fetch_eloratings_tsv(
+    world_url: str = ELORATINGS_WORLD_TSV_URL,
+    teams_url: str = ELORATINGS_TEAMS_TSV_URL,
+    timeout: float = 20.0,
+) -> tuple[str, str]:
+    """Fetch the EloRatings.net ``World.tsv`` ranking + ``en.teams.tsv`` code dictionary.
+
+    Returns ``(world_tsv, teams_tsv)`` as raw decoded text. This is the live published-Elo
+    source (the HTML page is a JS shell with no table). Parsing/joining the two TSVs into
+    ``(team, date, rating)`` rows lives in
+    :func:`~polymbappe.data.normalize.parse_eloratings_tsv` (pure, unit-tested).
+    """
+
+    return _get(world_url, timeout).text, _get(teams_url, timeout).text
 
 
 def load_kaggle_results_csv(csv_bytes: bytes) -> pl.DataFrame:
@@ -299,6 +333,35 @@ def fetch_openfootball_stadiums(
     return _fetch_openfootball_array(
         url, "stadiums", settings=settings, min_interval=min_interval, timeout=timeout
     )
+
+
+def fetch_kaggle_player_attributes(dataset: str, *, file: str | None = None) -> pl.DataFrame:
+    """Download an EA FC / FM player-attributes CSV from a Kaggle dataset into Polars.
+
+    Used for agent player-importance tiering only (not as model features) — see the
+    unified spec ("Player attribute data strategy"). ``dataset`` is a Kaggle slug such as
+    ``"stefanoleone992/ea-sports-fc-24-complete-player-dataset"``; ``file`` selects which
+    CSV inside it (e.g. ``"male_players.csv"``), defaulting to the first ``*.csv`` found.
+
+    Requires the optional ``kagglehub`` package and a Kaggle API token (``~/.kaggle/
+    kaggle.json``). ``kagglehub`` is imported lazily so the dependency is needed only when
+    this network path is actually taken; the local-CSV path in
+    :func:`~polymbappe.data.ingest.ingest_player_attributes` never imports it. The raw
+    columns are reconciled to the table schema by
+    :func:`~polymbappe.data.normalize.normalize_player_attributes`.
+    """
+
+    import kagglehub  # lazy: optional, network/auth-bound dependency
+
+    path = Path(kagglehub.dataset_download(dataset))
+    if file is not None:
+        csv_path = path / file
+    else:
+        csvs = sorted(path.glob("*.csv"))
+        if not csvs:
+            raise FileNotFoundError(f"no CSV found in Kaggle dataset {dataset!r} at {path}")
+        csv_path = csvs[0]
+    return pl.read_csv(csv_path, infer_schema_length=10_000, ignore_errors=True)
 
 
 #: Transfermarkt squad/kader page template. ``{slug}`` is the team's URL slug and
@@ -872,3 +935,107 @@ def get_fbref_matches(
     else:
         pandas_df = fbref.read_team_match_stats(stat_type=stat_type)
     return pl.from_pandas(pandas_df.reset_index())
+
+
+# ---------------------------------------------------------------------------
+# StatsBomb Open Data (free event data → real xG and PPDA)
+# ---------------------------------------------------------------------------
+#
+# StatsBomb publishes free event-level JSON on GitHub. Unlike FBref it is not browser-gated
+# (plain raw.githubusercontent.com), exposes the shot model directly (``shot.statsbomb_xg``,
+# the figure FBref re-publishes), and carries event locations — so real team xG and true
+# zonal PPDA are both derivable. It is, however, RELEASED AFTER tournaments and only for a
+# curated set; it is the historical/backtest source (2018+ here), NOT a live 2026 feed. See
+# the live-xG scraper TODO below for the in-tournament gap.
+#
+# Coverage relevant to this model (competition_id, season_id):
+#   (43, 3)    FIFA World Cup 2018      (55, 43)   UEFA Euro 2020
+#   (43, 106)  FIFA World Cup 2022      (55, 282)  UEFA Euro 2024
+#   (223, 282) Copa América 2024
+
+#: Pinned commit of statsbomb/open-data, so ingested xG/PPDA are reproducible (the dataset's
+#: ``master`` branch advances as StatsBomb releases new competitions).
+STATSBOMB_OPEN_DATA_REF = "b0bc9f22dd77c206ddedc1d742893b3bbe64baec"
+
+#: Raw-file base; ``{ref}`` pins the commit, ``{path}`` is e.g. ``matches/43/106.json``.
+STATSBOMB_OPEN_DATA_URL = (
+    "https://raw.githubusercontent.com/statsbomb/open-data/{ref}/data/{path}"
+)
+
+#: Default (competition_id, season_id) pairs ingested — the international tournaments the
+#: model trains/backtests on that StatsBomb open data covers.
+STATSBOMB_COMPETITIONS: tuple[tuple[int, int], ...] = (
+    (43, 3),  # FIFA World Cup 2018
+    (43, 106),  # FIFA World Cup 2022
+    (55, 43),  # UEFA Euro 2020
+    (55, 282),  # UEFA Euro 2024
+    (223, 282),  # Copa América 2024
+)
+
+
+def _statsbomb_json(
+    path: str,
+    *,
+    settings: Settings | None = None,
+    ref: str = STATSBOMB_OPEN_DATA_REF,
+    timeout: float = 30.0,
+) -> Any:
+    """Fetch and parse one StatsBomb open-data JSON file (cached on disk).
+
+    Goes through :func:`cached_get` (so a pinned ``ref`` yields a stable cache and repeat
+    runs do no network). GitHub raw is not anti-bot, so the per-host throttle is disabled.
+    """
+
+    url = STATSBOMB_OPEN_DATA_URL.format(ref=ref, path=path)
+    body = cached_get(url, settings=settings, timeout=timeout, min_interval=0.0)
+    return json.loads(body.decode("utf-8"))
+
+
+def fetch_statsbomb_matches(
+    competition_id: int,
+    season_id: int,
+    *,
+    settings: Settings | None = None,
+    ref: str = STATSBOMB_OPEN_DATA_REF,
+    timeout: float = 30.0,
+) -> list[dict[str, Any]]:
+    """Fetch the match list for one StatsBomb (competition, season).
+
+    Each match dict carries ``match_id``, ``match_date`` (ISO ``YYYY-MM-DD``) and the
+    ``home_team``/``away_team`` objects whose ``*_team_name`` join the ``matches`` table.
+    """
+
+    data = _statsbomb_json(
+        f"matches/{competition_id}/{season_id}.json",
+        settings=settings,
+        ref=ref,
+        timeout=timeout,
+    )
+    return data if isinstance(data, list) else []
+
+
+def fetch_statsbomb_events(
+    match_id: int,
+    *,
+    settings: Settings | None = None,
+    ref: str = STATSBOMB_OPEN_DATA_REF,
+    timeout: float = 60.0,
+) -> list[dict[str, Any]]:
+    """Fetch the full event stream for one StatsBomb match (~3k events).
+
+    Shots carry ``shot.statsbomb_xg``; passes/interceptions/fouls/tackle-duels carry
+    ``location`` — the inputs :func:`~polymbappe.data.normalize.statsbomb_team_match_xg`
+    and :func:`~polymbappe.data.normalize.statsbomb_team_match_ppda` consume.
+    """
+
+    data = _statsbomb_json(
+        f"events/{match_id}.json", settings=settings, ref=ref, timeout=timeout
+    )
+    return data if isinstance(data, list) else []
+
+
+# TODO(live-xg): StatsBomb open data is published only AFTER a tournament, so it cannot feed
+# live 2026 xG/PPDA during the World Cup. A separate in-tournament scraper (e.g. Understat,
+# fotmob, or a paid feed) is needed for the live layer — kept in view, not yet built. It
+# would land here as a thin fetcher + a normalizer producing the same team_xg / team_ppda
+# rows, so the ingest wiring downstream stays unchanged.

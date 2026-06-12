@@ -1,7 +1,9 @@
+import math
 from datetime import date
 
 import polars as pl
 
+from polymbappe.eval.backtest import Tournament
 from polymbappe.features.context import (
     build_form_features,
     build_h2h_features,
@@ -9,7 +11,12 @@ from polymbappe.features.context import (
     build_structural_features,
 )
 from polymbappe.features.elo import EloConfig, build_elo_features
-from polymbappe.features.pipeline import FeaturePipeline, result_label
+from polymbappe.features.pipeline import (
+    FeaturePipeline,
+    build_contextual_matrix,
+    result_label,
+)
+from polymbappe.features.squad import build_squad_features, build_squad_match_features
 from polymbappe.features.xg import build_xg_features
 
 # Chronological synthetic history. A is strong, plays B twice and C once.
@@ -94,6 +101,67 @@ def test_xg_proxy_falls_back_to_goals() -> None:
     assert _row(xg, "m3", "A")["xg_for"] == 1.5
 
 
+# A World Cup fixture (A strong, B weak) plus the squad-valuation snapshot for that
+# tournament. Dates fall inside the WC2022 window so ``select_fixtures`` maps the match.
+_WC_MATCHES = pl.DataFrame(
+    {
+        "match_id": ["w1"],
+        "date": [date(2022, 11, 21)],
+        "home_team": ["A"],
+        "away_team": ["B"],
+        "home_goals": [2],
+        "away_goals": [0],
+        "competition": ["FIFA World Cup"],
+        "is_knockout": [False],
+        "neutral_site": [True],
+        "group": ["A"],
+    }
+)
+_WC_VALUATIONS = pl.DataFrame(
+    {
+        "team": ["A", "B"],
+        "tournament": ["WC2022", "WC2022"],
+        "total_value": [1000.0, 100.0],
+        "median_value": [50.0, 5.0],
+        "player_count": [26, 26],
+    }
+)
+_WC2022 = Tournament("WC2022", "FIFA World Cup", date(2022, 11, 20), date(2022, 12, 18))
+
+
+def test_squad_match_features_map_tournament_snapshot() -> None:
+    feats = build_squad_match_features(_WC_MATCHES, _WC_VALUATIONS, (_WC2022,))
+    # One row per fixture-team, keyed for the team-table join.
+    assert set(feats.columns) == {"match_id", "team", "date", "log_total_value"}
+    assert feats.height == 2
+    assert _row(feats, "w1", "A")["log_total_value"] == math.log1p(1000.0)
+    # A team with no snapshot value for the tournament yields no row.
+    empty = build_squad_match_features(_WC_MATCHES, _WC_VALUATIONS, ())
+    assert empty.is_empty()
+
+
+def test_core_matrix_attaches_squad_value_ratio() -> None:
+    matrix = FeaturePipeline().build_core_matrix(
+        _WC_MATCHES, squad_valuations=_WC_VALUATIONS, tournaments=(_WC2022,)
+    )
+    row = matrix.row(0, named=True)
+    assert "squad_value_ratio" in matrix.columns
+    assert row["home_log_total_value"] == math.log1p(1000.0)
+    assert row["away_log_total_value"] == math.log1p(100.0)
+    # Tier-1 spec feature: log(value_home / value_away), positive when home is stronger.
+    assert row["squad_value_ratio"] == math.log1p(1000.0) - math.log1p(100.0)
+
+
+def test_core_matrix_skips_squad_when_absent() -> None:
+    # Default (no valuations) leaves the squad columns off entirely — graceful degradation.
+    matrix = FeaturePipeline().build_core_matrix(MATCHES)
+    assert "squad_value_ratio" not in matrix.columns
+    assert "home_log_total_value" not in matrix.columns
+    # build_squad_features still produces the per-team log values it always did.
+    per_team = build_squad_features(_WC_VALUATIONS)
+    assert "log_total_value" in per_team.columns
+
+
 def test_pipeline_assembles_matrix_with_label_and_diff() -> None:
     matrix = FeaturePipeline().build_core_matrix(MATCHES)
     assert matrix.height == MATCHES.height
@@ -107,3 +175,29 @@ def test_pipeline_assembles_matrix_with_label_and_diff() -> None:
     assert "home_elo_pre" in matrix.columns
     assert "away_gs_5" in matrix.columns
     assert "h2h_home_winrate" in matrix.columns
+
+
+def test_contextual_matrix_ppda_diff_null_without_table() -> None:
+    # Without a team_ppda table, ppda is null on both sides -> ppda_diff is all-null.
+    matrix = build_contextual_matrix(MATCHES)
+    assert "ppda_diff" in matrix.columns
+    assert matrix["ppda_diff"].null_count() == matrix.height
+
+
+def test_contextual_matrix_ppda_diff_populated_with_table() -> None:
+    # Supplying team_ppda lights up the otherwise-dead ppda_diff feature.
+    long_dates = [date(2020, 1, 1), date(2020, 1, 10), date(2020, 1, 20), date(2020, 2, 1)]
+    team_ppda = pl.DataFrame(
+        {
+            "team": ["A", "B", "A", "B", "A", "C", "A", "B"],
+            "date": [long_dates[0]] * 2
+            + [long_dates[1]] * 2
+            + [long_dates[2]] * 2
+            + [long_dates[3]] * 2,
+            "ppda": [9.0, 12.0, 8.0, 11.0, 10.0, 13.0, 9.5, 12.5],
+        }
+    )
+    matrix = build_contextual_matrix(MATCHES, team_ppda=team_ppda)
+    # The rolling PPDA excludes a team's own current match, so m1 (first appearance for both)
+    # is still null, but later matches carry a real difference.
+    assert matrix["ppda_diff"].null_count() < matrix.height

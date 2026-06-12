@@ -5,13 +5,16 @@ ingested independently and failures are isolated: a missing optional source or a
 network error logs a warning and is skipped rather than aborting the whole run.
 
 Sources prefer a local raw file under ``data/raw`` when present (reproducible,
-offline-friendly), falling back to a network fetch (or, for Elo, a self-computation from
-the already-ingested ``matches`` table) otherwise.
+offline-friendly), falling back to a network fetch otherwise. Elo prefers published
+EloRatings.net ratings (local ``elo.html`` or an opt-in fetch) and self-computes from the
+already-ingested ``matches`` table only when no published source is available.
 """
 
 from __future__ import annotations
 
 import io
+from collections.abc import Callable
+from datetime import date
 
 import polars as pl
 import structlog
@@ -25,6 +28,9 @@ from polymbappe.data.normalize import (
     normalize_odds_frame,
     normalize_openfootball_schedule,
     normalize_openfootball_stadiums,
+    normalize_player_attributes,
+    statsbomb_team_match_ppda,
+    statsbomb_team_match_xg,
 )
 from polymbappe.data.store import read_table, table_exists, write_table
 from polymbappe.data.tables import TABLE_COLUMNS, Table
@@ -60,27 +66,140 @@ def ingest_results(
     return normalized.height
 
 
-def ingest_elo(settings: Settings | None = None) -> int:
-    """Materialize the ``elo_snapshots`` table by self-computing Elo from ``matches``.
+def ingest_elo(
+    settings: Settings | None = None,
+    *,
+    url: str | None = None,
+    as_of: date | None = None,
+) -> int:
+    """Materialize the ``elo_snapshots`` table, preferring published EloRatings.net ratings.
 
-    Requires the ``matches`` table (run :func:`ingest_results` first). Walks results
-    chronologically and records each team's post-match rating, producing the time series
-    the dashboard's Elo-trajectory view reads. No network access.
+    Resolution order (first that yields data wins):
+
+    1. **Published ratings** — local raw TSVs (``elo_world.tsv`` + ``elo_teams.tsv``), else a
+       local ``data/raw/elo.html`` page, else an opt-in network fetch of EloRatings.net's
+       ``World.tsv`` + ``en.teams.tsv`` (see :func:`_published_elo`). TSVs are joined on the
+       2-letter team code and parsed via
+       :func:`~polymbappe.data.normalize.parse_eloratings_tsv` (HTML via
+       :func:`~polymbappe.data.normalize.parse_eloratings`); team names are canonicalized and
+       rows stamped with ``as_of`` (today by default).
+    2. **Self-computed** — walk the ``matches`` table chronologically, recording each
+       team's post-match rating. Requires the ``matches`` table (run :func:`ingest_results`
+       first) and no network access.
+
+    The dashboard reads only the latest rating per team, so either a single published
+    snapshot or the self-computed time series serves it. ``url`` forces a specific
+    ``World.tsv`` fetch URL; ``as_of`` overrides the published snapshot date (useful for
+    reproducibility).
 
     Returns the number of snapshot rows written.
     """
 
+    settings = settings or Settings()
+
+    published = _published_elo(settings, url=url, as_of=as_of)
+    if published is not None:
+        write_table(Table.ELO_SNAPSHOTS, published, mode="overwrite", settings=settings)
+        logger.info("ingest.elo.published", rows=published.height)
+        return published.height
+
     from polymbappe.features.elo import build_elo_snapshots
 
-    settings = settings or Settings()
     if not table_exists(Table.MATCHES, settings):
         raise FileNotFoundError("Elo ingestion needs the matches table; run ingest_results first.")
 
     matches = read_table(Table.MATCHES, settings)
     snapshots = build_elo_snapshots(matches)
     write_table(Table.ELO_SNAPSHOTS, snapshots, mode="overwrite", settings=settings)
-    logger.info("ingest.elo.stored", rows=snapshots.height)
+    logger.info("ingest.elo.self_computed", rows=snapshots.height)
     return snapshots.height
+
+
+def _elo_url(settings: Settings) -> str | None:
+    """Opt-in network source for published Elo: the ``World.tsv`` URL in ``data/raw/elo_url.txt``.
+
+    Returns the first non-comment line as the ``World.tsv`` fetch URL, or
+    :data:`~polymbappe.data.sources.ELORATINGS_WORLD_TSV_URL` if the file exists but names
+    none (so merely creating the file enables the default EloRatings.net feed). An absent
+    file returns ``None`` — keeping network fetches opt-in so the default path stays offline,
+    reproducible, and test-safe.
+    """
+
+    url_file = settings.raw_data_dir / "elo_url.txt"
+    if not url_file.exists():
+        return None
+    for line in url_file.read_text().splitlines():
+        line = line.strip()
+        if line and not line.startswith("#"):
+            return line
+    return sources.ELORATINGS_WORLD_TSV_URL
+
+
+def _published_elo(
+    settings: Settings, *, url: str | None, as_of: date | None
+) -> pl.DataFrame | None:
+    """Published EloRatings.net snapshot from local raw files or an opt-in network fetch.
+
+    Resolution order (first that yields rows wins); every path stamps rows with ``as_of``
+    (today by default), canonicalizes team names via :func:`normalize_team_expr`, dedupes per
+    ``(team, date)``, and returns the ``elo_snapshots`` schema:
+
+    1. **Local TSV** — ``data/raw/elo_world.tsv`` + ``data/raw/elo_teams.tsv`` (the site's
+       ``World.tsv`` / ``en.teams.tsv``), parsed via :func:`parse_eloratings_tsv`.
+    2. **Local HTML** — ``data/raw/elo.html`` (any saved/rendered ranking table), parsed via
+       :func:`parse_eloratings`.
+    3. **Network TSV (opt-in)** — fetches ``World.tsv`` + ``en.teams.tsv`` when ``url`` is
+       given or ``data/raw/elo_url.txt`` exists (see :func:`_elo_url`). This is the live
+       published source: the ranking page itself is a JS shell that serves its ratings from
+       these TSVs (keyed by 2-letter team code), so the HTML parser only ever sees an empty
+       table.
+
+    Returns ``None`` when no published source is configured, a fetch fails, or the parse
+    yields no rows — the caller then self-computes from ``matches``.
+    """
+
+    from polymbappe.data.normalize import parse_eloratings, parse_eloratings_tsv
+
+    as_of = as_of or date.today()
+    local_world = settings.raw_data_dir / "elo_world.tsv"
+    local_teams = settings.raw_data_dir / "elo_teams.tsv"
+    local_html = settings.raw_data_dir / "elo.html"
+
+    if local_world.exists() and local_teams.exists():
+        parsed = parse_eloratings_tsv(
+            local_world.read_text(), local_teams.read_text(), as_of=as_of
+        )
+        logger.info("ingest.elo.local_tsv", path=str(local_world))
+    elif local_html.exists():
+        from bs4 import BeautifulSoup
+
+        soup = BeautifulSoup(local_html.read_bytes(), "html.parser")
+        parsed = parse_eloratings(soup, as_of=as_of)
+        logger.info("ingest.elo.local", path=str(local_html))
+    else:
+        url = url or _elo_url(settings)
+        if url is None:
+            return None
+        try:
+            world_tsv, teams_tsv = sources.fetch_eloratings_tsv(world_url=url)
+        except Exception as exc:  # noqa: BLE001 - network isolated; fall back to self-compute
+            logger.warning("ingest.elo.fetch_failed", url=url, error=str(exc))
+            return None
+        parsed = parse_eloratings_tsv(world_tsv, teams_tsv, as_of=as_of)
+        logger.info("ingest.elo.fetched", url=url)
+
+    if parsed.is_empty():
+        logger.warning(
+            "ingest.elo.published_empty",
+            hint="EloRatings.net returned no parseable ratings; self-computing instead",
+        )
+        return None
+
+    return (
+        parsed.with_columns(normalize_team_expr("team").alias("team"))
+        .unique(subset=["team", "date"], keep="first")
+        .select(TABLE_COLUMNS[Table.ELO_SNAPSHOTS])
+    )
 
 
 _MARKET_ODDS_COLUMNS = TABLE_COLUMNS[Table.MARKET_ODDS]
@@ -217,36 +336,166 @@ def ingest_market_odds(settings: Settings | None = None, *, live: bool = False) 
     return combined.height
 
 
-def ingest_team_xg(settings: Settings | None = None) -> int:
-    """Ingest team-level xG into the ``team_xg`` table from ``data/raw/team_xg.csv``.
+def _statsbomb_team_match_rows(
+    settings: Settings,
+    row_builder: Callable[..., list[dict[str, object]]],
+    *,
+    competitions: tuple[tuple[int, int], ...] | None = None,
+) -> list[dict[str, object]]:
+    """Walk StatsBomb open data → per-team-match rows via ``row_builder``.
 
-    Expects columns ``team, date, xg, xga`` (FBref team-match xG, 2018+). Live FBref
-    scraping via :func:`~polymbappe.data.sources.get_fbref_matches` is available but heavy
-    and network-dependent, so the default path is the reproducible local file. Skips
-    (returns 0) when the file is absent.
+    For each configured ``(competition, season)`` fetches the match list, then each match's
+    event stream, and applies ``row_builder(events, home_team=, away_team=, match_date=)``.
+    Network/parse failures are isolated per competition and per match (logged, skipped). The
+    on-disk HTTP cache means a second pass (e.g. PPDA after xG) re-reads events from disk with
+    no network.
+    """
+
+    competitions = competitions or sources.STATSBOMB_COMPETITIONS
+    rows: list[dict[str, object]] = []
+    for competition_id, season_id in competitions:
+        try:
+            matches = sources.fetch_statsbomb_matches(
+                competition_id, season_id, settings=settings
+            )
+        except Exception as exc:  # noqa: BLE001 — isolate per-competition fetch failure
+            logger.warning(
+                "ingest.statsbomb.matches_failed",
+                competition=competition_id,
+                season=season_id,
+                error=str(exc),
+            )
+            continue
+        for match in matches:
+            match_id = match.get("match_id")
+            home = match.get("home_team", {}).get("home_team_name")
+            away = match.get("away_team", {}).get("away_team_name")
+            match_date = match.get("match_date")
+            if not (match_id and home and away and match_date):
+                continue
+            try:
+                events = sources.fetch_statsbomb_events(match_id, settings=settings)
+            except Exception as exc:  # noqa: BLE001 — isolate per-match fetch failure
+                logger.warning("ingest.statsbomb.events_failed", match_id=match_id, error=str(exc))
+                continue
+            rows.extend(
+                row_builder(events, home_team=home, away_team=away, match_date=match_date)
+            )
+    return rows
+
+
+def ingest_team_xg(settings: Settings | None = None, *, live: bool = False) -> int:
+    """Ingest team-level xG into the ``team_xg`` table (``[team, date, xg, xga]``).
+
+    Prefers a reproducible local ``data/raw/team_xg.csv`` (columns ``team, date, xg, xga``).
+    When that file is absent and ``live=True``, derives real xG from StatsBomb Open Data —
+    summing ``shot.statsbomb_xg`` per team across each covered international match (World Cup
+    2018/2022, Euro 2020/2024, Copa América 2024; the public xG that FBref re-publishes). The
+    fetch is pinned to a commit for reproducibility but heavy (~260 event files), so offline
+    runs (no ``live``) skip cleanly. Note: StatsBomb open data is released *after* tournaments,
+    so this is the historical/backtest source, not a live 2026 feed.
     """
 
     settings = settings or Settings()
     local = settings.raw_data_dir / "team_xg.csv"
-    if not local.exists():
-        logger.info("ingest.xg.skip", reason="no data/raw/team_xg.csv")
+    if local.exists():
+        raw = pl.read_csv(io.BytesIO(local.read_bytes()))
+        required = {"team", "date", "xg", "xga"}
+        missing = required - set(raw.columns)
+        if missing:
+            raise ValueError(f"team_xg.csv missing columns: {sorted(missing)}")
+        normalized = raw.select(
+            normalize_team_expr("team").alias("team"),
+            pl.col("date").cast(pl.Utf8).str.to_date(strict=False),
+            pl.col("xg").cast(pl.Float64),
+            pl.col("xga").cast(pl.Float64),
+        ).select(TABLE_COLUMNS[Table.TEAM_XG])
+        write_table(Table.TEAM_XG, normalized, mode="overwrite", settings=settings)
+        logger.info("ingest.xg.stored", rows=normalized.height, source="local")
+        return normalized.height
+
+    if not live:
+        logger.info(
+            "ingest.xg.skip",
+            reason="no data/raw/team_xg.csv (pass live=True to pull StatsBomb open data)",
+        )
         return 0
 
-    raw = pl.read_csv(io.BytesIO(local.read_bytes()))
-    required = {"team", "date", "xg", "xga"}
-    missing = required - set(raw.columns)
-    if missing:
-        raise ValueError(f"team_xg.csv missing columns: {sorted(missing)}")
+    rows = _statsbomb_team_match_rows(settings, statsbomb_team_match_xg)
+    if not rows:
+        logger.info("ingest.xg.skip", reason="StatsBomb open data produced no xG rows")
+        return 0
 
-    normalized = raw.select(
-        pl.col("team").cast(pl.Utf8),
-        pl.col("date").cast(pl.Utf8).str.to_date(strict=False),
-        pl.col("xg").cast(pl.Float64),
-        pl.col("xga").cast(pl.Float64),
-    ).select(TABLE_COLUMNS[Table.TEAM_XG])
-    write_table(Table.TEAM_XG, normalized, mode="overwrite", settings=settings)
-    logger.info("ingest.xg.stored", rows=normalized.height)
-    return normalized.height
+    frame = (
+        pl.DataFrame(
+            rows,
+            schema={"team": pl.Utf8, "date": pl.Utf8, "xg": pl.Float64, "xga": pl.Float64},
+        )
+        .with_columns(
+            normalize_team_expr("team").alias("team"),
+            pl.col("date").str.to_date(strict=False),
+        )
+        .unique(subset=["team", "date"], keep="first")
+        .select(TABLE_COLUMNS[Table.TEAM_XG])
+    )
+    write_table(Table.TEAM_XG, frame, mode="overwrite", settings=settings)
+    logger.info("ingest.xg.stored", rows=frame.height, source="statsbomb")
+    return frame.height
+
+
+def ingest_ppda(settings: Settings | None = None, *, live: bool = False) -> int:
+    """Ingest team-level PPDA into the ``team_ppda`` table (``[team, date, ppda]``).
+
+    PPDA — passes allowed per defensive action; lower = a more aggressive high press. Prefers
+    a reproducible local ``data/raw/team_ppda.csv`` (columns ``team, date, ppda``). When that
+    file is absent and ``live=True``, computes true zonal PPDA from StatsBomb Open Data event
+    streams (see :func:`~polymbappe.data.normalize.statsbomb_team_match_ppda`) over the same
+    covered tournaments as :func:`ingest_team_xg`. Team names are canonicalized so they join
+    the ``matches`` table; populating this table lights up the otherwise-null ``ppda_diff``
+    contextual feature. Offline runs (no ``live``) skip cleanly.
+    """
+
+    settings = settings or Settings()
+    local = settings.raw_data_dir / "team_ppda.csv"
+    if local.exists():
+        raw = pl.read_csv(io.BytesIO(local.read_bytes()))
+        required = {"team", "date", "ppda"}
+        missing = required - set(raw.columns)
+        if missing:
+            raise ValueError(f"team_ppda.csv missing columns: {sorted(missing)}")
+        normalized = raw.select(
+            normalize_team_expr("team").alias("team"),
+            pl.col("date").cast(pl.Utf8).str.to_date(strict=False),
+            pl.col("ppda").cast(pl.Float64),
+        ).select(TABLE_COLUMNS[Table.TEAM_PPDA])
+        write_table(Table.TEAM_PPDA, normalized, mode="overwrite", settings=settings)
+        logger.info("ingest.ppda.stored", rows=normalized.height, source="local")
+        return normalized.height
+
+    if not live:
+        logger.info(
+            "ingest.ppda.skip",
+            reason="no data/raw/team_ppda.csv (pass live=True to pull StatsBomb open data)",
+        )
+        return 0
+
+    rows = _statsbomb_team_match_rows(settings, statsbomb_team_match_ppda)
+    if not rows:
+        logger.info("ingest.ppda.skip", reason="StatsBomb open data produced no PPDA rows")
+        return 0
+
+    frame = (
+        pl.DataFrame(rows, schema={"team": pl.Utf8, "date": pl.Utf8, "ppda": pl.Float64})
+        .with_columns(
+            normalize_team_expr("team").alias("team"),
+            pl.col("date").str.to_date(strict=False),
+        )
+        .unique(subset=["team", "date"], keep="first")
+        .select(TABLE_COLUMNS[Table.TEAM_PPDA])
+    )
+    write_table(Table.TEAM_PPDA, frame, mode="overwrite", settings=settings)
+    logger.info("ingest.ppda.stored", rows=frame.height, source="statsbomb")
+    return frame.height
 
 
 def ingest_venues(settings: Settings | None = None) -> int:
@@ -604,6 +853,86 @@ def _aggregate_squad_valuations(
     return out
 
 
+def ingest_player_attributes(settings: Settings | None = None) -> int:
+    """Ingest EA FC / FM player attributes into the ``player_attributes`` table.
+
+    Prefers ``data/raw/player_attributes.csv`` (reproducible, offline) whose columns equal
+    ``TABLE_COLUMNS[Table.PLAYER_ATTRIBUTES]`` (``team, player, overall``); else fetches the
+    Kaggle dataset named in ``data/raw/player_attributes_kaggle.txt`` (first line: the Kaggle
+    slug, optional second line ``file=<name>.csv``) via
+    :func:`~polymbappe.data.sources.fetch_kaggle_player_attributes` and reconciles its columns
+    with :func:`~polymbappe.data.normalize.normalize_player_attributes`. ``team`` is the
+    player's national team, canonicalized via :func:`normalize_team_expr` so it joins the squad
+    tables; ``overall`` is cast to ``Int64``. Powers the agent's player-importance tiers
+    (:func:`~polymbappe.features.players.build_player_tiers`), not the prediction model
+    (unified spec, "Player attribute data strategy").
+
+    Skips (returns 0) when the local file is absent AND no Kaggle config / fetch yields rows.
+    """
+
+    settings = settings or Settings()
+    required = set(TABLE_COLUMNS[Table.PLAYER_ATTRIBUTES])
+    local = settings.raw_data_dir / "player_attributes.csv"
+    if local.exists():
+        raw = pl.read_csv(io.BytesIO(local.read_bytes()))
+        logger.info("ingest.player_attributes.local", path=str(local), rows=raw.height)
+    else:
+        fetched = _fetch_player_attributes(settings)
+        if fetched is None or fetched.height == 0:
+            logger.info(
+                "ingest.player_attributes.skip",
+                reason="no data/raw/player_attributes.csv and Kaggle fetch empty",
+            )
+            return 0
+        raw = fetched
+        logger.info("ingest.player_attributes.fetched", rows=raw.height)
+
+    missing = required - set(raw.columns)
+    if missing:
+        raise ValueError(f"player_attributes source missing columns: {sorted(missing)}")
+
+    normalized = raw.select(
+        normalize_team_expr("team").alias("team"),
+        pl.col("player").cast(pl.Utf8),
+        pl.col("overall").cast(pl.Int64),
+    ).select(TABLE_COLUMNS[Table.PLAYER_ATTRIBUTES])
+    write_table(Table.PLAYER_ATTRIBUTES, normalized, mode="overwrite", settings=settings)
+    logger.info("ingest.player_attributes.stored", rows=normalized.height)
+    return normalized.height
+
+
+def _fetch_player_attributes(settings: Settings) -> pl.DataFrame | None:
+    """Fetch + reconcile EA FC / FM attributes from the Kaggle dataset in the config file.
+
+    Reads optional ``data/raw/player_attributes_kaggle.txt`` (first non-comment line: the
+    Kaggle dataset slug; optional ``file=<name>.csv`` line selects the CSV inside it). Returns
+    ``None`` when the config is absent — so the local-CSV path stays the default and tests stay
+    offline — or when the fetch/reconcile yields nothing. The heavy, auth-bound ``kagglehub``
+    import lives in the source fetcher and is only triggered on this path.
+    """
+
+    config_path = settings.raw_data_dir / "player_attributes_kaggle.txt"
+    if not config_path.exists():
+        return None
+    dataset: str | None = None
+    file: str | None = None
+    for line in config_path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("file="):
+            file = line[len("file=") :].strip()
+        elif dataset is None:
+            dataset = line
+    if dataset is None:
+        return None
+
+    raw = sources.fetch_kaggle_player_attributes(dataset, file=file)
+    reconciled = normalize_player_attributes(raw)
+    logger.info("ingest.player_attributes.source", dataset=dataset, rows=reconciled.height)
+    return reconciled if reconciled.height > 0 else None
+
+
 def derive_manager_records(
     tenure_rows: list[dict[str, object]] | pl.DataFrame,
     matches: pl.DataFrame,
@@ -809,10 +1138,10 @@ def ingest_all_sources(live: bool = False, settings: Settings | None = None) -> 
     """Ingest all configured upstream datasets into normalized storage.
 
     Runs results first (the others depend on it or are optional overlays), then Elo
-    (self-computed from results), market odds, team xG, squads (Transfermarkt → cohesion
-    inputs), and manager records (Wikipedia tenure + match-join derivation → manager
-    pedigree). Each source is isolated: a failure or a skipped optional source is recorded
-    rather than aborting the run.
+    (self-computed from results), market odds, team xG and team PPDA (local CSV, or StatsBomb
+    Open Data when ``live``), squads (Transfermarkt → cohesion inputs), and manager records
+    (Wikipedia tenure + match-join derivation → manager pedigree). Each source is isolated: a
+    failure or a skipped optional source is recorded rather than aborting the run.
 
     Args:
         live: Incremental mode — append latest results/odds rather than overwrite.
@@ -832,12 +1161,14 @@ def ingest_all_sources(live: bool = False, settings: Settings | None = None) -> 
         ("results", ingest_results, True),
         ("elo", ingest_elo, False),
         ("market_odds", ingest_market_odds, True),
-        ("team_xg", ingest_team_xg, False),
+        ("team_xg", ingest_team_xg, True),
+        ("team_ppda", ingest_ppda, True),
         ("venues", ingest_venues, False),
         ("schedule", ingest_schedule, False),
         ("city_coords", ingest_city_coords, False),
         ("squads", ingest_squads, False),
         ("squad_valuations", ingest_squad_valuations, False),
+        ("player_attributes", ingest_player_attributes, False),
         ("manager_records", ingest_manager_records, False),
     )
     for name, fn, takes_live in steps:
@@ -847,13 +1178,16 @@ def ingest_all_sources(live: bool = False, settings: Settings | None = None) -> 
             logger.warning("ingest.source_failed", source=name, error=str(exc))
             report[name] = -1
 
-    # FBref *live* xG scraping remains manual/optional: its fetcher exists in `sources` but is
-    # heavy/network-dependent and off the minimum-viable-model critical path (the default
-    # team_xg path reads a local CSV). Every source above — results, odds, venues, schedule,
-    # squads, squad valuations, manager records — prefers a local CSV and falls back to a
-    # cached fetch (openfootball for venues/schedule; manifest scrapers for the rest), so they
-    # are safe to run by default: an absent local file + empty fetch records `0` rather than
-    # failing.
+    # team_xg/team_ppda prefer a local CSV and, under `live`, derive real xG/PPDA from
+    # StatsBomb Open Data (event-level, the source FBref re-publishes; soccerdata exposes
+    # neither for the international comps). That pull is heavy (~260 event files) so it only
+    # runs in live mode; offline runs without a local CSV record `0`. StatsBomb open data is
+    # historical (released after a tournament) — the live 2026 feed is a separate TODO (see
+    # `sources.fetch_statsbomb_events` and the live-xg note beneath it).
+    #
+    # venues/schedule/city_coords prefer a local CSV and fall back to a cached fetch
+    # (openfootball for venues/schedule; GeoNames for the city gazetteer), so they are safe to
+    # run by default: an absent local file + empty fetch records `0` rather than failing.
 
     logger.info("ingest.done", report=report)
     return report

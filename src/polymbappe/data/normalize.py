@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import re
 from datetime import date
+from typing import Any
 
 import polars as pl
 from bs4 import BeautifulSoup
@@ -184,6 +185,104 @@ def normalize_kaggle_results(raw: pl.DataFrame) -> pl.DataFrame:
 
 
 # ---------------------------------------------------------------------------
+# StatsBomb Open Data (events -> team xG / PPDA)
+# ---------------------------------------------------------------------------
+
+#: Pitch length in StatsBomb coordinates (x runs 0 = own goal-line to 120 = opponent's).
+_SB_PITCH_LENGTH = 120.0
+#: Fraction of the pitch (from a team's own goal) treated as the PPDA "build-up" zone — the
+#: classic definition presses in the opponent's defensive 60%.
+_SB_PPDA_ZONE_FRACTION = 0.6
+
+
+def _sb_type(event: dict[str, Any]) -> str:
+    return str(event.get("type", {}).get("name", ""))
+
+
+def statsbomb_team_match_xg(
+    events: list[dict[str, Any]], *, home_team: str, away_team: str, match_date: str
+) -> list[dict[str, object]]:
+    """Sum a match's shot xG per team into two ``team_xg`` rows.
+
+    Team xG is the sum of ``shot.statsbomb_xg`` over that team's shots; ``xga`` is the
+    opponent's total. Penalty-shootout shots (period 5) are excluded. Returns
+    ``[{team, date, xg, xga}, ...]`` for the home and away teams (raw StatsBomb names;
+    canonicalization happens at ingest).
+    """
+
+    xg = {home_team: 0.0, away_team: 0.0}
+    for e in events:
+        if e.get("period") == 5 or _sb_type(e) != "Shot":
+            continue
+        team = e.get("team", {}).get("name")
+        value = e.get("shot", {}).get("statsbomb_xg")
+        if team in xg and value is not None:
+            xg[team] += float(value)
+    return [
+        {"team": home_team, "date": match_date, "xg": xg[home_team], "xga": xg[away_team]},
+        {"team": away_team, "date": match_date, "xg": xg[away_team], "xga": xg[home_team]},
+    ]
+
+
+def _sb_is_defensive_action(event: dict[str, Any]) -> bool:
+    """A PPDA defensive action: interception, foul committed, or a tackle-type duel."""
+
+    kind = _sb_type(event)
+    if kind in ("Interception", "Foul Committed"):
+        return True
+    return kind == "Duel" and event.get("duel", {}).get("type", {}).get(
+        "name", ""
+    ).startswith("Tackle")
+
+
+def statsbomb_team_match_ppda(
+    events: list[dict[str, Any]],
+    *,
+    home_team: str,
+    away_team: str,
+    match_date: str,
+    zone_fraction: float = _SB_PPDA_ZONE_FRACTION,
+) -> list[dict[str, object]]:
+    """Compute each team's PPDA for one match from its event stream.
+
+    PPDA = opponent passes in their build-up zone ÷ this team's defensive actions in the
+    pressing zone (tackles + interceptions + fouls). Both restricted to the same physical
+    band: a team's own passes count where ``x <= 120*zone_fraction`` (its defensive 60%);
+    the pressing team's defensive actions count where ``x >= 120*(1 - zone_fraction)`` — the
+    mirror of that band in the presser's attacking-right frame. PPDA is ``None`` when a team
+    made no defensive actions in the zone (avoids divide-by-zero). Shootout events (period 5)
+    are excluded. Returns ``[{team, date, ppda}, ...]`` for home and away.
+    """
+
+    pass_line = _SB_PITCH_LENGTH * zone_fraction
+    press_line = _SB_PITCH_LENGTH * (1.0 - zone_fraction)
+    passes = {home_team: 0, away_team: 0}
+    def_actions = {home_team: 0, away_team: 0}
+    for e in events:
+        if e.get("period") == 5:
+            continue
+        team = e.get("team", {}).get("name")
+        location = e.get("location")
+        if team not in passes or not location:
+            continue
+        x = location[0]
+        if _sb_type(e) == "Pass":
+            if x <= pass_line:
+                passes[team] += 1
+        elif x >= press_line and _sb_is_defensive_action(e):
+            def_actions[team] += 1
+
+    def ppda(team: str, opponent: str) -> float | None:
+        actions = def_actions[team]
+        return float(passes[opponent]) / actions if actions > 0 else None
+
+    return [
+        {"team": home_team, "date": match_date, "ppda": ppda(home_team, away_team)},
+        {"team": away_team, "date": match_date, "ppda": ppda(away_team, home_team)},
+    ]
+
+
+# ---------------------------------------------------------------------------
 # EloRatings.net
 # ---------------------------------------------------------------------------
 
@@ -224,6 +323,68 @@ def parse_eloratings(soup: BeautifulSoup, as_of: date) -> pl.DataFrame:
             "team": teams,
             "date": [as_of] * len(teams),
             "rating": [float(r) for r in ratings],
+        },
+        schema={"team": pl.Utf8, "date": pl.Date, "rating": pl.Float64},
+    )
+
+
+def parse_eloratings_team_codes(teams_tsv: str) -> dict[str, str]:
+    """Build a ``team-code -> English name`` map from EloRatings.net ``en.teams.tsv``.
+
+    Each line is tab-separated ``CODE\\tName[\\tAlternateName...]``; the first name column is
+    the canonical English spelling (alternate columns are short/casual variants and are
+    ignored — alias normalization happens downstream at ingest). Blank or malformed lines
+    (no code or no name) are skipped. Codes are taken verbatim, including the rare
+    non-2-letter ones (e.g. ``US_loc``), which simply never match a ``World.tsv`` row.
+    """
+
+    mapping: dict[str, str] = {}
+    for line in teams_tsv.splitlines():
+        if not line.strip():
+            continue
+        parts = line.split("\t")
+        if len(parts) < 2:
+            continue
+        code, name = parts[0].strip(), parts[1].strip()
+        if code and name:
+            mapping[code] = name
+    return mapping
+
+
+def parse_eloratings_tsv(world_tsv: str, teams_tsv: str, as_of: date) -> pl.DataFrame:
+    """Extract ``(team, date, rating)`` rows from EloRatings.net ``World.tsv`` + ``en.teams.tsv``.
+
+    ``World.tsv`` is the backend ranking feed for the JS-rendered ranking page: each line is
+    tab-separated with the 2-letter team **code** in column 3 (index 2) and the current Elo
+    rating in column 4 (index 3). Codes are resolved to English names via
+    :func:`parse_eloratings_team_codes`; rows whose code is unknown or whose rating won't
+    parse as a number are skipped. Team names are returned as-is (the site's English
+    spelling) and canonicalized through the alias map downstream at ingest time. All rows are
+    stamped with ``as_of``.
+    """
+
+    codes = parse_eloratings_team_codes(teams_tsv)
+    teams: list[str] = []
+    ratings: list[float] = []
+    for line in world_tsv.splitlines():
+        parts = line.split("\t")
+        if len(parts) < 4:
+            continue
+        name = codes.get(parts[2].strip())
+        if not name:
+            continue
+        try:
+            rating = float(parts[3].strip())
+        except ValueError:
+            continue
+        teams.append(name)
+        ratings.append(rating)
+
+    return pl.DataFrame(
+        {
+            "team": teams,
+            "date": [as_of] * len(teams),
+            "rating": ratings,
         },
         schema={"team": pl.Utf8, "date": pl.Date, "rating": pl.Float64},
     )
@@ -560,3 +721,82 @@ def normalize_openfootball_schedule(matches: list[dict[str, object]]) -> pl.Data
         .alias("match_id")
     )
     return df.select(TABLE_COLUMNS[Table.SCHEDULE])
+
+
+# ---------------------------------------------------------------------------
+# Player attributes (EA FC / FIFA via stefanoleone992, FM25)
+# ---------------------------------------------------------------------------
+
+#: Candidate raw column names per logical field, in priority order. EA FC / FIFA exports
+#: use ``short_name`` / ``nationality_name`` / ``overall`` (older editions: ``nationality``);
+#: Football Manager exports are not standardized — common spellings are listed so a single
+#: reconciler covers both without per-source branching. See
+#: ``docs/.../2026-06-09-data-ingestion-requirements-spec.md`` ("Player attributes").
+_PLAYER_ATTR_CANDIDATES: dict[str, tuple[str, ...]] = {
+    "player": ("short_name", "long_name", "name", "Name", "player", "Player"),
+    "team": (
+        "nationality_name",
+        "nationality",
+        "nation",
+        "Nation",
+        "country",
+        "Country",
+        "team",
+    ),
+    "overall": ("overall", "Overall", "overall_rating", "CA", "ability"),
+}
+
+
+def _resolve_attr_column(field: str, override: str | None, columns: list[str]) -> str:
+    """Resolve the raw column for a logical field (``override`` wins, else candidates).
+
+    Raises ``ValueError`` (listing the available columns) when neither the override nor any
+    candidate from :data:`_PLAYER_ATTR_CANDIDATES` is present.
+    """
+
+    if override is not None:
+        return override
+    present = set(columns)
+    found = next((c for c in _PLAYER_ATTR_CANDIDATES[field] if c in present), None)
+    if found is None:
+        raise ValueError(
+            f"player attributes source missing a column for {field!r}; "
+            f"available columns: {sorted(columns)}"
+        )
+    return found
+
+
+def normalize_player_attributes(
+    raw: pl.DataFrame,
+    *,
+    player_col: str | None = None,
+    team_col: str | None = None,
+    overall_col: str | None = None,
+) -> pl.DataFrame:
+    """Reconcile an EA FC / FM player-attributes export to ``team, player, overall`` rows.
+
+    Pure column-reconciliation: EA FC and Football Manager exports name the same fields
+    differently (and FM names are not standardized), so the player / national-team / rating
+    columns are resolved from :data:`_PLAYER_ATTR_CANDIDATES` unless explicitly overridden.
+    ``team`` is the player's *national* team (canonicalized to a tournament squad later, at
+    ingest); ``overall`` is cast to ``Int64``. Rows missing a name or rating are dropped.
+    Team-name canonicalization is **not** done here (it happens in
+    :func:`~polymbappe.data.ingest.ingest_player_attributes`, mirroring the squad sources).
+
+    Raises ``ValueError`` if a required column can't be resolved.
+    """
+
+    columns = raw.columns
+    team = _resolve_attr_column("team", team_col, columns)
+    player = _resolve_attr_column("player", player_col, columns)
+    overall = _resolve_attr_column("overall", overall_col, columns)
+
+    return (
+        raw.select(
+            pl.col(team).cast(pl.Utf8).str.strip_chars().alias("team"),
+            pl.col(player).cast(pl.Utf8).str.strip_chars().alias("player"),
+            pl.col(overall).cast(pl.Int64, strict=False).alias("overall"),
+        )
+        .drop_nulls(subset=["player", "overall"])
+        .filter(pl.col("player") != "")
+    )
