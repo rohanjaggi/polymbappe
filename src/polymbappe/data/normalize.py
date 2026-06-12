@@ -43,12 +43,102 @@ _KAGGLE_RENAME = {
     "neutral": "neutral_site",
 }
 
+#: Competitions whose knockout stage is inferred by :func:`infer_knockout_stage`. Strings
+#: must match the Kaggle ``tournament`` field exactly (cf.
+#: ``polymbappe.eval.backtest.DEFAULT_TOURNAMENTS``). Scoped to the major single-elimination
+#: tournaments the model evaluates on; qualifiers, leagues, and round-robin competitions are
+#: deliberately excluded.
+_KNOCKOUT_COMPETITIONS: frozenset[str] = frozenset(
+    {"FIFA World Cup", "UEFA Euro", "Copa América"}
+)
+
+
+def infer_knockout_stage(matches: pl.DataFrame) -> pl.Series:
+    """Infer a per-row ``is_knockout`` flag for major-tournament matches.
+
+    The Kaggle results feed carries no stage metadata, so knockout matches are inferred
+    structurally. Within each *edition* (competition + calendar year) of a major tournament
+    (:data:`_KNOCKOUT_COMPETITIONS`) the group stage is a round-robin in which every team
+    plays the same number of games, while the knockout stage is single-elimination. A team
+    eliminated in the group stage therefore plays the *minimum* number of matches in that
+    edition; any match a team plays beyond that minimum is a knockout match. ``group_size``
+    is taken per edition as that minimum appearance count, which self-calibrates to each
+    format (3 group games for the modern World Cup / Euro / Copa, fewer for older ones).
+
+    A match is flagged knockout when **both** sides have already played at least
+    ``group_size`` matches in the edition — i.e. it is each team's ``group_size + 1``-th
+    appearance or later. In a single-elimination bracket both teams in a tie have survived
+    the same number of rounds, so their appearance counts are always equal. Non-major
+    competitions and round-robin-only editions (where no team exceeds the minimum) yield
+    all-False.
+
+    Assumes complete editions: a partially-ingested in-progress tournament can under-label,
+    and the rare historical double-group-stage formats (e.g. the 1974/1978/1982 World Cups)
+    over-label their second group round. Neither affects the modern editions the model
+    trains and evaluates on.
+
+    Returns a Boolean Series ``is_knockout`` aligned to ``matches`` (same length and order).
+    Requires ``date``, ``home_team``, ``away_team``, and ``competition`` columns.
+    """
+
+    n = matches.height
+    if n == 0:
+        return pl.Series("is_knockout", [], dtype=pl.Boolean)
+
+    work = matches.select(
+        pl.int_range(0, n, dtype=pl.Int64).alias("_row"),
+        "date",
+        "home_team",
+        "away_team",
+        "competition",
+    ).with_columns(
+        (pl.col("competition") + pl.lit("|") + pl.col("date").dt.year().cast(pl.Utf8))
+        .alias("_edition")
+    )
+
+    major = work.filter(pl.col("competition").is_in(list(_KNOCKOUT_COMPETITIONS)))
+    if major.is_empty():
+        return pl.Series("is_knockout", [False] * n, dtype=pl.Boolean)
+
+    # One row per (match, team), so each team's appearances within an edition can be counted.
+    long = pl.concat(
+        [
+            major.select("_row", "_edition", "date", pl.col("home_team").alias("team")),
+            major.select("_row", "_edition", "date", pl.col("away_team").alias("team")),
+        ]
+    ).sort(["_edition", "team", "date", "_row"])
+
+    # 1-based chronological appearance index per (edition, team).
+    long = long.with_columns(
+        pl.int_range(1, pl.len() + 1).over(["_edition", "team"]).alias("_appearance")
+    )
+    # group_size := fewest matches any team played in the edition (group-stage-only teams).
+    group_size = (
+        long.group_by(["_edition", "team"])
+        .agg(pl.len().alias("_team_matches"))
+        .group_by("_edition")
+        .agg(pl.col("_team_matches").min().alias("_group_size"))
+    )
+    long = long.join(group_size, on="_edition", how="left").with_columns(
+        (pl.col("_appearance") > pl.col("_group_size")).alias("_past_group")
+    )
+    # A match is knockout when both of its team-rows are past the group stage.
+    per_match = long.group_by("_row").agg(pl.col("_past_group").all().alias("_knockout"))
+
+    flags = (
+        work.join(per_match, on="_row", how="left")
+        .with_columns(pl.col("_knockout").fill_null(False))
+        .sort("_row")
+    )
+    return flags.get_column("_knockout").rename("is_knockout")
+
 
 def normalize_kaggle_results(raw: pl.DataFrame) -> pl.DataFrame:
     """Normalize the Kaggle international results CSV into the ``matches`` schema.
 
-    Drops unplayed fixtures (null scores) and coerces types. ``is_knockout`` and
-    ``group`` are left at structural defaults — the source carries no stage metadata.
+    Drops unplayed fixtures (null scores) and coerces types. The source carries no stage
+    metadata, so ``is_knockout`` is inferred structurally for the major tournaments by
+    :func:`infer_knockout_stage`; ``group`` is left null (no group labels in the feed).
     """
 
     present = {k: v for k, v in _KAGGLE_RENAME.items() if k in raw.columns}
@@ -77,9 +167,9 @@ def normalize_kaggle_results(raw: pl.DataFrame) -> pl.DataFrame:
     df = df.with_columns(
         pl.format("{}__{}__{}", pl.col("date"), pl.col("home_team"), pl.col("away_team"))
         .alias("match_id"),
-        pl.lit(False).alias("is_knockout"),
         pl.lit(None, dtype=pl.Utf8).alias("group"),
     )
+    df = df.with_columns(infer_knockout_stage(df))
 
     return df.select(TABLE_COLUMNS[Table.MATCHES])
 
