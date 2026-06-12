@@ -137,6 +137,12 @@ def cached_get(
     return content
 
 
+#: EloRatings.net world ranking page — default source for published international Elo.
+#: The ranking table is often JS-populated, so a plain fetch can return an empty table;
+#: ingestion treats an empty parse as "no published data" and self-computes instead.
+ELORATINGS_WORLD_URL = "https://www.eloratings.net/"
+
+
 def fetch_eloratings_html(url: str, timeout: float = 20.0) -> BeautifulSoup:
     """Fetch and parse an Elo ratings page."""
 

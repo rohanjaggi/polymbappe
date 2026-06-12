@@ -5,13 +5,15 @@ ingested independently and failures are isolated: a missing optional source or a
 network error logs a warning and is skipped rather than aborting the whole run.
 
 Sources prefer a local raw file under ``data/raw`` when present (reproducible,
-offline-friendly), falling back to a network fetch (or, for Elo, a self-computation from
-the already-ingested ``matches`` table) otherwise.
+offline-friendly), falling back to a network fetch otherwise. Elo prefers published
+EloRatings.net ratings (local ``elo.html`` or an opt-in fetch) and self-computes from the
+already-ingested ``matches`` table only when no published source is available.
 """
 
 from __future__ import annotations
 
 import io
+from datetime import date
 
 import polars as pl
 import structlog
@@ -54,27 +56,118 @@ def ingest_results(
     return normalized.height
 
 
-def ingest_elo(settings: Settings | None = None) -> int:
-    """Materialize the ``elo_snapshots`` table by self-computing Elo from ``matches``.
+def ingest_elo(
+    settings: Settings | None = None,
+    *,
+    url: str | None = None,
+    as_of: date | None = None,
+) -> int:
+    """Materialize the ``elo_snapshots`` table, preferring published EloRatings.net ratings.
 
-    Requires the ``matches`` table (run :func:`ingest_results` first). Walks results
-    chronologically and records each team's post-match rating, producing the time series
-    the dashboard's Elo-trajectory view reads. No network access.
+    Resolution order (first that yields data wins):
+
+    1. **Published ratings** — a local ``data/raw/elo.html`` page, else an opt-in network
+       fetch (see :func:`_published_elo`). Parsed via
+       :func:`~polymbappe.data.normalize.parse_eloratings`, team names canonicalized, and
+       stamped with ``as_of`` (today by default).
+    2. **Self-computed** — walk the ``matches`` table chronologically, recording each
+       team's post-match rating. Requires the ``matches`` table (run :func:`ingest_results`
+       first) and no network access.
+
+    The dashboard reads only the latest rating per team, so either a single published
+    snapshot or the self-computed time series serves it. ``url`` forces a specific fetch
+    source; ``as_of`` overrides the published snapshot date (useful for reproducibility).
 
     Returns the number of snapshot rows written.
     """
 
+    settings = settings or Settings()
+
+    published = _published_elo(settings, url=url, as_of=as_of)
+    if published is not None:
+        write_table(Table.ELO_SNAPSHOTS, published, mode="overwrite", settings=settings)
+        logger.info("ingest.elo.published", rows=published.height)
+        return published.height
+
     from polymbappe.features.elo import build_elo_snapshots
 
-    settings = settings or Settings()
     if not table_exists(Table.MATCHES, settings):
         raise FileNotFoundError("Elo ingestion needs the matches table; run ingest_results first.")
 
     matches = read_table(Table.MATCHES, settings)
     snapshots = build_elo_snapshots(matches)
     write_table(Table.ELO_SNAPSHOTS, snapshots, mode="overwrite", settings=settings)
-    logger.info("ingest.elo.stored", rows=snapshots.height)
+    logger.info("ingest.elo.self_computed", rows=snapshots.height)
     return snapshots.height
+
+
+def _elo_url(settings: Settings) -> str | None:
+    """Opt-in network source for published Elo: the URL in ``data/raw/elo_url.txt``.
+
+    Returns the first non-comment line as the fetch URL, or
+    :data:`~polymbappe.data.sources.ELORATINGS_WORLD_URL` if the file exists but names none
+    (so merely creating the file enables the default EloRatings.net page). An absent file
+    returns ``None`` — keeping network fetches opt-in so the default path stays offline,
+    reproducible, and test-safe.
+    """
+
+    url_file = settings.raw_data_dir / "elo_url.txt"
+    if not url_file.exists():
+        return None
+    for line in url_file.read_text().splitlines():
+        line = line.strip()
+        if line and not line.startswith("#"):
+            return line
+    return sources.ELORATINGS_WORLD_URL
+
+
+def _published_elo(
+    settings: Settings, *, url: str | None, as_of: date | None
+) -> pl.DataFrame | None:
+    """Published EloRatings.net snapshot from a local raw HTML file or a configured URL.
+
+    Prefers ``data/raw/elo.html`` (reproducible, offline). Otherwise fetches ``url`` if
+    given, else the opt-in URL from :func:`_elo_url`. The parsed ratings are stamped with
+    ``as_of`` (today by default), team names canonicalized via :func:`normalize_team_expr`,
+    deduped per ``(team, date)``, and returned in the ``elo_snapshots`` schema.
+
+    Returns ``None`` when no published source is configured, a fetch fails, or the page
+    yields no rows (EloRatings.net populates its table via JavaScript, so a plain scrape can
+    come back empty) — the caller then self-computes from ``matches``.
+    """
+
+    from polymbappe.data.normalize import parse_eloratings
+
+    local = settings.raw_data_dir / "elo.html"
+    if local.exists():
+        from bs4 import BeautifulSoup
+
+        soup = BeautifulSoup(local.read_bytes(), "html.parser")
+        logger.info("ingest.elo.local", path=str(local))
+    else:
+        url = url or _elo_url(settings)
+        if url is None:
+            return None
+        try:
+            soup = sources.fetch_eloratings_html(url)
+        except Exception as exc:  # noqa: BLE001 - network isolated; fall back to self-compute
+            logger.warning("ingest.elo.fetch_failed", url=url, error=str(exc))
+            return None
+        logger.info("ingest.elo.fetched", url=url)
+
+    parsed = parse_eloratings(soup, as_of=as_of or date.today())
+    if parsed.is_empty():
+        logger.warning(
+            "ingest.elo.published_empty",
+            hint="EloRatings.net table may be JS-populated; self-computing instead",
+        )
+        return None
+
+    return (
+        parsed.with_columns(normalize_team_expr("team").alias("team"))
+        .unique(subset=["team", "date"], keep="first")
+        .select(TABLE_COLUMNS[Table.ELO_SNAPSHOTS])
+    )
 
 
 _MARKET_ODDS_COLUMNS = TABLE_COLUMNS[Table.MARKET_ODDS]
