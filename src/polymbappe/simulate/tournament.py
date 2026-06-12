@@ -100,9 +100,15 @@ class StrengthModel:
     rho: float = 0.0
     max_goals: int = 8
     hosts: frozenset[str] = frozenset()
+    host_bonus: float = 0.15
 
     @classmethod
-    def from_dixon_coles(cls, model: object, hosts: frozenset[str] = frozenset()) -> StrengthModel:
+    def from_dixon_coles(
+        cls,
+        model: object,
+        hosts: frozenset[str] = frozenset(),
+        host_bonus: float = 0.15,
+    ) -> StrengthModel:
         """Build from a fitted :class:`~polymbappe.models.dixon_coles.DixonColesModel`."""
 
         idx = model.team_to_index  # type: ignore[attr-defined]
@@ -115,16 +121,27 @@ class StrengthModel:
             rho=float(model.rho),  # type: ignore[attr-defined]
             max_goals=model.config.max_goals,  # type: ignore[attr-defined]
             hosts=hosts,
+            host_bonus=host_bonus,
         )
 
     def rates(
         self, home: str, away: str, neutral: bool, dh: float = 0.0, da: float = 0.0
     ) -> tuple[float, float]:
-        """Expected (home, away) goals including latent strength deltas ``dh``/``da``."""
+        """Expected (home, away) goals including latent strength deltas ``dh``/``da``.
+
+        A host nation (USA/MEX/CAN for 2026) carries a reduced ``host_bonus`` log-rate
+        boost on top of its attack — applied to whichever side it is on and even at
+        neutral venues, since the World Cup is played in the hosts' countries (spec 4.1).
+        Group and knockout matches both pass ``neutral=True``, so this is the only
+        home-like effect in the tournament.
+        """
 
         home_term = 0.0 if neutral else self.home_advantage
+        if home in self.hosts:
+            home_term += self.host_bonus
+        away_term = self.host_bonus if away in self.hosts else 0.0
         lam = exp(home_term + self.attack.get(home, 0.0) + dh + self.defense.get(away, 0.0))
-        mu = exp(self.attack.get(away, 0.0) + da + self.defense.get(home, 0.0))
+        mu = exp(away_term + self.attack.get(away, 0.0) + da + self.defense.get(home, 0.0))
         return lam, mu
 
     def score_matrix(
