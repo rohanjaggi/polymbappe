@@ -1,0 +1,8 @@
+# Kaggle dataset for EA FC / FM player attributes (agent player-importance tiers).
+# Read by polymbappe.data.ingest._fetch_player_attributes when
+# data/raw/player_attributes.csv is absent. First non-comment line = the Kaggle
+# dataset slug; the optional `file=` line picks one CSV inside the dataset.
+# Requires the `kaggle` extra (pip install -e .[kaggle]) and a Kaggle API token
+# at ~/.kaggle/kaggle.json (or KAGGLE_USERNAME / KAGGLE_KEY env vars).
+stefanoleone992/ea-sports-fc-24-complete-player-dataset
+file=male_players.csv
