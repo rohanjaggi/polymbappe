@@ -254,7 +254,7 @@ def ingest_squads(settings: Settings | None = None) -> int:
     canonicalized via :func:`normalize_team_expr`; ``club`` is trimmed; ``tournament`` must
     already equal a ``Tournament.name`` (e.g. ``"WC2018"``) and is passed through as-is;
     ``age`` is cast to ``Float64``. Market value is NOT ingested here (cohesion needs only
-    player/club/age — see ``SQUAD_VALUATIONS`` for valuations).
+    player/club/age — see :func:`ingest_squad_valuations` for the ``squad_valuations`` table).
 
     Skips (returns 0) when the local file is absent AND the scraper yields nothing.
     """
@@ -343,6 +343,115 @@ def _scrape_one_squad(
         source="wikipedia" if rows else "none", rows=len(rows),
     )
     return rows
+
+
+def ingest_squad_valuations(settings: Settings | None = None) -> int:
+    """Ingest per-team Transfermarkt squad valuations into the ``squad_valuations`` table.
+
+    Prefers ``data/raw/squad_valuations.csv`` (reproducible, offline) whose columns equal
+    ``TABLE_COLUMNS[Table.SQUAD_VALUATIONS]`` (``team, tournament, total_value, median_value,
+    player_count``); else scrapes each manifest team's Transfermarkt squad page
+    (:func:`~polymbappe.data.sources.fetch_transfermarkt_squad_valuation`) and aggregates the
+    per-player market values into one row per ``(team, tournament)``. ``team`` is canonicalized
+    via :func:`normalize_team_expr`; ``tournament`` must already equal a ``Tournament.name``
+    (e.g. ``"WC2018"``) and is passed through as-is. Powers the squad-value features
+    (:func:`~polymbappe.features.squad.build_squad_features`).
+
+    Skips (returns 0) when the local file is absent AND the scraper yields nothing.
+    """
+
+    settings = settings or Settings()
+    required = set(TABLE_COLUMNS[Table.SQUAD_VALUATIONS])
+    local = settings.raw_data_dir / "squad_valuations.csv"
+    if local.exists():
+        raw = pl.read_csv(io.BytesIO(local.read_bytes()))
+        logger.info("ingest.squad_valuations.local", path=str(local), rows=raw.height)
+    else:
+        rows = _scrape_squad_valuations(settings)
+        if not rows:
+            logger.info(
+                "ingest.squad_valuations.skip",
+                reason="no data/raw/squad_valuations.csv and scraper empty",
+            )
+            return 0
+        raw = pl.DataFrame(rows)
+        logger.info("ingest.squad_valuations.scraped", rows=raw.height)
+
+    missing = required - set(raw.columns)
+    if missing:
+        raise ValueError(f"squad_valuations source missing columns: {sorted(missing)}")
+
+    normalized = raw.select(
+        normalize_team_expr("team").alias("team"),
+        pl.col("tournament").cast(pl.Utf8),
+        pl.col("total_value").cast(pl.Float64),
+        pl.col("median_value").cast(pl.Float64),
+        pl.col("player_count").cast(pl.Int64),
+    ).select(TABLE_COLUMNS[Table.SQUAD_VALUATIONS])
+    write_table(Table.SQUAD_VALUATIONS, normalized, mode="overwrite", settings=settings)
+    logger.info("ingest.squad_valuations.stored", rows=normalized.height)
+    return normalized.height
+
+
+def _scrape_squad_valuations(settings: Settings) -> list[dict[str, object]]:
+    """Scrape Transfermarkt market values for each manifest team, aggregated per team.
+
+    Reuses the squads manifest (``data/raw/squads_manifest.csv``: columns ``tournament,
+    team`` plus optional ``tm_id, saison_id, url``) — the same Transfermarkt pages that feed
+    the per-player ``squads`` scrape. Returns one aggregate row per ``(team, tournament)``
+    (``[]`` when no manifest or nothing fetched). Unlike squads there is no Wikipedia fallback,
+    since Wikipedia squad pages carry no market values; a team Transfermarkt can't serve is
+    simply absent. Keeping the manifest out of code lets the local-CSV path stay the default
+    and tests stay offline.
+    """
+
+    manifest_path = settings.raw_data_dir / "squads_manifest.csv"
+    if not manifest_path.exists():
+        return []
+    manifest = pl.read_csv(io.BytesIO(manifest_path.read_bytes()))
+    player_rows: list[dict[str, object]] = []
+    for entry in manifest.iter_rows(named=True):
+        tournament = str(entry["tournament"])
+        team = str(entry["team"])
+        tm_kwargs: dict[str, object] = {"settings": settings}
+        for key in ("tm_id", "saison_id", "url"):
+            if key in entry and entry[key] is not None:
+                tm_kwargs[key] = entry[key]
+        rows = sources.fetch_transfermarkt_squad_valuation(tournament, team, **tm_kwargs)
+        logger.info(
+            "ingest.squad_valuations.source", team=team,
+            source="transfermarkt" if rows else "none", rows=len(rows),
+        )
+        player_rows.extend(rows)
+    return _aggregate_squad_valuations(player_rows)
+
+
+def _aggregate_squad_valuations(
+    player_rows: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    """Aggregate per-player ``market_value`` rows into per-``(team, tournament)`` valuations.
+
+    Pure, network-free, unit-testable. ``total_value`` / ``median_value`` are taken over the
+    non-null market values (a player with no listed value still counts toward
+    ``player_count`` but not the totals); a group with no valued players yields ``0.0``.
+    """
+
+    if not player_rows:
+        return []
+    frame = pl.DataFrame(player_rows)
+    out: list[dict[str, object]] = []
+    for (team, tournament), group in frame.group_by(["team", "tournament"]):
+        values = group["market_value"].drop_nulls()
+        out.append(
+            {
+                "team": team,
+                "tournament": tournament,
+                "total_value": float(values.sum()) if values.len() > 0 else 0.0,
+                "median_value": float(values.median()) if values.len() > 0 else 0.0,
+                "player_count": int(group.height),
+            }
+        )
+    return out
 
 
 def derive_manager_records(
@@ -575,6 +684,7 @@ def ingest_all_sources(live: bool = False, settings: Settings | None = None) -> 
         ("market_odds", ingest_market_odds, True),
         ("team_xg", ingest_team_xg, False),
         ("squads", ingest_squads, False),
+        ("squad_valuations", ingest_squad_valuations, False),
         ("manager_records", ingest_manager_records, False),
     )
     for name, fn, takes_live in steps:
@@ -584,11 +694,12 @@ def ingest_all_sources(live: bool = False, settings: Settings | None = None) -> 
             logger.warning("ingest.source_failed", source=name, error=str(exc))
             report[name] = -1
 
-    # Transfermarkt squad *valuations* (SQUAD_VALUATIONS) and FBref live xG scraping remain
-    # manual/optional: their fetchers exist in `sources` but require auth/heavy network and
-    # are off the minimum-viable-model critical path. The squads (per-player) and manager
-    # records sources above prefer a local CSV and fall back to cached scrapers, so they are
-    # safe to run by default — an absent local file + empty scraper records `0`.
+    # FBref *live* xG scraping remains manual/optional: its fetcher exists in `sources` but is
+    # heavy/network-dependent and off the minimum-viable-model critical path (the default
+    # team_xg path reads a local CSV). Every source above — results, odds, squads, squad
+    # valuations, manager records — prefers a local CSV and falls back to a cached/manifest
+    # scraper, so they are safe to run by default: an absent local file + empty scraper
+    # records `0` rather than failing.
 
     logger.info("ingest.done", report=report)
     return report
