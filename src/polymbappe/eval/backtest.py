@@ -32,6 +32,11 @@ _ELO_COLS = ["elo_home", "elo_draw", "elo_away"]
 _MKT_COLS = ["mkt_home", "mkt_draw", "mkt_away"]
 #: Tier-1 squad-value core feature stacked into the GBM (mirrors train._attach_core_features).
 _SQUAD_COLS = ["squad_value_ratio"]
+#: Tier-1 rolling form raw columns (per-team); pivoted to home_*/away_* in the backtest.
+_FORM_RAW_COLS = ["gs_5", "ga_5", "pts_5", "gs_10", "ga_10", "pts_10"]
+_FORM_COLS = [f"{side}_{c}" for side in ("home", "away") for c in _FORM_RAW_COLS]
+_H2H_COLS = ["h2h_home_winrate", "h2h_meetings"]
+_REST_COLS = ["home_rest_days", "away_rest_days"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -116,6 +121,137 @@ def _metrics(labels: list[str], y_prob: np.ndarray) -> dict[str, float]:
     }
 
 
+def _pivot_team_features(
+    team_frame: pl.DataFrame,
+    fixtures: pl.DataFrame,
+    feature_cols: list[str],
+) -> pl.DataFrame:
+    """Pivot a ``(match_id, team, *features)`` frame to ``(match_id, home_feat, away_feat)``."""
+
+    fixture_ids = set(fixtures["match_id"].to_list())
+    filtered = team_frame.filter(pl.col("match_id").is_in(fixture_ids))
+    if filtered.is_empty():
+        return pl.DataFrame(schema={"match_id": pl.Utf8})
+
+    fx_map = fixtures.select("match_id", "home_team", "away_team")
+    joined = filtered.join(fx_map, on="match_id", how="left")
+
+    home_feat = (
+        joined.filter(pl.col("team") == pl.col("home_team"))
+        .select(["match_id"] + feature_cols)
+        .rename({c: f"home_{c}" for c in feature_cols})
+    )
+    away_feat = (
+        joined.filter(pl.col("team") == pl.col("away_team"))
+        .select(["match_id"] + feature_cols)
+        .rename({c: f"away_{c}" for c in feature_cols})
+    )
+    return home_feat.join(away_feat, on="match_id", how="outer_coalesce")
+
+
+def _prepare_rolling_form(
+    matches: pl.DataFrame,
+    sorted_tournaments: list[Tournament],
+    per_tournament_probs: dict[str, pl.DataFrame],
+) -> list[str]:
+    """Compute rolling form features and join into each tournament frame, in-place.
+
+    Returns the list of home_*/away_* column names successfully added (empty on failure).
+    """
+
+    try:
+        from polymbappe.features.context import build_form_features
+
+        for tournament in sorted_tournaments:
+            if tournament.name not in per_tournament_probs:
+                continue
+            history = matches.filter(pl.col("date") < tournament.start)
+            fixtures = select_fixtures(matches, tournament)
+            if history.is_empty() or fixtures.is_empty():
+                continue
+            combined = pl.concat([history, fixtures], how="diagonal_relaxed")
+            form = build_form_features(combined)
+            pivot = _pivot_team_features(form, fixtures, _FORM_RAW_COLS)
+            if pivot.is_empty():
+                continue
+            per_tournament_probs[tournament.name] = per_tournament_probs[tournament.name].join(
+                pivot, on="match_id", how="left"
+            )
+
+        sample = next(iter(per_tournament_probs.values()))
+        return [c for c in _FORM_COLS if c in sample.columns]
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("backtest.form_skip", error=str(exc))
+        return []
+
+
+def _prepare_h2h(
+    matches: pl.DataFrame,
+    sorted_tournaments: list[Tournament],
+    per_tournament_probs: dict[str, pl.DataFrame],
+) -> list[str]:
+    """Compute H2H features and join into each tournament frame, in-place."""
+
+    try:
+        from polymbappe.features.context import build_h2h_features
+
+        for tournament in sorted_tournaments:
+            if tournament.name not in per_tournament_probs:
+                continue
+            history = matches.filter(pl.col("date") < tournament.start)
+            fixtures = select_fixtures(matches, tournament)
+            if history.is_empty() or fixtures.is_empty():
+                continue
+            combined = pl.concat([history, fixtures], how="diagonal_relaxed")
+            h2h = build_h2h_features(combined)
+            fixture_ids = set(fixtures["match_id"].to_list())
+            h2h_filt = h2h.filter(pl.col("match_id").is_in(fixture_ids))
+            if h2h_filt.is_empty():
+                continue
+            per_tournament_probs[tournament.name] = per_tournament_probs[tournament.name].join(
+                h2h_filt, on="match_id", how="left"
+            )
+
+        sample = next(iter(per_tournament_probs.values()))
+        return [c for c in _H2H_COLS if c in sample.columns]
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("backtest.h2h_skip", error=str(exc))
+        return []
+
+
+def _prepare_rest_days(
+    matches: pl.DataFrame,
+    sorted_tournaments: list[Tournament],
+    per_tournament_probs: dict[str, pl.DataFrame],
+) -> list[str]:
+    """Compute rest-days features and join into each tournament frame, in-place."""
+
+    try:
+        from polymbappe.features.context import build_rest_features
+
+        for tournament in sorted_tournaments:
+            if tournament.name not in per_tournament_probs:
+                continue
+            history = matches.filter(pl.col("date") < tournament.start)
+            fixtures = select_fixtures(matches, tournament)
+            if history.is_empty() or fixtures.is_empty():
+                continue
+            combined = pl.concat([history, fixtures], how="diagonal_relaxed")
+            rest = build_rest_features(combined)
+            pivot = _pivot_team_features(rest, fixtures, ["rest_days"])
+            if pivot.is_empty():
+                continue
+            per_tournament_probs[tournament.name] = per_tournament_probs[tournament.name].join(
+                pivot, on="match_id", how="left"
+            )
+
+        sample = next(iter(per_tournament_probs.values()))
+        return [c for c in _REST_COLS if c in sample.columns]
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("backtest.rest_skip", error=str(exc))
+        return []
+
+
 def run_leave_one_tournament_out(
     matches: pl.DataFrame,
     tournaments: tuple[Tournament, ...] = DEFAULT_TOURNAMENTS,
@@ -125,6 +261,9 @@ def run_leave_one_tournament_out(
     contextual_config: ContextualAdjusterConfig | None = None,
     market_odds: pl.DataFrame | None = None,
     squad_valuations: pl.DataFrame | None = None,
+    toggle_rolling_form: bool = True,
+    toggle_h2h: bool = True,
+    toggle_rest_days: bool = True,
 ) -> BacktestResult:
     """Run the leave-one-tournament-out backtest over the stacked ensemble.
 
@@ -199,11 +338,28 @@ def run_leave_one_tournament_out(
     if use_squad and gbm_cols is not None:
         gbm_cols = gbm_cols + _SQUAD_COLS
 
+    # Tier-1 backtestable features: rolling form, H2H, rest days. Each only has a path through
+    # the GBM (meta-learner sees base-group probs only), so they are no-ops when GBM is off.
+    tier1_cols: list[str] = []
+    if gbm_cols is not None:
+        if toggle_rolling_form:
+            tier1_cols += _prepare_rolling_form(matches, sorted_tournaments, per_tournament_probs)
+        if toggle_h2h:
+            tier1_cols += _prepare_h2h(matches, sorted_tournaments, per_tournament_probs)
+        if toggle_rest_days:
+            tier1_cols += _prepare_rest_days(matches, sorted_tournaments, per_tournament_probs)
+        if tier1_cols:
+            gbm_cols = gbm_cols + tier1_cols
+
     use_contextual, feature_groups = _prepare_contextual(
         matches, sorted_tournaments, per_tournament_probs, contextual_config
     )
 
-    reported_cols = feature_cols + (_SQUAD_COLS if (use_squad and gbm_cols is not None) else [])
+    reported_cols = (
+        feature_cols
+        + (_SQUAD_COLS if (use_squad and gbm_cols is not None) else [])
+        + tier1_cols
+    )
     result = BacktestResult(feature_columns=reported_cols)
     names = list(per_tournament_probs)
     for held_out in names:
@@ -229,6 +385,7 @@ def run_leave_one_tournament_out(
         meta=ensemble_config.meta.learner,
         gbm=ensemble_config.use_gbm,
         squad=use_squad and gbm_cols is not None,
+        tier1_extra=tier1_cols,
         contextual=use_contextual,
         tournaments=names,
     )

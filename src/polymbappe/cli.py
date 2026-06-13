@@ -70,7 +70,12 @@ def train_command(
 def simulate_command(
     tournament: int = 2026,
     n_sims: int = 50_000,
-    with_context: bool = False,
+    with_context: bool = typer.Option(
+        False, "--with-context", help="Apply adaptive contextual weights (from contextual-monitor --apply)."
+    ),
+    historical_context: bool = typer.Option(
+        False, "--historical-context", help="Diagnostic: use the historically-trained LightGBM adjuster instead of adaptive weights."
+    ),
     live: bool = False,
     refresh_odds: bool = typer.Option(
         False, "--refresh-odds", help="Re-pull market odds before computing edges (live updates)."
@@ -80,7 +85,11 @@ def simulate_command(
 
     _ = tournament
     run_tournament_simulation(
-        n_sims=n_sims, with_context=with_context, live=live, refresh_odds=refresh_odds
+        n_sims=n_sims,
+        with_context=with_context,
+        historical_context=historical_context,
+        live=live,
+        refresh_odds=refresh_odds,
     )
 
 
@@ -147,6 +156,103 @@ def autotune_command(
         leaderboard=leaderboard,
         apply_best=apply_best,
     )
+
+
+@app.command("contextual-monitor")
+def contextual_monitor_command(
+    apply: bool = typer.Option(False, "--apply", help="Write weights to file after testing."),
+    min_matches: int = typer.Option(32, "--min-matches", help="Skip if fewer completed WC2026 matches."),
+) -> None:
+    """Test contextual feature signals on live WC2026 results.
+
+    Runs a signal test for each contextual feature group (xg_overperformance, draw_pressure,
+    cohesion, manager, fatigue) to check whether it correlates with live WC2026 outcomes
+    beyond the base model. Gate: p < 0.05 AND RPS improvement > 0.003.
+
+    With --apply, saves passing weights to data/outputs/contextual_wc2026_weights.json so
+    the next ``simulate --with-context`` call picks them up automatically.
+    """
+
+    from polymbappe.config import Settings
+    from polymbappe.context.adaptive import (
+        MIN_MATCHES,
+        AdaptiveWeightState,
+        append_attribution,
+        compute_wc2026_base_predictions,
+        load_live_wc2026_matches,
+        run_all_signal_tests,
+        save_adaptive_weights,
+    )
+    from polymbappe.context.runtime import build_tournament_context_features
+    from polymbappe.data.store import read_table
+    from polymbappe.data.tables import Table
+
+    settings = Settings()
+    matches = read_table(Table.MATCHES, settings)
+
+    live = load_live_wc2026_matches(matches, settings)
+    n = live.height
+    gate = max(min_matches, MIN_MATCHES)
+
+    if n < gate:
+        typer.echo(f"Only {n} completed WC2026 matches (need {gate}). Run `ingest --live` to update.")
+        return
+
+    typer.echo(f"Testing contextual signals on {n} completed WC2026 matches...")
+
+    # Base predictions for the live fixtures
+    base_preds = compute_wc2026_base_predictions(live, matches, settings)
+
+    # Contextual features for those fixtures
+    from dataclasses import dataclass
+    from datetime import date as _date
+
+    @dataclass
+    class _WC2026Tournament:
+        name: str = "WC2026"
+        competition: str = "FIFA World Cup 2026"
+        start: _date = _date(2026, 6, 11)
+        end: _date = _date(2026, 7, 19)
+
+    ctx_df = build_tournament_context_features(matches, [_WC2026Tournament()], settings)
+    # Align context rows to live match order
+    live_ids = live["match_id"].to_list()
+    ctx_aligned = (
+        live.select("match_id")
+        .join(ctx_df, on="match_id", how="left")
+        .drop("match_id")
+    )
+
+    labels = live["label"].to_list() if "label" in live.columns else []
+    if not labels:
+        typer.echo("Live matches have no labels yet — no signal tests possible.")
+        return
+
+    results = run_all_signal_tests(labels, base_preds, ctx_aligned)
+    append_attribution(results, settings)
+
+    typer.echo(f"\n{'Group':<25} {'p-value':>10} {'RPS Δ':>10} {'Weight':>10} {'Active':>8}")
+    typer.echo("-" * 65)
+    for r in results:
+        marker = "✓" if r.active else " "
+        typer.echo(
+            f"{marker} {r.feature_group:<23} {r.p_value:>10.4f} {r.rps_delta:>10.4f}"
+            f" {r.weight:>10.4f} {str(r.active):>8}"
+        )
+
+    active_groups = [r.feature_group for r in results if r.active]
+    typer.echo(f"\nActive groups: {active_groups or 'none'}")
+
+    if apply:
+        state = AdaptiveWeightState(
+            weights={r.feature_group: r.weight for r in results},
+            n_matches=n,
+            last_updated=__import__("datetime").datetime.now().isoformat(),
+        )
+        path = save_adaptive_weights(state, settings)
+        typer.echo(f"Weights saved → {path}")
+    else:
+        typer.echo("\nRe-run with --apply to activate weights in simulation.")
 
 
 @app.command("agent")
