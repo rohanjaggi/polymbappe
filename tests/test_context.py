@@ -18,9 +18,14 @@ from polymbappe.context.draw_pressure import (
 )
 from polymbappe.context.fatigue import (
     add_fatigue_flag,
+    build_city_coord_lookup,
+    build_match_travel_features,
     build_season_load_features,
     build_travel_features,
+    build_travel_features_from_tables,
+    coord_lookup_from_venues,
     haversine_km,
+    schedule_to_appearances,
     venue_distance,
 )
 from polymbappe.context.manager import ManagerConfig, build_manager_features, shrink
@@ -402,3 +407,142 @@ def test_score_text_vader_graceful() -> None:
     # Returns a float in [-1, 1] whether or not vader is installed.
     val = score_text_vader(["great win", "terrible loss"])
     assert -1.0 <= val <= 1.0
+
+
+# -- travel features from ingested venues + schedule ---------------------------
+
+def _venues_frame() -> pl.DataFrame:
+    return pl.DataFrame(
+        {
+            "venue": ["Estadio Azteca", "SoFi Stadium", "MetLife Stadium"],
+            "city": [
+                "Mexico City",
+                "Los Angeles (Inglewood)",
+                "New York/New Jersey (East Rutherford)",
+            ],
+            "country": ["mx", "us", "us"],
+            "latitude": [19.3029, 33.953, 40.8135],
+            "longitude": [-99.1505, -118.339, -74.0744],
+        }
+    )
+
+
+def test_coord_lookup_from_venues_keys_full_and_bare() -> None:
+    coords = coord_lookup_from_venues(_venues_frame())
+    # Both the full host-city string (as the schedule uses) and the bare city resolve.
+    assert "Los Angeles (Inglewood)" in coords
+    assert "Los Angeles" in coords
+    assert coords["Los Angeles (Inglewood)"] == coords["Los Angeles"]
+    # venue_distance accepts the ingested lookup and matches its bare-name fallback.
+    d = venue_distance("Mexico City", "Los Angeles (Inglewood)", coords)
+    assert d is not None and d == pytest.approx(
+        venue_distance("Mexico City", "Los Angeles", coords)
+    )
+
+
+def test_schedule_to_appearances_explodes_home_and_away() -> None:
+    schedule = pl.DataFrame(
+        {
+            "match_id": ["m1"],
+            "date": [date(2026, 6, 11)],
+            "stage": ["Matchday 1"],
+            "group": ["A"],
+            "home_team": ["Mexico"],
+            "away_team": ["South Africa"],
+            "city": ["Mexico City"],
+        }
+    )
+    appearances = schedule_to_appearances(schedule)
+    assert appearances.columns == ["team", "date", "match_id", "venue"]
+    assert appearances.height == 2  # one row per side
+    assert set(appearances["team"].to_list()) == {"Mexico", "South Africa"}
+    assert appearances["venue"].to_list() == ["Mexico City", "Mexico City"]
+
+
+def test_build_travel_features_from_tables_uses_ingested_coords() -> None:
+    venues = _venues_frame()
+    schedule = pl.DataFrame(
+        {
+            "match_id": ["m1", "m2"],
+            "date": [date(2026, 6, 11), date(2026, 6, 17)],
+            "stage": ["Matchday 1", "Matchday 2"],
+            "group": ["A", "A"],
+            "home_team": ["Mexico", "Mexico"],
+            "away_team": ["South Africa", "Canada"],
+            "city": ["Mexico City", "Los Angeles (Inglewood)"],
+        }
+    )
+    travel = build_travel_features_from_tables(schedule, venues)
+    # Mexico's first appearance is 0; its Mexico City -> LA hop is ~2500 km.
+    mex = travel.filter(pl.col("team") == "Mexico").sort("match_id")
+    assert mex.filter(pl.col("match_id") == "m1")["travel_km"].item() == 0.0
+    assert mex.filter(pl.col("match_id") == "m2")["travel_km"].item() == pytest.approx(
+        2500.0, abs=150.0
+    )
+
+
+# -- historical travel backfill (GeoNames gazetteer) ---------------------------
+
+def _city_coords_frame() -> pl.DataFrame:
+    return pl.DataFrame(
+        {
+            "city": ["moscow", "moscow", "rio de janeiro", "sao paulo"],
+            "country": ["RU", "US", "BR", "BR"],
+            "latitude": [55.7522, 46.7324, -22.9111, -23.5475],
+            "longitude": [37.6156, -117.0002, -43.2056, -46.6361],
+            "population": [10381222, 25000, 6320446, 10021295],
+        }
+    )
+
+
+def test_build_city_coord_lookup_picks_highest_population() -> None:
+    coords = build_city_coord_lookup(_city_coords_frame())
+    # Moscow resolves to the RU entry (10M) over Idaho's (25k).
+    assert coords["moscow"] == pytest.approx((55.7522, 37.6156))
+    assert "sao paulo" in coords
+
+
+def test_build_match_travel_features_accent_folds_city() -> None:
+    coords = build_city_coord_lookup(_city_coords_frame())
+    matches = pl.DataFrame(
+        {
+            "match_id": ["m1", "m2"],
+            "date": [date(2014, 6, 12), date(2014, 6, 17)],
+            "home_team": ["Brazil", "Brazil"],
+            "away_team": ["Croatia", "Mexico"],
+            # Accented spellings must still resolve against the ASCII gazetteer.
+            "city": ["São Paulo", "Rio de Janeiro"],
+        }
+    )
+    travel = build_match_travel_features(matches, coords).filter(pl.col("team") == "Brazil")
+    by_match = {r["match_id"]: r["travel_km"] for r in travel.iter_rows(named=True)}
+    assert by_match["m1"] == 0.0  # first appearance
+    assert by_match["m2"] == pytest.approx(360.0, abs=60.0)  # São Paulo -> Rio ~360 km
+
+
+def test_context_features_carry_travel_from_gazetteer(tmp_path) -> None:
+    """With a city_coords table + city-bearing matches, the fatigue columns are nonzero."""
+
+    settings = Settings(data_dir=tmp_path)
+    write_table(Table.CITY_COORDS, _city_coords_frame(), settings=settings)
+    matches = pl.DataFrame(
+        {
+            "match_id": ["h0", "wc1", "wc2"],
+            "date": [date(2013, 6, 1), date(2014, 6, 12), date(2014, 6, 17)],
+            "home_team": ["Brazil", "Brazil", "Brazil"],
+            "away_team": ["Chile", "Croatia", "Mexico"],
+            "home_goals": [2, 3, 1],
+            "away_goals": [0, 1, 0],
+            "competition": ["Friendly", "FIFA World Cup", "FIFA World Cup"],
+            "is_knockout": [False, False, False],
+            "neutral_site": [False, False, False],
+            "group": [None, "A", "A"],
+            "city": ["Sao Paulo", "São Paulo", "Rio de Janeiro"],
+        }
+    )
+    tournaments = (Tournament("WC2014", "FIFA World Cup", date(2014, 6, 12), date(2014, 7, 13)),)
+    out = build_tournament_context_features(matches, tournaments, settings)
+    assert "home_travel_km" in out.columns and "away_travel_km" in out.columns
+    wc2 = out.filter(pl.col("match_id") == "wc2").row(0, named=True)
+    # Brazil (home) travelled São Paulo -> Rio between its two group games.
+    assert wc2["home_travel_km"] == pytest.approx(360.0, abs=60.0)

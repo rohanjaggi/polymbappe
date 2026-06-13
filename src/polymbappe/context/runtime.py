@@ -46,6 +46,8 @@ SIM_CONTEXT_FEATURES: tuple[str, ...] = (
     "away_knockout_win_rate",
     "home_deepest_run_weighted",
     "away_deepest_run_weighted",
+    "home_travel_km",
+    "away_travel_km",
 )
 
 #: Group -> columns mapping for the adjuster's toggle gating. ``cohesion`` / ``manager`` are
@@ -67,6 +69,7 @@ FEATURE_GROUPS: dict[str, list[str]] = {
         "home_deepest_run_weighted",
         "away_deepest_run_weighted",
     ],
+    "fatigue": ["home_travel_km", "away_travel_km"],
 }
 
 #: Minimum number of tournaments with non-zero data a group needs before the coverage gate
@@ -197,12 +200,17 @@ def fixture_feature_row(
     ctx: FixtureContext,
     *,
     is_knockout: bool = False,
+    home_travel_km: float = 0.0,
+    away_travel_km: float = 0.0,
 ) -> dict[str, float]:
     """Build the contextual feature row for one fixture from a :class:`FixtureContext`.
 
     Emits the :data:`SIM_CONTEXT_FEATURES` columns in their fixed order. Missing teams
     yield ``0.0`` explicitly (the adjuster also ``fill_null``s, but emitting 0.0 keeps the
-    schema dense).
+    schema dense). ``home/away_travel_km`` are per-fixture (not team-level, since travel
+    depends on the match sequence), so they are passed in by the caller — the fit assembly
+    geocodes them from the tournament schedule; callers without schedule data (the live
+    per-pair sim hook) pass 0.0.
     """
 
     gap = ctx.elo.get(home, 1500.0) - ctx.elo.get(away, 1500.0)
@@ -222,6 +230,8 @@ def fixture_feature_row(
         "away_knockout_win_rate": away_mgr.get("knockout_win_rate", 0.0),
         "home_deepest_run_weighted": home_mgr.get("deepest_run_weighted", 0.0),
         "away_deepest_run_weighted": away_mgr.get("deepest_run_weighted", 0.0),
+        "home_travel_km": float(home_travel_km),
+        "away_travel_km": float(away_travel_km),
     }
 
 
@@ -246,7 +256,7 @@ def gated_feature_groups(context_features: pl.DataFrame) -> dict[str, list[str]]
         if not present:
             continue
         # Always keep the always-available data-light groups; gate the ingestion-backed ones.
-        if group not in {"cohesion", "manager"}:
+        if group not in {"cohesion", "manager", "fatigue"}:
             gated[group] = cols
             continue
         nonzero_expr = pl.any_horizontal([pl.col(c) != 0.0 for c in present])
@@ -285,10 +295,14 @@ def build_tournament_context_features(
     :func:`gated_feature_groups` (the coverage gate).
     """
 
+    from polymbappe.context.fatigue import build_city_coord_lookup
     from polymbappe.eval.backtest import select_fixtures
     from polymbappe.features.elo import build_elo_snapshots
 
-    squads, records = _load_context_tables(settings)
+    squads, records, city_coords = _load_context_tables(settings)
+    travel_coords = (
+        build_city_coord_lookup(city_coords) if city_coords is not None else {}
+    )
 
     rows: list[dict[str, object]] = []
     for tournament in tournaments:  # type: ignore[attr-defined]
@@ -312,11 +326,20 @@ def build_tournament_context_features(
             cohesion=cohesion_lookup(squads, tournament) if squads is not None else {},
             manager=manager_lookup(records, tournament) if records is not None else {},
         )
+        # Per-(match, team) travel within this tournament's schedule (0.0 when the city
+        # column is absent or unresolved). Travel is the only per-fixture (not team-level)
+        # signal, so it is keyed by (match_id, team) and passed into the feature row.
+        travel = _tournament_travel(fixtures, travel_coords)
         for fx in fixtures.iter_rows(named=True):
-            feats = fixture_feature_row(fx["home_team"], fx["away_team"], ctx)
-            rows.append(
-                {"match_id": fx["match_id"], "tournament": tournament.name, **feats}
+            mid = fx["match_id"]
+            feats = fixture_feature_row(
+                fx["home_team"],
+                fx["away_team"],
+                ctx,
+                home_travel_km=travel.get((mid, fx["home_team"]), 0.0),
+                away_travel_km=travel.get((mid, fx["away_team"]), 0.0),
             )
+            rows.append({"match_id": mid, "tournament": tournament.name, **feats})
     cols = {
         "match_id": pl.Utf8,
         "tournament": pl.Utf8,
@@ -332,27 +355,47 @@ def build_tournament_context_features(
     return frame.drop("tournament")
 
 
+def _tournament_travel(
+    fixtures: pl.DataFrame, coords: dict[str, tuple[float, float]]
+) -> dict[tuple[str, str], float]:
+    """``(match_id, team) -> travel_km`` for one tournament's fixtures (empty when no coords).
+
+    Travel is geocoded from each fixture's ``city`` against the lower-cased ``coords``
+    gazetteer; absent ``city`` column or an empty gazetteer yields no travel (all 0.0 via the
+    caller's ``.get`` default), so this degrades gracefully on match frames built without
+    venue data (most unit-test frames).
+    """
+
+    from polymbappe.context.fatigue import build_match_travel_features
+
+    if not coords or "city" not in fixtures.columns:
+        return {}
+    travel = build_match_travel_features(fixtures, coords)
+    return {
+        (r["match_id"], r["team"]): float(r["travel_km"])
+        for r in travel.iter_rows(named=True)
+    }
+
+
 def _load_context_tables(
     settings: object | None,
-) -> tuple[pl.DataFrame | None, pl.DataFrame | None]:
-    """Read the ``squads`` / ``manager_records`` tables when materialized, else ``None``."""
+) -> tuple[pl.DataFrame | None, pl.DataFrame | None, pl.DataFrame | None]:
+    """Read the ``squads`` / ``manager_records`` / ``city_coords`` tables, else ``None`` each."""
 
     try:
         from polymbappe.config import Settings
         from polymbappe.data.store import read_table, table_exists
         from polymbappe.data.tables import Table
     except Exception:  # noqa: BLE001 - data layer optional in minimal test contexts
-        return None, None
+        return None, None, None
 
     resolved = settings if settings is not None else Settings()
-    squads = (
-        read_table(Table.SQUADS, resolved)  # type: ignore[arg-type]
-        if table_exists(Table.SQUADS, resolved)  # type: ignore[arg-type]
-        else None
-    )
-    records = (
-        read_table(Table.MANAGER_RECORDS, resolved)  # type: ignore[arg-type]
-        if table_exists(Table.MANAGER_RECORDS, resolved)  # type: ignore[arg-type]
-        else None
-    )
-    return squads, records
+
+    def _maybe(table: Table) -> pl.DataFrame | None:
+        return (
+            read_table(table, resolved)  # type: ignore[arg-type]
+            if table_exists(table, resolved)  # type: ignore[arg-type]
+            else None
+        )
+
+    return _maybe(Table.SQUADS), _maybe(Table.MANAGER_RECORDS), _maybe(Table.CITY_COORDS)

@@ -23,8 +23,11 @@ from polymbappe.config import Settings
 from polymbappe.data import sources
 from polymbappe.data.aliases import normalize_team_expr
 from polymbappe.data.normalize import (
+    normalize_geonames_cities,
     normalize_kaggle_results,
     normalize_odds_frame,
+    normalize_openfootball_schedule,
+    normalize_openfootball_stadiums,
     normalize_player_attributes,
     statsbomb_team_match_ppda,
     statsbomb_team_match_xg,
@@ -493,6 +496,150 @@ def ingest_ppda(settings: Settings | None = None, *, live: bool = False) -> int:
     write_table(Table.TEAM_PPDA, frame, mode="overwrite", settings=settings)
     logger.info("ingest.ppda.stored", rows=frame.height, source="statsbomb")
     return frame.height
+
+
+def ingest_venues(settings: Settings | None = None) -> int:
+    """Ingest tournament venue coordinates into the ``venues`` table.
+
+    Prefers ``data/raw/venues.csv`` (reproducible, offline) whose columns equal
+    ``TABLE_COLUMNS[Table.VENUES]`` (``venue, city, country, latitude, longitude``); else
+    fetches the openfootball 2026 stadiums feed
+    (:func:`~polymbappe.data.sources.fetch_openfootball_stadiums`) and parses each venue's
+    coordinates. ``city`` is the openfootball host-city string kept verbatim so it joins the
+    ``schedule`` table's ``city`` and the travel-feature coordinate lookup
+    (:func:`~polymbappe.context.fatigue.coord_lookup_from_venues`). This replaces the static
+    16-city coordinate table that the travel feature previously hard-coded.
+
+    Skips (returns 0) when the local file is absent AND the feed yields nothing.
+    """
+
+    settings = settings or Settings()
+    required = set(TABLE_COLUMNS[Table.VENUES])
+    local = settings.raw_data_dir / "venues.csv"
+    if local.exists():
+        raw = pl.read_csv(io.BytesIO(local.read_bytes()))
+        missing = required - set(raw.columns)
+        if missing:
+            raise ValueError(f"venues.csv missing columns: {sorted(missing)}")
+        normalized = raw.select(
+            pl.col("venue").cast(pl.Utf8),
+            pl.col("city").cast(pl.Utf8),
+            pl.col("country").cast(pl.Utf8),
+            pl.col("latitude").cast(pl.Float64),
+            pl.col("longitude").cast(pl.Float64),
+        ).select(TABLE_COLUMNS[Table.VENUES])
+        logger.info("ingest.venues.local", path=str(local), rows=normalized.height)
+    else:
+        stadiums = sources.fetch_openfootball_stadiums(settings=settings)
+        normalized = normalize_openfootball_stadiums(stadiums)
+        if normalized.is_empty():
+            logger.info(
+                "ingest.venues.skip", reason="no data/raw/venues.csv and openfootball empty"
+            )
+            return 0
+        logger.info("ingest.venues.fetched", rows=normalized.height)
+
+    write_table(Table.VENUES, normalized, mode="overwrite", settings=settings)
+    logger.info("ingest.venues.stored", rows=normalized.height)
+    return normalized.height
+
+
+def ingest_city_coords(
+    settings: Settings | None = None, *, dataset: str = "cities15000"
+) -> int:
+    """Ingest the GeoNames city gazetteer into the ``city_coords`` table.
+
+    Prefers ``data/raw/city_coords.csv`` (reproducible, offline) whose columns equal
+    ``TABLE_COLUMNS[Table.CITY_COORDS]``; else downloads the GeoNames ``{dataset}`` dump
+    (:func:`~polymbappe.data.sources.fetch_geonames_cities`) and normalizes it to one
+    lower-cased ``(city, country)`` alias row per coordinate. This is the geocoding backbone
+    that resolves each historical match's ``city`` to coordinates for the travel-distance
+    backfill (:func:`~polymbappe.context.fatigue.build_city_coord_lookup`).
+
+    Skips (returns 0) when the local file is absent AND the download yields nothing.
+    """
+
+    settings = settings or Settings()
+    required = set(TABLE_COLUMNS[Table.CITY_COORDS])
+    local = settings.raw_data_dir / "city_coords.csv"
+    if local.exists():
+        raw = pl.read_csv(io.BytesIO(local.read_bytes()))
+        missing = required - set(raw.columns)
+        if missing:
+            raise ValueError(f"city_coords.csv missing columns: {sorted(missing)}")
+        normalized = raw.select(
+            pl.col("city").cast(pl.Utf8).str.to_lowercase(),
+            pl.col("country").cast(pl.Utf8),
+            pl.col("latitude").cast(pl.Float64),
+            pl.col("longitude").cast(pl.Float64),
+            pl.col("population").cast(pl.Int64),
+        ).select(TABLE_COLUMNS[Table.CITY_COORDS])
+        logger.info("ingest.city_coords.local", path=str(local), rows=normalized.height)
+    else:
+        raw = sources.fetch_geonames_cities(dataset, settings=settings)
+        normalized = normalize_geonames_cities(raw)
+        if normalized.is_empty():
+            logger.info(
+                "ingest.city_coords.skip",
+                reason="no data/raw/city_coords.csv and GeoNames empty",
+            )
+            return 0
+        logger.info("ingest.city_coords.fetched", rows=normalized.height, dataset=dataset)
+
+    write_table(Table.CITY_COORDS, normalized, mode="overwrite", settings=settings)
+    logger.info("ingest.city_coords.stored", rows=normalized.height)
+    return normalized.height
+
+
+def ingest_schedule(settings: Settings | None = None) -> int:
+    """Ingest the tournament match schedule into the ``schedule`` table.
+
+    Prefers ``data/raw/schedule.csv`` (reproducible, offline) whose columns equal
+    ``TABLE_COLUMNS[Table.SCHEDULE]``; else fetches the openfootball 2026 fixtures feed
+    (:func:`~polymbappe.data.sources.fetch_openfootball_schedule`) and normalizes it via
+    :func:`~polymbappe.data.normalize.normalize_openfootball_schedule`. Either way ``team``
+    columns are canonicalized via :func:`normalize_team_expr` and ``match_id`` is rebuilt on
+    the shared ``date__home__away`` convention so group-stage fixtures join the matches / Elo
+    tables; ``city`` joins the ``venues`` table. Feeds the travel-distance feature
+    (:func:`~polymbappe.context.fatigue.schedule_to_appearances`).
+
+    Skips (returns 0) when the local file is absent AND the feed yields nothing.
+    """
+
+    settings = settings or Settings()
+    required = set(TABLE_COLUMNS[Table.SCHEDULE])
+    local = settings.raw_data_dir / "schedule.csv"
+    if local.exists():
+        raw = pl.read_csv(io.BytesIO(local.read_bytes()))
+        missing = required - set(raw.columns)
+        if missing:
+            raise ValueError(f"schedule.csv missing columns: {sorted(missing)}")
+        normalized = raw.with_columns(
+            pl.col("date").cast(pl.Utf8).str.to_date(strict=False).alias("date"),
+            pl.col("stage").cast(pl.Utf8),
+            pl.col("group").cast(pl.Utf8),
+            normalize_team_expr("home_team").alias("home_team"),
+            normalize_team_expr("away_team").alias("away_team"),
+            pl.col("city").cast(pl.Utf8),
+        ).with_columns(
+            pl.format("{}__{}__{}", pl.col("date"), pl.col("home_team"), pl.col("away_team"))
+            .alias("match_id")
+        ).select(TABLE_COLUMNS[Table.SCHEDULE])
+        logger.info("ingest.schedule.local", path=str(local), rows=normalized.height)
+    else:
+        matches = sources.fetch_openfootball_schedule(settings=settings)
+        normalized = normalize_openfootball_schedule(matches)
+        if normalized.is_empty():
+            logger.info(
+                "ingest.schedule.skip",
+                reason="no data/raw/schedule.csv and openfootball empty",
+            )
+            return 0
+        logger.info("ingest.schedule.fetched", rows=normalized.height)
+
+    write_table(Table.SCHEDULE, normalized, mode="overwrite", settings=settings)
+    logger.info("ingest.schedule.stored", rows=normalized.height)
+    return normalized.height
 
 
 def ingest_squads(settings: Settings | None = None) -> int:
@@ -1310,6 +1457,9 @@ def ingest_all_sources(live: bool = False, settings: Settings | None = None) -> 
         ("market_odds", ingest_market_odds, True),
         ("team_xg", ingest_team_xg, True),
         ("team_ppda", ingest_ppda, True),
+        ("venues", ingest_venues, False),
+        ("schedule", ingest_schedule, False),
+        ("city_coords", ingest_city_coords, False),
         ("squads", ingest_squads, False),
         ("squad_valuations", ingest_squad_valuations, False),
         ("player_attributes", ingest_player_attributes, False),
@@ -1328,6 +1478,10 @@ def ingest_all_sources(live: bool = False, settings: Settings | None = None) -> 
     # runs in live mode; offline runs without a local CSV record `0`. StatsBomb open data is
     # historical (released after a tournament) — the live 2026 feed is a separate TODO (see
     # `sources.fetch_statsbomb_events` and the live-xg note beneath it).
+    #
+    # venues/schedule/city_coords prefer a local CSV and fall back to a cached fetch
+    # (openfootball for venues/schedule; GeoNames for the city gazetteer), so they are safe to
+    # run by default: an absent local file + empty fetch records `0` rather than failing.
 
     logger.info("ingest.done", report=report)
     return report

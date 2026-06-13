@@ -8,9 +8,13 @@ from polymbappe.data.normalize import (
     implied_probabilities,
     infer_knockout_stage,
     make_match_id,
+    normalize_geonames_cities,
     normalize_kaggle_results,
     normalize_odds_frame,
+    normalize_openfootball_schedule,
+    normalize_openfootball_stadiums,
     parse_eloratings,
+    parse_geo_coords,
     slugify,
 )
 from polymbappe.data.tables import TABLE_COLUMNS, Table
@@ -259,3 +263,144 @@ def test_parse_market_outcomes_handles_json_arrays() -> None:
     }
     # Mismatched lengths -> empty.
     assert parse_market_outcomes({"outcomes": '["Yes"]', "outcomePrices": '["0.1","0.9"]'}) == []
+
+
+# -- openfootball venues + schedule --------------------------------------------
+
+def test_parse_geo_coords_dms_and_decimal() -> None:
+    # DMS form (Vancouver, BC Place) -> ~(49.277, -123.112).
+    lat, lon = parse_geo_coords("49°16'36\"N 123°6'43\"W")
+    assert lat is not None and lon is not None
+    assert lat == pytest.approx(49.2767, abs=1e-3)
+    assert lon == pytest.approx(-123.1119, abs=1e-3)
+
+    # Decimal-degree form (Levi's Stadium).
+    assert parse_geo_coords("37.403°N 121.970°W") == pytest.approx((37.403, -121.97))
+
+    # DMS with a decimal seconds component (MetLife Stadium).
+    lat, lon = parse_geo_coords("40°48'48.7\"N 74°4'27.7\"W")
+    assert lat == pytest.approx(40.8135, abs=1e-3)
+    assert lon == pytest.approx(-74.0744, abs=1e-3)
+
+    # Unparseable / empty -> (None, None).
+    assert parse_geo_coords(None) == (None, None)
+    assert parse_geo_coords("not coords") == (None, None)
+
+
+def test_normalize_openfootball_stadiums() -> None:
+    stadiums = [
+        {"city": "Mexico City", "cc": "mx", "name": "Estadio Azteca",
+         "coords": "19°18'11\"N 99°09'02\"W"},
+        {"city": "Los Angeles (Inglewood)", "cc": "us", "name": "SoFi Stadium",
+         "coords": "33.953°N 118.339°W"},
+        # Unparseable coords -> dropped.
+        {"city": "Nowhere", "cc": "us", "name": "Ghost Stadium", "coords": ""},
+    ]
+    venues = normalize_openfootball_stadiums(stadiums)
+    assert venues.columns == list(TABLE_COLUMNS[Table.VENUES])
+    assert venues.height == 2  # the coordless venue is dropped
+    azteca = venues.filter(pl.col("venue") == "Estadio Azteca").row(0, named=True)
+    assert azteca["city"] == "Mexico City"  # host-city string kept verbatim
+    assert azteca["country"] == "mx"
+    assert azteca["latitude"] == pytest.approx(19.303, abs=1e-2)
+    # The district qualifier is preserved so the schedule's ground joins it.
+    assert "Los Angeles (Inglewood)" in venues["city"].to_list()
+
+
+def test_normalize_openfootball_schedule() -> None:
+    matches = [
+        {"round": "Matchday 1", "date": "2026-06-11", "team1": "Mexico",
+         "team2": "South Africa", "group": "Group A", "ground": "Mexico City"},
+        # Knockout fixture: no group, bracket placeholders pass through.
+        {"round": "Round of 32", "date": "2026-06-28", "team1": "2A", "team2": "2B",
+         "ground": "Los Angeles (Inglewood)"},
+        # Missing date -> dropped.
+        {"round": "Matchday 1", "date": "", "team1": "Brazil", "team2": "Haiti",
+         "group": "Group C", "ground": "Atlanta"},
+    ]
+    sched = normalize_openfootball_schedule(matches)
+    assert sched.columns == list(TABLE_COLUMNS[Table.SCHEDULE])
+    assert sched.height == 2  # the dateless row is dropped
+
+    md1 = sched.filter(pl.col("stage") == "Matchday 1").row(0, named=True)
+    assert md1["group"] == "A"  # "Group " prefix stripped
+    assert md1["date"] == date(2026, 6, 11)
+    assert md1["city"] == "Mexico City"
+    assert md1["match_id"] == "2026-06-11__Mexico__South Africa"  # date__home__away
+
+    ko = sched.filter(pl.col("stage") == "Round of 32").row(0, named=True)
+    assert ko["group"] is None
+    assert ko["home_team"] == "2A" and ko["away_team"] == "2B"
+
+
+def test_normalize_openfootball_schedule_empty() -> None:
+    empty = normalize_openfootball_schedule([])
+    assert empty.columns == list(TABLE_COLUMNS[Table.SCHEDULE])
+    assert empty.height == 0
+
+
+# -- GeoNames city gazetteer ---------------------------------------------------
+
+def _geonames_raw() -> pl.DataFrame:
+    cols = (
+        "geonameid name asciiname alternatenames latitude longitude feature_class "
+        "feature_code country_code cc2 admin1_code admin2_code admin3_code admin4_code "
+        "population elevation dem timezone modification_date"
+    ).split()
+    rows = [
+        # Moscow RU (big) and Moscow US/Idaho (small) -> RU wins the bare name.
+        ["1", "Moscow", "Moscow", "Moskva,Moscow", "55.7522", "37.6156", "P", "PPLC",
+         "RU", "", "", "", "", "", "10381222", "", "", "", ""],
+        ["2", "Moscow", "Moscow", "", "46.7324", "-117.0002", "P", "PPL", "US", "", "",
+         "", "", "", "25000", "", "", "", ""],
+        # München: accented name dropped by the Latin filter, but asciiname + "Munich"
+        # alternatename survive.
+        ["3", "München", "Munchen", "Munich,Muenchen,Москва-нет", "48.1374", "11.5755",
+         "P", "PPLA", "DE", "", "", "", "", "", "1488202", "", "", "", ""],
+    ]
+    return pl.DataFrame(
+        {c: [r[i] for r in rows] for i, c in enumerate(cols)}
+    )
+
+
+def test_normalize_geonames_cities_aliases_and_population() -> None:
+    g = normalize_geonames_cities(_geonames_raw())
+    assert g.columns == list(TABLE_COLUMNS[Table.CITY_COORDS])
+    # Keys are lower-cased; both Moscow entries kept (distinct countries).
+    cities = set(g["city"].to_list())
+    assert "moscow" in cities
+    assert "munich" in cities  # English alternatename resolved
+    assert "munchen" in cities  # asciiname resolved
+    # Non-Latin alternatename was filtered out.
+    assert all(c.isascii() for c in cities)
+    # The RU Moscow (higher population) is retained for the RU row.
+    ru = g.filter((pl.col("city") == "moscow") & (pl.col("country") == "RU")).row(0, named=True)
+    assert ru["latitude"] == pytest.approx(55.7522)
+    assert ru["population"] == 10381222
+
+
+def test_normalize_geonames_cities_empty() -> None:
+    empty = normalize_geonames_cities(pl.DataFrame())
+    assert empty.columns == list(TABLE_COLUMNS[Table.CITY_COORDS])
+    assert empty.height == 0
+
+
+def test_normalize_kaggle_results_preserves_city_country() -> None:
+    raw = pl.DataFrame(
+        {
+            "date": ["2014-06-12"],
+            "home_team": ["Brazil"],
+            "away_team": ["Croatia"],
+            "home_score": [3],
+            "away_score": [1],
+            "tournament": ["FIFA World Cup"],
+            "city": ["São Paulo"],
+            "country": ["Brazil"],
+            "neutral": [False],
+        }
+    )
+    out = normalize_kaggle_results(raw)
+    assert "city" in out.columns and "country" in out.columns
+    row = out.row(0, named=True)
+    assert row["city"] == "São Paulo"  # kept verbatim (accent-folded only at lookup time)
+    assert row["country"] == "Brazil"
