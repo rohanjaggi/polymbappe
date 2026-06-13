@@ -85,6 +85,8 @@ core pipeline.
 | `polymarket_query.txt` *(tracked)* | Polymarket market slug filter | one slug, e.g. `fifa-world-cup-2026` |
 | `player_attributes_kaggle.txt` *(tracked)* | Kaggle dataset for player attributes | dataset slug + optional `file=` line |
 | `player_attributes.csv` | local player attributes (skips Kaggle) | `team,player,overall` |
+| `squad_valuations_kaggle.txt` *(tracked)* | Kaggle dataset for offline Transfermarkt squad values | dataset slug |
+| `squad_valuations.csv` | local squad valuations (skips Kaggle/scrape) | `team,tournament,total_value,median_value,player_count` |
 | `football_data_urls.txt` | Football-Data.co.uk bookmaker odds | one CSV URL per line (`#` comments ok) |
 | `football_data/*.csv` | local Football-Data.co.uk odds | raw Football-Data CSVs |
 | `squads_manifest.csv` | per-team Transfermarkt squad pages | `tournament,team[,tm_id,saison_id,url,wiki_page]` |
@@ -136,12 +138,26 @@ export KAGGLE_USERNAME=your_username KAGGLE_KEY=your_key
 
 To skip Kaggle entirely, drop `data/raw/player_attributes.csv` (`team,player,overall`).
 
-### Squads & squad valuations (Transfermarkt / Wikipedia)
+### Squads (Transfermarkt / Wikipedia)
 No credentials — uses built-in browser headers and an on-disk HTTP cache
 (`data/raw/.http_cache`). Transfermarkt is anti-bot-sensitive and self-throttled.
 An optional `data/raw/squads_manifest.csv` pins each team's Transfermarkt page
 (`tm_id`/`url`); without it, ingest falls back to the per-tournament Wikipedia
 "squads" pages. Runs as part of `polymbappe ingest`.
+
+### Squad valuations (offline Transfermarkt via Kaggle)
+Per-team squad market value (Tier-1 `squad_value_ratio` feature). Live Transfermarkt
+kader pages are hard-blocked (AWS WAF / HTTP 405), so values come from the
+auto-refreshed (`~weekly`) `davidcariboo/player-scores` Kaggle mirror of Transfermarkt's
+own valuation history, configured in `data/raw/squad_valuations_kaggle.txt` (public,
+downloads anonymously; needs the `kaggle` extra). Dated player values are joined onto the
+ingested `squads` rosters by accent-folded name + citizenship and selected **point-in-time**
+(latest value on/before each tournament's start date). Ingest the `squads` table first.
+
+Source priority: `data/raw/squad_valuations.csv` (offline override) → Kaggle values
+joined onto rosters → the live Transfermarkt scrape (best-effort, blocked in practice).
+Match quality is logged (`ingest.squad_valuations.kaggle`, `matched/total`); for any team
+where name-matching is poor, drop a `squad_valuations.csv` to override.
 
 ### Team xG & PPDA (StatsBomb Open Data)
 Real xG and zonal PPDA are derived from StatsBomb's free event data (pinned

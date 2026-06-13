@@ -28,6 +28,10 @@ dixon_coles:
 features:
   elo_k_factor: {type: float, low: 10.0, high: 40.0}
   draw_max: {type: float, low: 0.20, high: 0.32}
+  # Tier-1 squad market-value ratio (offline Transfermarkt values, ingest_squad_valuations).
+  # Stacked into the GBM, so it only bites when gbm.enable is true; the toggle lets TPE measure
+  # its RPS contribution. Inert (no-op) when the squad_valuations table is absent.
+  toggle_squad_value: {type: categorical, choices: [true, false]}
 
 gbm:
   # GBM stacks over the base-model H/D/A outputs; `enable` lets TPE switch the layer in/out.

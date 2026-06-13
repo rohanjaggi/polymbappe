@@ -142,6 +142,87 @@ def test_backtest_full_stack_gbm_and_contextual() -> None:
     assert np.isfinite(result.mean_rps)
 
 
+def _squad_valuations_for(tournaments) -> pl.DataFrame:
+    """Per-(team, tournament) squad values, monotonically increasing A>B>C>D."""
+
+    rows: list[dict[str, object]] = []
+    for t in tournaments:
+        for mult, team in enumerate(reversed(TEAMS), start=1):
+            rows.append(
+                {
+                    "team": team, "tournament": t.name,
+                    "total_value": float(mult * 100_000_000),
+                    "median_value": float(mult * 5_000_000),
+                    "player_count": 23,
+                }
+            )
+    return pl.DataFrame(rows)
+
+
+def test_squad_value_ratio_is_point_in_time() -> None:
+    """``_squad_value_ratio`` emits home−away log values per fixture, only when both sides
+    have that tournament's snapshot."""
+
+    import math
+
+    from polymbappe.eval.backtest import _squad_value_ratio
+
+    matches = _make_matches()
+    ratio = _squad_value_ratio(matches, _squad_valuations_for(TOURNAMENTS), TOURNAMENTS)
+    assert ratio.columns == ["match_id", "squad_value_ratio"]
+    assert not ratio.is_empty()
+    # A (total 400M) at home vs D (total 100M): log1p(400M) - log1p(100M) > 0.
+    wc16 = select_fixtures(matches, TOURNAMENTS[0])
+    a_vs_d = wc16.filter((pl.col("home_team") == "A") & (pl.col("away_team") == "D")).row(
+        0, named=True
+    )
+    val = ratio.filter(pl.col("match_id") == a_vs_d["match_id"]).row(0, named=True)
+    assert val["squad_value_ratio"] == math.log1p(400_000_000.0) - math.log1p(100_000_000.0)
+    assert val["squad_value_ratio"] > 0
+
+
+def test_backtest_squad_value_wires_into_gbm() -> None:
+    """squad_valuations stacks squad_value_ratio into the backtest GBM (autotuner path):
+    it appears in feature_columns when the GBM is on, and is absent when toggled off."""
+
+    matches = _make_matches()
+    valuations = _squad_valuations_for(TOURNAMENTS)
+    configs = config_to_configs({"gbm.enable": True})
+
+    with_squad = run_leave_one_tournament_out(
+        matches, TOURNAMENTS, base_config=configs.base,
+        ensemble_config=configs.ensemble, squad_valuations=valuations,
+    )
+    assert "squad_value_ratio" in with_squad.feature_columns
+    assert np.isfinite(with_squad.mean_rps)
+
+    # No valuations -> feature absent (the dead-data baseline).
+    without = run_leave_one_tournament_out(
+        matches, TOURNAMENTS, base_config=configs.base, ensemble_config=configs.ensemble,
+    )
+    assert "squad_value_ratio" not in without.feature_columns
+
+
+def test_objective_toggle_squad_value_off_drops_feature() -> None:
+    """``features.toggle_squad_value=false`` makes the objective pass no squad data, so the
+    feature stays out even when valuations are available."""
+
+    from polymbappe.tune.objective import config_to_metrics
+
+    matches = _make_matches()
+    valuations = _squad_valuations_for(TOURNAMENTS)
+    off = config_to_metrics(
+        {"gbm.enable": True, "features.toggle_squad_value": False},
+        matches, tournaments=TOURNAMENTS, squad_valuations=valuations,
+    )
+    assert "squad_value_ratio" not in off.feature_columns
+    on = config_to_metrics(
+        {"gbm.enable": True, "features.toggle_squad_value": True},
+        matches, tournaments=TOURNAMENTS, squad_valuations=valuations,
+    )
+    assert "squad_value_ratio" in on.feature_columns
+
+
 def _write_backtest_context_tables(settings) -> None:
     """Squads + manager records for the three backtest tournaments (every team)."""
 

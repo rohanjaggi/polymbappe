@@ -30,6 +30,8 @@ _DC_COLS = ["dc_home", "dc_draw", "dc_away"]
 _BAY_COLS = ["bay_home", "bay_draw", "bay_away"]
 _ELO_COLS = ["elo_home", "elo_draw", "elo_away"]
 _MKT_COLS = ["mkt_home", "mkt_draw", "mkt_away"]
+#: Tier-1 squad-value core feature stacked into the GBM (mirrors train._attach_core_features).
+_SQUAD_COLS = ["squad_value_ratio"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -122,6 +124,7 @@ def run_leave_one_tournament_out(
     ensemble_config: EnsembleConfig | None = None,
     contextual_config: ContextualAdjusterConfig | None = None,
     market_odds: pl.DataFrame | None = None,
+    squad_valuations: pl.DataFrame | None = None,
 ) -> BacktestResult:
     """Run the leave-one-tournament-out backtest over the stacked ensemble.
 
@@ -189,11 +192,19 @@ def run_leave_one_tournament_out(
     ensemble_config = replace(ensemble_config, base_groups=base_groups, market_blind=False)
     gbm_cols = feature_cols if ensemble_config.use_gbm else None
 
+    # Stack the Tier-1 squad-value ratio into the GBM (mirrors train._attach_core_features) when
+    # valuations are supplied. It is a continuous core feature, so it only has a path through the
+    # GBM — with the GBM off it cannot enter (the meta-learner sees base-group probs only).
+    use_squad = _prepare_squad(matches, sorted_tournaments, per_tournament_probs, squad_valuations)
+    if use_squad and gbm_cols is not None:
+        gbm_cols = gbm_cols + _SQUAD_COLS
+
     use_contextual, feature_groups = _prepare_contextual(
         matches, sorted_tournaments, per_tournament_probs, contextual_config
     )
 
-    result = BacktestResult(feature_columns=feature_cols)
+    reported_cols = feature_cols + (_SQUAD_COLS if (use_squad and gbm_cols is not None) else [])
+    result = BacktestResult(feature_columns=reported_cols)
     names = list(per_tournament_probs)
     for held_out in names:
         train = pl.concat(
@@ -214,13 +225,72 @@ def run_leave_one_tournament_out(
     logger.info(
         "backtest.done",
         mean_rps=round(result.mean_rps, 4),
-        features=feature_cols,
+        features=reported_cols,
         meta=ensemble_config.meta.learner,
         gbm=ensemble_config.use_gbm,
+        squad=use_squad and gbm_cols is not None,
         contextual=use_contextual,
         tournaments=names,
     )
     return result
+
+
+def _squad_value_ratio(
+    matches: pl.DataFrame,
+    valuations: pl.DataFrame,
+    tournaments: tuple[Tournament, ...],
+) -> pl.DataFrame:
+    """Per-match ``squad_value_ratio`` (= home_log_value − away_log_value), point-in-time.
+
+    Mirrors :func:`~polymbappe.features.pipeline.FeaturePipeline.build_core_matrix`'s squad
+    derivation but emits one ``(match_id, squad_value_ratio)`` row per fixture instead of the
+    home/away team-table form. Each fixture uses *its own* tournament's snapshot (leakage-safe);
+    only fixtures where both teams have a snapshot value get a row (others stay null on join).
+    """
+
+    from polymbappe.features.squad import build_squad_features
+
+    per_team = build_squad_features(valuations)
+    rows: list[dict[str, object]] = []
+    for tournament in tournaments:
+        snapshot = per_team.filter(pl.col("tournament") == tournament.name)
+        if snapshot.is_empty():
+            continue
+        fixtures = select_fixtures(matches, tournament)
+        if fixtures.is_empty():
+            continue
+        value = {r["team"]: r["log_total_value"] for r in snapshot.iter_rows(named=True)}
+        for fx in fixtures.iter_rows(named=True):
+            home, away = value.get(fx["home_team"]), value.get(fx["away_team"])
+            if home is not None and away is not None:
+                rows.append({"match_id": fx["match_id"], "squad_value_ratio": home - away})
+    return pl.DataFrame(rows, schema={"match_id": pl.Utf8, "squad_value_ratio": pl.Float64})
+
+
+def _prepare_squad(
+    matches: pl.DataFrame,
+    sorted_tournaments: list[Tournament],
+    per_tournament_probs: dict[str, pl.DataFrame],
+    squad_valuations: pl.DataFrame | None,
+) -> bool:
+    """Join ``squad_value_ratio`` into each tournament frame by ``match_id``, in-place.
+
+    Returns False (leaving frames untouched) when no valuations are supplied or none of the
+    fixtures can be valued; never fatal — a failure degrades to "no squad feature".
+    """
+
+    if squad_valuations is None or squad_valuations.is_empty():
+        return False
+    try:
+        ratio = _squad_value_ratio(matches, squad_valuations, tuple(sorted_tournaments))
+        if ratio.is_empty():
+            return False
+        for name, df in per_tournament_probs.items():
+            per_tournament_probs[name] = df.join(ratio, on="match_id", how="left")
+        return True
+    except Exception as exc:  # noqa: BLE001 - squad feature is optional, never fatal
+        logger.warning("backtest.squad_skip", error=str(exc))
+        return False
 
 
 def _prepare_contextual(
@@ -266,7 +336,14 @@ def run_walk_forward_backtest() -> None:
         if table_exists(Table.MARKET_ODDS, settings)
         else None
     )
-    result = run_leave_one_tournament_out(matches, market_odds=market_odds)
+    squad_valuations = (
+        read_table(Table.SQUAD_VALUATIONS, settings)
+        if table_exists(Table.SQUAD_VALUATIONS, settings)
+        else None
+    )
+    result = run_leave_one_tournament_out(
+        matches, market_odds=market_odds, squad_valuations=squad_valuations
+    )
     print(f"Features: {', '.join(result.feature_columns)}")
     print(result.to_frame().sort("tournament"))
     print(f"Mean RPS: {result.mean_rps:.4f}")

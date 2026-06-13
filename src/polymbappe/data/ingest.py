@@ -597,19 +597,126 @@ def _scrape_one_squad(
     return rows
 
 
+def _player_name_key(col: str) -> pl.Expr:
+    """Accent-folded, lowercased, punctuation-collapsed name key for cross-source joins.
+
+    National-team rosters (Wikipedia) and the Kaggle valuation dump spell names with
+    different accents/punctuation/casing ("Anže Šemrl" vs "Anze Semrl"). Folding both sides
+    to a stable key lets them join. Names that reduce to empty are dropped by the caller.
+    """
+
+    return (
+        pl.col(col)
+        .cast(pl.Utf8)
+        .str.normalize("NFKD")
+        .str.replace_all(r"\p{M}", "")
+        .str.to_lowercase()
+        .str.replace_all(r"[^a-z0-9]+", " ")
+        .str.strip_chars()
+    )
+
+
+def _value_squads_from_kaggle(settings: Settings) -> list[dict[str, object]]:
+    """Value each ingested squad roster from the offline Kaggle Transfermarkt valuations.
+
+    The ToS-clean, reproducible replacement for the AWS-WAF-blocked live kader scrape. Opt-in
+    via ``data/raw/squad_valuations_kaggle.txt`` (first non-comment line: the Kaggle dataset
+    slug). Joins the already-ingested :data:`Table.SQUADS` rosters (``team`` = country,
+    ``tournament``, ``player`` — from the Transfermarkt/Wikipedia squad scrape) to the dated
+    ``player_valuations`` (:func:`~polymbappe.data.sources.fetch_kaggle_player_valuations`) on
+    an accent-folded name key plus citizenship, selecting each player's latest market value
+    **on/before the tournament's start date** (point-in-time, leakage-safe). Tournaments not in
+    the backtest set (e.g. live ``WC2026``) take the latest available value.
+
+    Returns per-``(team, tournament)`` aggregate rows (via :func:`_aggregate_squad_valuations`);
+    ``[]`` when the config file or the ``squads`` table is absent, or nothing matches. Matched /
+    total roster players are logged so silent under-coverage is visible.
+    """
+
+    config_path = settings.raw_data_dir / "squad_valuations_kaggle.txt"
+    if not config_path.exists():
+        return []
+    if not table_exists(Table.SQUADS, settings):
+        logger.info("ingest.squad_valuations.kaggle_skip", reason="no squads table")
+        return []
+    dataset: str | None = None
+    for line in config_path.read_text().splitlines():
+        line = line.strip()
+        if line and not line.startswith("#"):
+            dataset = line
+            break
+    if dataset is None:
+        return []
+
+    from polymbappe.eval.backtest import DEFAULT_TOURNAMENTS
+
+    starts = {t.name: t.start for t in DEFAULT_TOURNAMENTS}
+
+    rosters = (
+        read_table(Table.SQUADS, settings)
+        .select("team", "tournament", "player", _player_name_key("player").alias("name_key"))
+        .filter(pl.col("name_key") != "")
+    )
+    if rosters.is_empty():
+        return []
+
+    values = (
+        sources.fetch_kaggle_player_valuations(dataset)
+        .filter(pl.col("market_value_eur").is_not_null() & pl.col("date").is_not_null())
+        .with_columns(
+            _player_name_key("player").alias("name_key"),
+            normalize_team_expr("country_of_citizenship").alias("team"),
+        )
+        .filter(pl.col("name_key") != "")
+    )
+
+    player_rows: list[dict[str, object]] = []
+    matched = total = 0
+    for tournament in rosters["tournament"].unique().to_list():
+        roster = rosters.filter(pl.col("tournament") == tournament)
+        as_of = starts.get(tournament)  # None -> latest available (e.g. live WC2026)
+        pool = values if as_of is None else values.filter(pl.col("date") <= as_of)
+        latest = (
+            pool.sort("date")
+            .group_by(["team", "name_key"])
+            .agg(pl.col("market_value_eur").last())
+        )
+        joined = roster.join(latest, on=["team", "name_key"], how="left")
+        total += joined.height
+        matched += int(joined["market_value_eur"].is_not_null().sum())
+        for r in joined.iter_rows(named=True):
+            player_rows.append(
+                {
+                    "player": r["player"],
+                    "market_value": r["market_value_eur"],
+                    "team": r["team"],
+                    "tournament": tournament,
+                }
+            )
+    logger.info(
+        "ingest.squad_valuations.kaggle",
+        dataset=dataset,
+        matched=matched,
+        total=total,
+        match_rate=round(matched / total, 3) if total else 0.0,
+    )
+    return _aggregate_squad_valuations(player_rows)
+
+
 def ingest_squad_valuations(settings: Settings | None = None) -> int:
-    """Ingest per-team Transfermarkt squad valuations into the ``squad_valuations`` table.
+    """Ingest per-team squad market valuations into the ``squad_valuations`` table.
 
-    Prefers ``data/raw/squad_valuations.csv`` (reproducible, offline) whose columns equal
-    ``TABLE_COLUMNS[Table.SQUAD_VALUATIONS]`` (``team, tournament, total_value, median_value,
-    player_count``); else scrapes each manifest team's Transfermarkt squad page
-    (:func:`~polymbappe.data.sources.fetch_transfermarkt_squad_valuation`) and aggregates the
-    per-player market values into one row per ``(team, tournament)``. ``team`` is canonicalized
-    via :func:`normalize_team_expr`; ``tournament`` must already equal a ``Tournament.name``
-    (e.g. ``"WC2018"``) and is passed through as-is. Powers the squad-value features
-    (:func:`~polymbappe.features.squad.build_squad_features`).
+    Source priority: ``data/raw/squad_valuations.csv`` (reproducible, offline) whose columns
+    equal ``TABLE_COLUMNS[Table.SQUAD_VALUATIONS]`` (``team, tournament, total_value,
+    median_value, player_count``) → the offline Kaggle Transfermarkt valuations joined onto the
+    ingested rosters (:func:`_value_squads_from_kaggle`) → the live Transfermarkt kader scrape
+    (:func:`_scrape_squad_valuations`, AWS-WAF-blocked in practice → best-effort last resort).
+    Either non-local path aggregates per-player market values into one row per ``(team,
+    tournament)``. ``team`` is canonicalized via :func:`normalize_team_expr`; ``tournament``
+    must already equal a ``Tournament.name`` (e.g. ``"WC2018"``). Powers the squad-value
+    features (:func:`~polymbappe.features.squad.build_squad_features`).
 
-    Skips (returns 0) when the local file is absent AND the scraper yields nothing.
+    Skips (returns 0) when the local file is absent AND every fallback yields nothing.
     """
 
     settings = settings or Settings()
@@ -619,15 +726,19 @@ def ingest_squad_valuations(settings: Settings | None = None) -> int:
         raw = pl.read_csv(io.BytesIO(local.read_bytes()))
         logger.info("ingest.squad_valuations.local", path=str(local), rows=raw.height)
     else:
-        rows = _scrape_squad_valuations(settings)
+        rows = _value_squads_from_kaggle(settings)
+        source = "kaggle"
+        if not rows:
+            rows = _scrape_squad_valuations(settings)
+            source = "transfermarkt"
         if not rows:
             logger.info(
                 "ingest.squad_valuations.skip",
-                reason="no data/raw/squad_valuations.csv and scraper empty",
+                reason="no data/raw/squad_valuations.csv and Kaggle/scraper empty",
             )
             return 0
         raw = pl.DataFrame(rows)
-        logger.info("ingest.squad_valuations.scraped", rows=raw.height)
+        logger.info("ingest.squad_valuations.scraped", rows=raw.height, source=source)
 
     missing = required - set(raw.columns)
     if missing:

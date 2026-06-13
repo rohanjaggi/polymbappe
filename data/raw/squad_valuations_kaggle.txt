@@ -1,0 +1,12 @@
+# Kaggle dataset for offline Transfermarkt squad market values.
+# Read by polymbappe.data.ingest._value_squads_from_kaggle when
+# data/raw/squad_valuations.csv is absent. First non-comment line = the Kaggle
+# dataset slug. Values (player_valuations.csv: player_id, date, market_value_in_eur)
+# are joined onto the ingested `squads` rosters by accent-folded name + citizenship,
+# point-in-time to each tournament's start date.
+#
+# This is the ToS-clean, reproducible replacement for the live Transfermarkt kader
+# scrape (hard-blocked by AWS WAF / HTTP 405); the dataset is auto-refreshed ~weekly.
+# Requires the `kaggle` extra (pip install -e .[kaggle]); the dataset is public so no
+# Kaggle token is needed. Requires the `squads` table to be ingested first.
+davidcariboo/player-scores

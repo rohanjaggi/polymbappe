@@ -571,6 +571,78 @@ def test_scrape_squad_valuations_aggregates_transfermarkt(tmp_path: Path, monkey
     assert row["player_count"] == 3
 
 
+def test_player_name_key_folds_accents_punct_case() -> None:
+    from polymbappe.data.ingest import _player_name_key
+
+    keys = (
+        pl.DataFrame({"p": ["Kylian Mbappé", "N'Golo  Kanté", "SON Heung-min", "—"]})
+        .select(_player_name_key("p").alias("k"))["k"]
+        .to_list()
+    )
+    assert keys[0] == "kylian mbappe"
+    assert keys[1] == "n golo kante"
+    assert keys[2] == "son heung min"
+    assert keys[3] == ""  # punctuation-only reduces to empty (dropped by the caller)
+
+
+def test_value_squads_from_kaggle_point_in_time_and_citizenship(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Kaggle valuations are joined onto rosters point-in-time (latest value on/before the
+    tournament start) and disambiguated by citizenship; unmatched players count toward
+    player_count only."""
+
+    settings = _settings(tmp_path)
+    (settings.raw_data_dir / "squad_valuations_kaggle.txt").write_text(
+        "davidcariboo/player-scores\n"
+    )
+    write_table(
+        Table.SQUADS,
+        pl.DataFrame(
+            {
+                "team": ["Brazil", "Brazil", "Brazil"],
+                "tournament": ["WC2018", "WC2018", "WC2018"],
+                "player": ["Neymar", "Casemiro", "Ghost Player"],
+                "club": ["PSG", "Madrid", "Nowhere"],
+                "age": [26.0, 26.0, 30.0],
+            }
+        ).select(TABLE_COLUMNS[Table.SQUADS]),
+        settings=settings,
+    )
+
+    def _fake_kaggle_values(*args, **kwargs):
+        return pl.DataFrame(
+            {
+                "player": ["Neymar", "Neymar", "Neymar", "Casemiro", "Casemiro"],
+                "country_of_citizenship": ["Brazil", "Brazil", "Brazil", "Brazil", "Spain"],
+                "date": [
+                    date(2017, 1, 1),
+                    date(2018, 5, 1),  # latest on/before WC2018 start (2018-06-14)
+                    date(2019, 1, 1),  # after the cutoff -> excluded
+                    date(2018, 5, 1),
+                    date(2018, 5, 1),  # wrong citizenship -> excluded by the team join
+                ],
+                "market_value_eur": [90e6, 100e6, 120e6, 40e6, 999e6],
+            }
+        )
+
+    monkeypatch.setattr(
+        ingest_mod.sources, "fetch_kaggle_player_valuations", _fake_kaggle_values
+    )
+    # The Transfermarkt scrape must NOT be reached when the Kaggle path yields rows.
+    def _boom(*args, **kwargs):  # pragma: no cover - asserts it is never called
+        raise AssertionError("Transfermarkt scrape should not run when Kaggle yields rows")
+
+    monkeypatch.setattr(ingest_mod.sources, "fetch_transfermarkt_squad_valuation", _boom)
+
+    assert ingest_squad_valuations(settings) == 1
+    row = read_table(Table.SQUAD_VALUATIONS, settings).row(0, named=True)
+    assert row["team"] == "Brazil"
+    assert row["total_value"] == 140_000_000.0  # 100M (point-in-time) + 40M; Spain row excluded
+    assert row["median_value"] == 70_000_000.0  # median(100M, 40M)
+    assert row["player_count"] == 3  # Ghost Player matched nothing but still counts
+
+
 def test_ingest_player_attributes_from_local(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
     (settings.raw_data_dir / "player_attributes.csv").write_text(
