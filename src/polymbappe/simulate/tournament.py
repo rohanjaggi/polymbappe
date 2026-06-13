@@ -477,6 +477,7 @@ def refresh_market_odds(settings: object, logger: object) -> int:
 def run_tournament_simulation(
     n_sims: int = 100_000,
     with_context: bool = False,
+    historical_context: bool = False,
     live: bool = False,
     refresh_odds: bool = False,
 ) -> None:
@@ -548,8 +549,10 @@ def run_tournament_simulation(
 
     # Optional contextual injection: load the fitted adjuster and build a per-match hook.
     context_hook: ContextHook | None = None
-    if with_context:
-        context_hook = _load_context_hook(settings, structure, elo, logger)
+    if with_context or historical_context:
+        context_hook = _load_context_hook(
+            settings, structure, elo, logger, historical=historical_context
+        )
 
     result = simulate_tournament(structure, model, n_sims=n_sims, context_hook=context_hook)
     predictions = compute_match_predictions(
@@ -708,24 +711,60 @@ def _context_feature_frame(
 
 
 def _load_context_hook(
-    settings: object, structure: TournamentStructure, elo: dict[str, float] | None, logger: object
+    settings: object,
+    structure: TournamentStructure,
+    elo: dict[str, float] | None,
+    logger: object,
+    *,
+    historical: bool = False,
 ) -> ContextHook | None:
-    """Build a per-match contextual hook from the fitted adjuster artifact, if present.
+    """Build a per-match contextual hook from live adaptive weights.
 
-    The contextual adjustment depends only on the matchup (team features), not on the
-    in-sim state, so the raw adjustment is precomputed once per ordered team pair in a
-    single batched prediction. The returned hook is then an O(1) lookup plus a cheap capped
-    re-projection — fast enough for 100K sims.
+    By default (``historical=False``) only the adaptive hook is used: weights earned from
+    live WC2026 results via ``contextual-monitor --apply``. When no weights are active yet
+    (early in the tournament, or before the first ``--apply`` run), returns ``None`` so the
+    simulation runs without any contextual adjustment — which is correct, because the
+    historically-trained adjuster is known to hurt the LOTO backtest (contextual features
+    are near-zero for all pre-2026 tournaments) and should not fire by default.
 
-    Cohesion / manager features are assembled from point-in-time lookups for the 2026
-    tournament (``WC2026``) via :func:`_live_fixture_context`; see its docstring for the
-    live data contract. They 0-fill when the ``squads`` / ``manager_records`` tables (or
-    their 2026 rows) are absent, so the hook never hard-requires them.
+    Pass ``historical=True`` (via ``simulate --historical-context``) to fall back to the
+    LightGBM residual adjuster artifact from ``train`` when no adaptive weights are active.
+    This is preserved as an explicit opt-in for diagnostic use.
     """
 
-    from polymbappe.context.adjuster import apply_adjustment
+    from polymbappe.context.adaptive import load_adaptive_weights
     from polymbappe.data.store import table_exists
     from polymbappe.data.tables import Table
+
+    if not table_exists(Table.MATCHES, settings):  # type: ignore[arg-type]
+        logger.warning("simulate.context", status="no matches table for features")  # type: ignore[attr-defined]
+        return None
+
+    ctx = _live_fixture_context(settings, elo, logger)
+    team_travel = _wc2026_team_travel(settings)
+
+    # Adaptive hook: weights earned from live WC2026 results (default path).
+    adaptive_state = load_adaptive_weights(settings)
+    if adaptive_state.is_active():
+        from polymbappe.context.wc2026_hook import build_adaptive_hook
+
+        adaptive_hook = build_adaptive_hook(adaptive_state, structure.teams, ctx, team_travel)
+        if adaptive_hook is not None:
+            active = [g for g, w in adaptive_state.weights.items() if w != 0.0]
+            logger.info(  # type: ignore[attr-defined]
+                "simulate.context",
+                status="adaptive",
+                active_groups=active,
+                n_matches=adaptive_state.n_matches,
+            )
+            return adaptive_hook  # type: ignore[return-value]
+
+    # No adaptive weights yet. Use historical adjuster only when explicitly requested.
+    if not historical:
+        logger.info("simulate.context", status="no_adaptive_weights; run contextual-monitor --apply")  # type: ignore[attr-defined]
+        return None
+
+    from polymbappe.context.adjuster import apply_adjustment
     from polymbappe.models.train import load_artifact
 
     try:
@@ -733,17 +772,12 @@ def _load_context_hook(
     except FileNotFoundError:
         logger.warning("simulate.context", status="no adjuster artifact; run `train`")  # type: ignore[attr-defined]
         return None
-    if not table_exists(Table.MATCHES, settings):  # type: ignore[arg-type]
-        logger.warning("simulate.context", status="no matches table for features")  # type: ignore[attr-defined]
-        return None
 
-    ctx = _live_fixture_context(settings, elo, logger)
-    team_travel = _wc2026_team_travel(settings)
     pairs, frame = _context_feature_frame(structure.teams, ctx, team_travel=team_travel)
-    raw = adjuster.predict_adjustment(frame)  # type: ignore[attr-defined]  # one batched call
+    raw = adjuster.predict_adjustment(frame)  # type: ignore[attr-defined]
     cache = {pair: raw[i] for i, pair in enumerate(pairs)}
     cap = adjuster.config.cap  # type: ignore[attr-defined]
-    logger.info("simulate.context", status="applied", pairs=len(pairs))  # type: ignore[attr-defined]
+    logger.info("simulate.context", status="historical_adjuster", pairs=len(pairs))  # type: ignore[attr-defined]
 
     def hook(home: str, away: str, base_hda: np.ndarray) -> np.ndarray:
         adjustment = cache.get((home, away))

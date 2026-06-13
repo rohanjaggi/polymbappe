@@ -128,7 +128,9 @@ def config_to_metrics(
     """
 
     configs = config_to_configs(config)
-    use_squad = bool(_get(config, "features.toggle_squad_value", default=True))
+    toggle_rolling_form = bool(_get(config, "features.toggle_rolling_form", default=True))
+    toggle_h2h = bool(_get(config, "features.toggle_h2h", default=True))
+    toggle_rest_days = bool(_get(config, "features.toggle_rest_days", default=True))
     result = run_leave_one_tournament_out(
         matches,
         tournaments,
@@ -136,7 +138,10 @@ def config_to_metrics(
         ensemble_config=configs.ensemble,
         contextual_config=configs.contextual,
         market_odds=market_odds,
-        squad_valuations=squad_valuations if use_squad else None,
+        squad_valuations=squad_valuations,
+        toggle_rolling_form=toggle_rolling_form,
+        toggle_h2h=toggle_h2h,
+        toggle_rest_days=toggle_rest_days,
     )
     return ExperimentMetrics(
         mean_rps=result.mean_rps,

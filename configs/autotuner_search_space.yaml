@@ -7,48 +7,41 @@
 # Every parameter here is wired into the backtest objective (tune/objective.py ->
 # eval/backtest.py); sampling one changes the score. Knobs that the backtest cannot
 # exercise are deliberately *omitted* so TPE never wastes trials on inert dimensions:
-#   * bayesian.*        - the PyMC hierarchical model is NUTS-sampled per tournament; fit
-#                         per-trial across the leave-one-tournament-out loop it would turn
-#                         a 2 h run into days. It is deliberately excluded from the TPE loop
-#                         and instead exercised via `models.train --bayesian` (stacks bay_*
-#                         into the ensemble, persists model_bayesian.pkl) and the standalone
-#                         `polymbappe bayesian-ab` kill-criterion A/B (eval.backtest.
-#                         compare_bayesian_ab), which measures the +0.003 RPS gate.
-#   * features.xg_window - only feeds the core FeaturePipeline; the base-probability path
-#                         the backtest stacks on does not build rolling-xG features.
-#   * contextual.toggle_{ppda,fatigue} - not in the runtime contextual
-#                         feature set (context.runtime.FEATURE_GROUPS), so they are inert
-#                         at both backtest and simulation time.
+#   * bayesian.*           - NUTS per tournament across an 11-fold loop would take days;
+#                            exercised separately via `polymbappe bayesian-ab`.
+#   * features.xg_window   - feeds the offline FeaturePipeline only, not the backtest path.
+#   * contextual.*         - cohesion/manager/fatigue 0-fill for all historical tournaments
+#                            (only WC2026 has squad / manager data), so the contextual layer
+#                            fits on noise in the LOTO backtest. Contextual features are
+#                            handled by the live adaptive weighting system (`contextual-monitor`)
+#                            and are disabled in backtest by default.
+#   * squad_value_ratio    - WC2026 rosters only; no historical squad snapshots to backtest.
 
 dixon_coles:
-  xi: {type: float, low: 0.0005, high: 0.005}
+  # xi: time-decay half-life. Tightened bounds avoid extreme values that cause the DC
+  # optimiser to exit at iteration 0 (flat gradient / singular Hessian at the boundary).
+  xi: {type: float, low: 0.001, high: 0.003}
   friendly_weight: {type: float, low: 0.1, high: 0.5}
   max_goals: {type: categorical, choices: [8, 10, 12]}
 
 features:
   elo_k_factor: {type: float, low: 10.0, high: 40.0}
   draw_max: {type: float, low: 0.20, high: 0.32}
-  # Tier-1 squad market-value ratio (offline Transfermarkt values, ingest_squad_valuations).
-  # Stacked into the GBM, so it only bites when gbm.enable is true; the toggle lets TPE measure
-  # its RPS contribution. Inert (no-op) when the squad_valuations table is absent.
-  toggle_squad_value: {type: categorical, choices: [true, false]}
+  # Tier-1 rolling form (gs/ga/pts over 5 and 10 matches), H2H win rate, and rest days.
+  # All are leakage-safe (shift-1 rolling windows) and feed the GBM; no-ops when GBM is off.
+  toggle_rolling_form: {type: categorical, choices: [true, false]}
+  toggle_h2h: {type: categorical, choices: [true, false]}
+  toggle_rest_days: {type: categorical, choices: [true, false]}
 
 gbm:
   # GBM stacks over the base-model H/D/A outputs; `enable` lets TPE switch the layer in/out.
+  # min_child_samples floor raised to 30 (from 10) — LOTO folds are ~100 matches so a low
+  # floor lets the GBM memorise fold-specific noise rather than learning a general signal.
   enable: {type: categorical, choices: [true, false]}
   num_leaves: {type: int, low: 15, high: 63}
   learning_rate: {type: float, low: 0.01, high: 0.1, log: true}
-  n_estimators: {type: int, low: 100, high: 500}
-  min_child_samples: {type: int, low: 10, high: 50}
-
-contextual:
-  context_num_leaves: {type: int, low: 7, high: 31}
-  context_n_estimators: {type: int, low: 50, high: 200}
-  toggle_xg_overperformance: {type: categorical, choices: [true, false]}
-  toggle_draw_pressure: {type: categorical, choices: [true, false]}
-  toggle_cohesion: {type: categorical, choices: [true, false]}
-  toggle_manager: {type: categorical, choices: [true, false]}
-  enable_contextual_layer: {type: categorical, choices: [true, false]}
+  n_estimators: {type: int, low: 50, high: 300}
+  min_child_samples: {type: int, low: 30, high: 100}
 
 ensemble:
   meta_C: {type: float, low: 0.1, high: 10.0, log: true}

@@ -29,6 +29,15 @@ polymbappe edges --tournament 2026                  # model vs market (needs odd
 polymbappe report
 ```
 
+Live tournament loop (once WC2026 is underway):
+
+```bash
+polymbappe ingest --live                            # pull latest results
+polymbappe contextual-monitor                       # check if contextual features have signal
+polymbappe contextual-monitor --apply               # activate features that pass the gate
+polymbappe simulate --with-context --n-sims 50000   # re-run with adaptive weights
+```
+
 The base install runs the full results→Elo→Dixon-Coles→simulate→backtest path
 with zero setup. Everything else below is **opt-in**: each feature needs either
 an optional dependency extra, a credential, an opt-in input file, or `--live`.
@@ -228,6 +237,59 @@ polymbappe autotune --leaderboard
 polymbappe autotune --apply-best          # writes configs/best_config.yaml
 ```
 
+Tunable knobs in `configs/autotuner_search_space.yaml` include Dixon-Coles decay
+(`xi`, `friendly_weight`), Elo K-factor, draw probability cap, meta-learner
+regularisation, and a set of **Tier-1 feature toggles**. These let the TPE
+sampler measure the marginal RPS contribution of each backtestable feature:
+
+| Toggle | Feature | Path |
+|--------|---------|------|
+| `features.toggle_rolling_form` | Goals/points over last 5 and 10 matches | GBM only |
+| `features.toggle_h2h` | Head-to-head win rate, last 5 meetings | GBM only |
+| `features.toggle_rest_days` | Days since each team's previous match | GBM only |
+
+Squad market-value ratio (`squad_value_ratio`) is always passed to the simulator when
+squad valuations are available, but is **not a backtest toggle** — the squad data only
+covers WC2026 rosters so there is no historical signal to measure.
+
+All Tier-1 toggles are no-ops when `gbm.enable` is false (the meta-learner only
+sees base-group H/D/A probabilities).
+
+### Contextual monitor (adaptive weighting)
+During the tournament, live WC2026 results can be used to test whether each
+contextual feature group (xG overperformance, draw pressure, squad cohesion,
+manager pedigree, travel fatigue) has a real signal. Groups that pass the gate
+(**p < 0.05** AND **RPS improvement > 0.003**) earn a non-zero weight that is
+baked into the next simulation run. All weights start at zero — no live
+adjustment is applied until evidence accumulates.
+
+```bash
+# After ≥ 32 completed WC2026 matches (end of matchday 2):
+polymbappe ingest --live                       # pull latest WC2026 results
+polymbappe contextual-monitor                  # dry-run: prints per-group p-value, RPS Δ, status
+polymbappe contextual-monitor --apply          # write weights → data/outputs/contextual_wc2026_weights.json
+polymbappe simulate --with-context             # picks up adaptive weights automatically
+polymbappe simulate --historical-context       # diagnostic only: apply the historical LightGBM adjuster
+```
+
+The monitor can be re-run after every matchday — weights update in place and the
+next simulation call reflects the latest evidence. Attribution history is
+appended to `data/outputs/contextual_attribution.parquet` on every run.
+
+**Two-tier architecture:**
+
+| Tier | Features | Signal source | When active |
+|------|----------|--------------|-------------|
+| Tier 1 (backtestable) | DC probs, Elo probs, squad value, rolling form, H2H, rest days | Historical tournaments (LOTO backtest) | Always (autotuner-gated) |
+| Tier 2 (adaptive) | xG overperf, draw pressure, cohesion, manager pedigree, travel km | Live WC2026 results only | After ≥ 32 matches + signal gate |
+
+`simulate --with-context` uses the **adaptive hook** (Tier 2) when
+`contextual_wc2026_weights.json` has non-zero weights, and does nothing when no
+live weights exist yet — which is correct, because the historically-trained
+LightGBM adjuster is known to hurt the LOTO backtest (contextual features
+0-fill for all pre-2026 tournaments). The historical adjuster is still
+accessible via `simulate --historical-context` for diagnostic comparison.
+
 ### Dashboard
 Six-page Streamlit app (overview, team deep-dive, match predictor, market edges,
 upset watch, agent activity).
@@ -244,6 +306,7 @@ polymbappe dashboard
 - `src/polymbappe/models/` — Dixon-Coles, GBM, Bayesian DC, ensemble, meta-stacker
 - `src/polymbappe/simulate/` — Monte Carlo match & tournament simulation
 - `src/polymbappe/eval/` — walk-forward backtest, market comparison, reporting
+- `src/polymbappe/context/` — contextual adjuster, runtime feature contract, adaptive weighting (`adaptive.py`, `wc2026_hook.py`)
 - `src/polymbappe/polymarket/` — Gamma API adapter & market alignment
 - `src/polymbappe/agent/` — LangGraph live-monitoring agent
 - `src/polymbappe/tune/` — autotuner (Optuna + optional LLM search)
