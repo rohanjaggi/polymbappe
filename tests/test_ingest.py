@@ -356,7 +356,9 @@ _WIKI_SQUADS_HTML = """
       <td><span class="flagicon"><a href="/wiki/England"></a></span>
           <a href="/wiki/Liverpool_F.C.">Liverpool</a></td></tr>
   <tr><td colspan="6">Coach note spanning the whole row</td></tr>
-  <tr><td>10</td><td>FW</td><td><a href="/wiki/Neymar">Neymar</a></td>
+  <tr><td>10</td><td>FW</td>
+      <td><a href="/wiki/Neymar">Neymar</a>
+          <a href="/wiki/Captain_(association_football)" title="Captain">(c)</a></td>
       <td>(1992-02-05) 5 February 1992 (aged 30)</td><td>120</td>
       <td><a href="/wiki/Al_Hilal">Al Hilal</a></td></tr>
 </table>
@@ -371,11 +373,15 @@ _WIKI_SQUADS_HTML = """
 
 
 def test_parse_wikipedia_squad_extracts_player_club_age() -> None:
-    from polymbappe.data.sources import _parse_wikipedia_squad
+    from polymbappe.data.sources import _is_non_name_token, _parse_wikipedia_squad
 
     rows = _parse_wikipedia_squad(_WIKI_SQUADS_HTML, team="Brazil", tournament="WC2022")
     # Only Brazil's two players (the spanning sub-row is skipped; Serbia is a different section).
-    assert [r["player"] for r in rows] == ["Alisson", "Neymar"]
+    # Neymar carries a trailing "(c)" captain annotation anchor that must NOT become the name,
+    # and the annotation must never surface as its own roster row.
+    players = [r["player"] for r in rows]
+    assert players == ["Alisson", "Neymar"]
+    assert not any(_is_non_name_token(p) for p in players)  # no "captain"/"(c)" pollution
     alisson = rows[0]
     assert alisson["club"] == "Liverpool"
     assert alisson["age"] == 29.0
@@ -575,14 +581,27 @@ def test_player_name_key_folds_accents_punct_case() -> None:
     from polymbappe.data.ingest import _player_name_key
 
     keys = (
-        pl.DataFrame({"p": ["Kylian Mbappé", "N'Golo  Kanté", "SON Heung-min", "—"]})
+        pl.DataFrame(
+            {
+                "p": [
+                    "Kylian Mbappé",
+                    "N'Golo  Kanté",
+                    "SON Heung-min",
+                    "—",
+                    "Heung-Min Son",
+                ]
+            }
+        )
         .select(_player_name_key("p").alias("k"))["k"]
         .to_list()
     )
+    # Tokens are sorted, so the key is order-insensitive.
     assert keys[0] == "kylian mbappe"
-    assert keys[1] == "n golo kante"
-    assert keys[2] == "son heung min"
+    assert keys[1] == "golo kante n"
+    assert keys[2] == "heung min son"
     assert keys[3] == ""  # punctuation-only reduces to empty (dropped by the caller)
+    # Family-Given ("Son Heung-min") and Given-Family ("Heung-Min Son") fold equal.
+    assert keys[4] == keys[2]
 
 
 def test_value_squads_from_kaggle_point_in_time_and_citizenship(
@@ -600,11 +619,13 @@ def test_value_squads_from_kaggle_point_in_time_and_citizenship(
         Table.SQUADS,
         pl.DataFrame(
             {
-                "team": ["Brazil", "Brazil", "Brazil"],
-                "tournament": ["WC2018", "WC2018", "WC2018"],
-                "player": ["Neymar", "Casemiro", "Ghost Player"],
-                "club": ["PSG", "Madrid", "Nowhere"],
-                "age": [26.0, 26.0, 30.0],
+                "team": ["Brazil", "Brazil", "Brazil", "Brazil"],
+                "tournament": ["WC2018", "WC2018", "WC2018", "WC2018"],
+                # Roster lists this name Family-Given; the Kaggle dump (below) uses
+                # Given-Family — token sorting must make them join.
+                "player": ["Neymar", "Casemiro", "Ghost Player", "Reverse Name"],
+                "club": ["PSG", "Madrid", "Nowhere", "Club"],
+                "age": [26.0, 26.0, 30.0, 28.0],
             }
         ).select(TABLE_COLUMNS[Table.SQUADS]),
         settings=settings,
@@ -613,16 +634,20 @@ def test_value_squads_from_kaggle_point_in_time_and_citizenship(
     def _fake_kaggle_values(*args, **kwargs):
         return pl.DataFrame(
             {
-                "player": ["Neymar", "Neymar", "Neymar", "Casemiro", "Casemiro"],
-                "country_of_citizenship": ["Brazil", "Brazil", "Brazil", "Brazil", "Spain"],
+                "player": ["Neymar", "Neymar", "Neymar", "Casemiro", "Casemiro", "Name Reverse"],
+                "country_of_citizenship": [
+                    "Brazil", "Brazil", "Brazil", "Brazil", "Spain", "Brazil",
+                ],
+                "birth_year": [1992, 1992, 1992, 1992, 1992, 1990],
                 "date": [
                     date(2017, 1, 1),
                     date(2018, 5, 1),  # latest on/before WC2018 start (2018-06-14)
                     date(2019, 1, 1),  # after the cutoff -> excluded
                     date(2018, 5, 1),
                     date(2018, 5, 1),  # wrong citizenship -> excluded by the team join
+                    date(2018, 5, 1),  # opposite token order from the roster -> still joins
                 ],
-                "market_value_eur": [90e6, 100e6, 120e6, 40e6, 999e6],
+                "market_value_eur": [90e6, 100e6, 120e6, 40e6, 999e6, 60e6],
             }
         )
 
@@ -638,9 +663,316 @@ def test_value_squads_from_kaggle_point_in_time_and_citizenship(
     assert ingest_squad_valuations(settings) == 1
     row = read_table(Table.SQUAD_VALUATIONS, settings).row(0, named=True)
     assert row["team"] == "Brazil"
-    assert row["total_value"] == 140_000_000.0  # 100M (point-in-time) + 40M; Spain row excluded
-    assert row["median_value"] == 70_000_000.0  # median(100M, 40M)
-    assert row["player_count"] == 3  # Ghost Player matched nothing but still counts
+    # 100M (Neymar, point-in-time) + 40M (Casemiro) + 60M (reverse-order join); Spain excluded.
+    assert row["total_value"] == 200_000_000.0
+    assert row["median_value"] == 60_000_000.0  # median(100M, 40M, 60M)
+    assert row["player_count"] == 4  # Ghost Player matched nothing but still counts
+
+
+def _squads_table(teams_players: dict[str, list[str]], tournament: str) -> pl.DataFrame:
+    """Build a minimal SQUADS frame: ``{team: [player, ...]}`` for one tournament."""
+
+    rows: dict[str, list[object]] = {
+        "team": [], "tournament": [], "player": [], "club": [], "age": []
+    }
+    for team, players in teams_players.items():
+        for player in players:
+            rows["team"].append(team)
+            rows["tournament"].append(tournament)
+            rows["player"].append(player)
+            rows["club"].append("Club")
+            rows["age"].append(27.0)
+    return pl.DataFrame(rows).select(TABLE_COLUMNS[Table.SQUADS])
+
+
+def _kaggle_values(valued: dict[str, list[tuple[str, float]]]) -> pl.DataFrame:
+    """Build a kaggle player_valuations frame: ``{citizenship: [(player, value), ...]}``.
+
+    All dated 2018-01-01 (well before the WC2018 start), so point-in-time selection is moot and
+    the only variable under test is the per-team match rate.
+    """
+
+    rows: dict[str, list[object]] = {
+        "player": [], "country_of_citizenship": [], "birth_year": [],
+        "date": [], "market_value_eur": []
+    }
+    for citizenship, players in valued.items():
+        for player, value in players:
+            rows["player"].append(player)
+            rows["country_of_citizenship"].append(citizenship)
+            rows["birth_year"].append(None)  # null -> name+citizenship fallback (age-blind)
+            rows["date"].append(date(2018, 1, 1))
+            rows["market_value_eur"].append(value)
+    return pl.DataFrame(rows, schema_overrides={"birth_year": pl.Int32})
+
+
+def test_value_squads_from_kaggle_drops_fully_unmatched_team(tmp_path: Path, monkeypatch) -> None:
+    """A team that matches zero valuations is dropped entirely (no row → null downstream),
+    rather than aggregated to a misleading €0 total; a well-matched team still emits a row."""
+
+    settings = _settings(tmp_path)
+    (settings.raw_data_dir / "squad_valuations_kaggle.txt").write_text("slug\n")
+    write_table(
+        Table.SQUADS,
+        _squads_table(
+            {
+                "Brazil": ["Neymar", "Casemiro"],  # both match -> rate 1.0 -> kept
+                "Atlantis": ["Nobody One", "Nobody Two"],  # zero match -> dropped
+            },
+            "WC2018",
+        ),
+        settings=settings,
+    )
+    monkeypatch.setattr(
+        ingest_mod.sources,
+        "fetch_kaggle_player_valuations",
+        lambda *a, **k: _kaggle_values(
+            {"Brazil": [("Neymar", 100e6), ("Casemiro", 40e6)]}
+        ),
+    )
+
+    rows = ingest_mod._value_squads_from_kaggle(settings)
+    teams = {r["team"] for r in rows}
+    assert "Brazil" in teams
+    assert "Atlantis" not in teams  # absent, not a €0.0 row
+    assert all(r["total_value"] > 0 for r in rows)
+
+
+def test_value_squads_from_kaggle_match_rate_threshold_boundary(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Boundary around ``MIN_SQUAD_MATCH_RATE`` (0.5): a team exactly at the threshold is kept,
+    one just below it is dropped."""
+
+    settings = _settings(tmp_path)
+    (settings.raw_data_dir / "squad_valuations_kaggle.txt").write_text("slug\n")
+    write_table(
+        Table.SQUADS,
+        _squads_table(
+            {
+                "Edge": ["Match One", "Miss One"],  # 1/2 = 0.5 == threshold -> kept
+                "Below": ["Match Two", "Miss Two", "Miss Three"],  # 1/3 ~ 0.33 -> dropped
+            },
+            "WC2018",
+        ),
+        settings=settings,
+    )
+    monkeypatch.setattr(
+        ingest_mod.sources,
+        "fetch_kaggle_player_valuations",
+        lambda *a, **k: _kaggle_values(
+            {"Edge": [("Match One", 50e6)], "Below": [("Match Two", 50e6)]}
+        ),
+    )
+    assert ingest_mod.MIN_SQUAD_MATCH_RATE == 0.5
+
+    teams = {r["team"] for r in ingest_mod._value_squads_from_kaggle(settings)}
+    assert teams == {"Edge"}  # Edge at exactly 0.5 survives; Below at 0.33 dropped
+
+
+def test_value_squads_from_kaggle_disambiguates_same_name_country_by_birth_year(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Two same-name, same-country players with different birth years: the roster age picks the
+    right one (the ~€70M call-up), not the arbitrary ~€10M namesake the name-only key collapsed
+    to."""
+
+    settings = _settings(tmp_path)
+    (settings.raw_data_dir / "squad_valuations_kaggle.txt").write_text("slug\n")
+    write_table(
+        Table.SQUADS,
+        pl.DataFrame(
+            {
+                "team": ["Brazil"],
+                "tournament": ["WC2018"],  # starts 2018-06-14
+                "player": ["Marquinhos"],
+                "club": ["PSG"],
+                "age": [24.0],  # implied birth year 2018-24 = 1994 (the real call-up)
+            }
+        ).select(TABLE_COLUMNS[Table.SQUADS]),
+        settings=settings,
+    )
+
+    def _fake(*args, **kwargs):
+        # Two Brazilian "Marquinhos" colliding on name+citizenship; only birth year separates them.
+        return pl.DataFrame(
+            {
+                "player": ["Marquinhos", "Marquinhos"],
+                "country_of_citizenship": ["Brazil", "Brazil"],
+                "birth_year": [1986, 1994],  # fringe namesake vs. the actual call-up
+                "date": [date(2018, 5, 1), date(2018, 5, 1)],
+                "market_value_eur": [10e6, 70e6],
+            },
+            schema_overrides={"birth_year": pl.Int32},
+        )
+
+    monkeypatch.setattr(ingest_mod.sources, "fetch_kaggle_player_valuations", _fake)
+
+    rows = ingest_mod._value_squads_from_kaggle(settings)
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["team"] == "Brazil"
+    assert row["total_value"] == 70_000_000.0  # 1994 chosen by age, not the 1986 €10M namesake
+
+
+def test_value_squads_from_kaggle_null_age_matches_by_name(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A roster player with null age (no birth year derivable) still matches on name+citizenship
+    rather than being dropped."""
+
+    settings = _settings(tmp_path)
+    (settings.raw_data_dir / "squad_valuations_kaggle.txt").write_text("slug\n")
+    write_table(
+        Table.SQUADS,
+        pl.DataFrame(
+            {
+                "team": ["Brazil"],
+                "tournament": ["WC2018"],
+                "player": ["Marquinhos"],
+                "club": ["PSG"],
+                "age": [None],  # no age -> name+citizenship fallback
+            },
+            schema_overrides={"age": pl.Float64},
+        ).select(TABLE_COLUMNS[Table.SQUADS]),
+        settings=settings,
+    )
+
+    def _fake(*args, **kwargs):
+        return pl.DataFrame(
+            {
+                "player": ["Marquinhos"],
+                "country_of_citizenship": ["Brazil"],
+                "birth_year": [1994],
+                "date": [date(2018, 5, 1)],
+                "market_value_eur": [70e6],
+            },
+            schema_overrides={"birth_year": pl.Int32},
+        )
+
+    monkeypatch.setattr(ingest_mod.sources, "fetch_kaggle_player_valuations", _fake)
+
+    rows = ingest_mod._value_squads_from_kaggle(settings)
+    assert len(rows) == 1
+    assert rows[0]["total_value"] == 70_000_000.0  # matched by name despite the missing age
+
+
+def test_squad_coverage_reports_match_rates_worst_first(tmp_path: Path, monkeypatch) -> None:
+    """squad_coverage returns team/tournament/matched/total/rate, worst-first, and reflects the
+    raw join (so a thin nation ingest would later drop is still visible)."""
+
+    settings = _settings(tmp_path)
+    (settings.raw_data_dir / "squad_valuations_kaggle.txt").write_text("slug\n")
+    write_table(
+        Table.SQUADS,
+        _squads_table(
+            {
+                "Brazil": ["Neymar", "Casemiro"],  # 2/2 -> rate 1.0
+                "Atlantis": ["Nobody One", "Nobody Two"],  # 0/2 -> rate 0.0
+            },
+            "WC2018",
+        ),
+        settings=settings,
+    )
+    monkeypatch.setattr(
+        ingest_mod.sources,
+        "fetch_kaggle_player_valuations",
+        lambda *a, **k: _kaggle_values({"Brazil": [("Neymar", 100e6), ("Casemiro", 40e6)]}),
+    )
+
+    cov = ingest_mod.squad_coverage(settings)
+    assert cov.columns == ["team", "tournament", "matched", "total", "rate"]
+    # Worst-first: Atlantis (0/2) sorts ahead of Brazil (2/2).
+    assert cov["team"].to_list() == ["Atlantis", "Brazil"]
+    atlantis = cov.row(0, named=True)
+    assert atlantis["matched"] == 0 and atlantis["total"] == 2 and atlantis["rate"] == 0.0
+    brazil = cov.filter(pl.col("team") == "Brazil").row(0, named=True)
+    assert brazil["matched"] == 2 and brazil["total"] == 2 and brazil["rate"] == 1.0
+
+
+def test_squad_coverage_empty_when_unconfigured(tmp_path: Path) -> None:
+    """No Kaggle config / squads table -> an empty but correctly-typed coverage frame."""
+
+    settings = _settings(tmp_path)
+    cov = ingest_mod.squad_coverage(settings)
+    assert cov.is_empty()
+    assert cov.columns == ["team", "tournament", "matched", "total", "rate"]
+
+
+def test_ingest_squad_valuations_partial_override_merges_over_kaggle(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A partial squad_valuations.csv overrides only the (team, tournament) it lists; other teams
+    keep their Kaggle-joined values."""
+
+    settings = _settings(tmp_path)
+    (settings.raw_data_dir / "squad_valuations_kaggle.txt").write_text("slug\n")
+    write_table(
+        Table.SQUADS,
+        _squads_table(
+            {"Brazil": ["Neymar", "Casemiro"], "Argentina": ["Messi", "Di Maria"]},
+            "WC2018",
+        ),
+        settings=settings,
+    )
+    monkeypatch.setattr(
+        ingest_mod.sources,
+        "fetch_kaggle_player_valuations",
+        lambda *a, **k: _kaggle_values(
+            {
+                "Brazil": [("Neymar", 100e6), ("Casemiro", 40e6)],
+                "Argentina": [("Messi", 90e6), ("Di Maria", 50e6)],
+            }
+        ),
+    )
+    # Partial CSV: Brazil only, with a sentinel total that must replace the joined value.
+    (settings.raw_data_dir / "squad_valuations.csv").write_text(
+        "team,tournament,total_value,median_value,player_count\n"
+        "Brazil,WC2018,777000000,1000000,23\n"
+    )
+
+    n = ingest_squad_valuations(settings)
+    assert n == 2
+    vals = read_table(Table.SQUAD_VALUATIONS, settings)
+    brazil = vals.filter(pl.col("team") == "Brazil").row(0, named=True)
+    assert brazil["total_value"] == 777_000_000.0  # CSV override, not the 140M Kaggle join
+    assert brazil["player_count"] == 23
+    argentina = vals.filter(pl.col("team") == "Argentina").row(0, named=True)
+    assert argentina["total_value"] == 140_000_000.0  # kept Kaggle join (90M + 50M)
+    assert argentina["player_count"] == 2
+
+
+def test_ingest_squad_valuations_full_override_with_kaggle_base(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A CSV covering every (team, tournament) replaces the whole table even when a Kaggle base
+    is configured — the full-override behaviour is preserved."""
+
+    settings = _settings(tmp_path)
+    (settings.raw_data_dir / "squad_valuations_kaggle.txt").write_text("slug\n")
+    write_table(
+        Table.SQUADS,
+        _squads_table({"Brazil": ["Neymar"], "Argentina": ["Messi"]}, "WC2018"),
+        settings=settings,
+    )
+    monkeypatch.setattr(
+        ingest_mod.sources,
+        "fetch_kaggle_player_valuations",
+        lambda *a, **k: _kaggle_values(
+            {"Brazil": [("Neymar", 100e6)], "Argentina": [("Messi", 90e6)]}
+        ),
+    )
+    (settings.raw_data_dir / "squad_valuations.csv").write_text(
+        "team,tournament,total_value,median_value,player_count\n"
+        "Brazil,WC2018,1,1,1\n"
+        "Argentina,WC2018,2,2,2\n"
+    )
+
+    n = ingest_squad_valuations(settings)
+    assert n == 2
+    vals = read_table(Table.SQUAD_VALUATIONS, settings)
+    # Every value is from the CSV; no Kaggle-derived total (100M / 90M) survives.
+    assert set(vals["total_value"].to_list()) == {1.0, 2.0}
 
 
 def test_ingest_player_attributes_from_local(tmp_path: Path) -> None:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import date
 
+import polars as pl
 import typer
 
 from polymbappe.data.ingest import ingest_all_sources
@@ -23,6 +24,23 @@ def ingest_command(live: bool = False) -> None:
 
     report = ingest_all_sources(live=live)
     typer.echo(report)
+
+
+@app.command("squad-coverage")
+def squad_coverage_command() -> None:
+    """Report Kaggle squad-valuation name-match coverage per (team, tournament), worst-first."""
+
+    from polymbappe.data.ingest import squad_coverage
+
+    coverage = squad_coverage()
+    if coverage.is_empty():
+        typer.echo(
+            "No squad-valuation coverage to report "
+            "(needs the squads table and data/raw/squad_valuations_kaggle.txt)."
+        )
+        return
+    with pl.Config(tbl_rows=-1):
+        typer.echo(coverage)
 
 
 @app.command("features")

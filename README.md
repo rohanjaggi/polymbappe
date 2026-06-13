@@ -86,7 +86,7 @@ core pipeline.
 | `player_attributes_kaggle.txt` *(tracked)* | Kaggle dataset for player attributes | dataset slug + optional `file=` line |
 | `player_attributes.csv` | local player attributes (skips Kaggle) | `team,player,overall` |
 | `squad_valuations_kaggle.txt` *(tracked)* | Kaggle dataset for offline Transfermarkt squad values | dataset slug |
-| `squad_valuations.csv` | local squad valuations (skips Kaggle/scrape) | `team,tournament,total_value,median_value,player_count` |
+| `squad_valuations.csv` | squad valuations override (full file, or partial — merged per `(team,tournament)` over the Kaggle join) | `team,tournament,total_value,median_value,player_count` |
 | `football_data_urls.txt` | Football-Data.co.uk bookmaker odds | one CSV URL per line (`#` comments ok) |
 | `football_data/*.csv` | local Football-Data.co.uk odds | raw Football-Data CSVs |
 | `squads_manifest.csv` | per-team Transfermarkt squad pages | `tournament,team[,tm_id,saison_id,url,wiki_page]` |
@@ -154,10 +154,25 @@ downloads anonymously; needs the `kaggle` extra). Dated player values are joined
 ingested `squads` rosters by accent-folded name + citizenship and selected **point-in-time**
 (latest value on/before each tournament's start date). Ingest the `squads` table first.
 
-Source priority: `data/raw/squad_valuations.csv` (offline override) → Kaggle values
-joined onto rosters → the live Transfermarkt scrape (best-effort, blocked in practice).
-Match quality is logged (`ingest.squad_valuations.kaggle`, `matched/total`); for any team
-where name-matching is poor, drop a `squad_valuations.csv` to override.
+A base table is built from the Kaggle values joined onto rosters → the live Transfermarkt
+scrape (best-effort, blocked in practice). An optional `data/raw/squad_valuations.csv` is then
+**merged per `(team, tournament)`**: each pair the CSV lists overrides the base for that pair,
+while teams the CSV omits keep their joined values. So a *partial* CSV patches just the thin
+nations the name-match misses, and a *full* CSV (or one provided with no Kaggle/scrape source
+configured) is the entire table.
+
+Coverage is bimodal — most squads match cleanly, a few thin nations don't. To see which
+need an override:
+
+```bash
+polymbappe squad-coverage   # per (team, tournament): matched / total / rate, worst-first
+```
+
+This reports the raw name-match rate *before* the low-coverage drop, so the groups ingest
+discards as too thin are still visible. Match quality is also logged at ingest time
+(`ingest.squad_valuations.kaggle`, `matched/total`; full report under
+`ingest.squad_valuations.coverage`). For any team where matching is poor, add a row to
+`squad_valuations.csv` to override just that `(team, tournament)`.
 
 ### Team xG & PPDA (StatsBomb Open Data)
 Real xG and zonal PPDA are derived from StatsBomb's free event data (pinned

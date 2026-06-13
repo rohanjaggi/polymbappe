@@ -598,11 +598,16 @@ def _scrape_one_squad(
 
 
 def _player_name_key(col: str) -> pl.Expr:
-    """Accent-folded, lowercased, punctuation-collapsed name key for cross-source joins.
+    """Accent-folded, lowercased, punctuation-collapsed, token-sorted name key for joins.
 
     National-team rosters (Wikipedia) and the Kaggle valuation dump spell names with
-    different accents/punctuation/casing ("Anže Šemrl" vs "Anze Semrl"). Folding both sides
-    to a stable key lets them join. Names that reduce to empty are dropped by the caller.
+    different accents/punctuation/casing ("Anže Šemrl" vs "Anze Semrl") *and* in different
+    token orders: Wikipedia lists Korean/other names Family-Given ("Son Heung-min") while the
+    dump uses Given-Family ("Heung-Min Son"). Folding both sides to a stable key and sorting
+    the tokens alphabetically lets them join regardless of name order. The key is only ever
+    compared for equality (never displayed), so reordering is safe. Sorting raises the risk of
+    two distinct players colliding on the same token multiset (see Rec 3); citizenship in the
+    join key absorbs most of it. Names that reduce to empty are dropped by the caller.
     """
 
     return (
@@ -613,32 +618,53 @@ def _player_name_key(col: str) -> pl.Expr:
         .str.to_lowercase()
         .str.replace_all(r"[^a-z0-9]+", " ")
         .str.strip_chars()
+        .str.split(" ")
+        .list.sort()
+        .list.join(" ")
     )
 
 
-def _value_squads_from_kaggle(settings: Settings) -> list[dict[str, object]]:
-    """Value each ingested squad roster from the offline Kaggle Transfermarkt valuations.
+# A ``(team, tournament)`` group whose roster matches fewer than this fraction of players to a
+# Kaggle valuation is dropped entirely (absent → null downstream) rather than aggregated. Summing
+# only the few matched values yields a confidently-wrong near-€0 total that the GBM reads as the
+# cheapest possible squad and can't route around; absence is the honest signal.
+MIN_SQUAD_MATCH_RATE = 0.5
 
-    The ToS-clean, reproducible replacement for the AWS-WAF-blocked live kader scrape. Opt-in
-    via ``data/raw/squad_valuations_kaggle.txt`` (first non-comment line: the Kaggle dataset
-    slug). Joins the already-ingested :data:`Table.SQUADS` rosters (``team`` = country,
-    ``tournament``, ``player`` — from the Transfermarkt/Wikipedia squad scrape) to the dated
-    ``player_valuations`` (:func:`~polymbappe.data.sources.fetch_kaggle_player_valuations`) on
-    an accent-folded name key plus citizenship, selecting each player's latest market value
+
+def _join_rosters_to_kaggle(settings: Settings) -> pl.DataFrame | None:
+    """Join the ingested squad rosters to the Kaggle valuations, one row per roster player.
+
+    Shared core of :func:`_value_squads_from_kaggle` (which aggregates + threshold-drops) and
+    :func:`squad_coverage` (which reports match rates). Opt-in via
+    ``data/raw/squad_valuations_kaggle.txt`` (first non-comment line: the Kaggle dataset slug).
+    Joins the already-ingested :data:`Table.SQUADS` rosters (``team`` = country, ``tournament``,
+    ``player`` — from the Transfermarkt/Wikipedia squad scrape) to the dated
+    ``player_valuations`` (:func:`~polymbappe.data.sources.fetch_kaggle_player_valuations`) on an
+    accent-folded name key plus citizenship, selecting each player's latest market value
     **on/before the tournament's start date** (point-in-time, leakage-safe). Tournaments not in
     the backtest set (e.g. live ``WC2026``) take the latest available value.
 
-    Returns per-``(team, tournament)`` aggregate rows (via :func:`_aggregate_squad_valuations`);
-    ``[]`` when the config file or the ``squads`` table is absent, or nothing matches. Matched /
-    total roster players are logged so silent under-coverage is visible.
+    Same-name, same-country players (e.g. the several Brazilian "Marquinhos") collide on the
+    name+citizenship key and would otherwise collapse to one arbitrary valuation (~€10M for a
+    fringe namesake instead of ~€70M for the actual call-up). To disambiguate, each roster
+    player's birth year is derived from their roster ``age`` and the tournament start year, and
+    matched against the dump's ``birth_year`` within a ±1yr tolerance (``age`` is a whole-year
+    count, so the implied birth year is off by one whenever the birthday hasn't yet passed on the
+    start date). The accent-folded name key stays the primary join; birth year only breaks ties
+    among colliding candidates. When ``age`` is null (or the tournament has no known start date),
+    selection falls back to the latest-dated name+citizenship match.
+
+    Returns a frame with one row per roster player (columns ``team, tournament, player,
+    market_value_eur`` — the value is ``null`` for an unmatched player). Returns ``None`` when the
+    config file or the ``squads`` table is absent, or the rosters reduce to no usable names.
     """
 
     config_path = settings.raw_data_dir / "squad_valuations_kaggle.txt"
     if not config_path.exists():
-        return []
+        return None
     if not table_exists(Table.SQUADS, settings):
         logger.info("ingest.squad_valuations.kaggle_skip", reason="no squads table")
-        return []
+        return None
     dataset: str | None = None
     for line in config_path.read_text().splitlines():
         line = line.strip()
@@ -646,7 +672,7 @@ def _value_squads_from_kaggle(settings: Settings) -> list[dict[str, object]]:
             dataset = line
             break
     if dataset is None:
-        return []
+        return None
 
     from polymbappe.eval.backtest import DEFAULT_TOURNAMENTS
 
@@ -654,11 +680,17 @@ def _value_squads_from_kaggle(settings: Settings) -> list[dict[str, object]]:
 
     rosters = (
         read_table(Table.SQUADS, settings)
-        .select("team", "tournament", "player", _player_name_key("player").alias("name_key"))
+        .select(
+            "team",
+            "tournament",
+            "player",
+            "age",
+            _player_name_key("player").alias("name_key"),
+        )
         .filter(pl.col("name_key") != "")
     )
     if rosters.is_empty():
-        return []
+        return None
 
     values = (
         sources.fetch_kaggle_player_valuations(dataset)
@@ -670,87 +702,238 @@ def _value_squads_from_kaggle(settings: Settings) -> list[dict[str, object]]:
         .filter(pl.col("name_key") != "")
     )
 
-    player_rows: list[dict[str, object]] = []
-    matched = total = 0
+    per_tournament: list[pl.DataFrame] = []
     for tournament in rosters["tournament"].unique().to_list():
-        roster = rosters.filter(pl.col("tournament") == tournament)
         as_of = starts.get(tournament)  # None -> latest available (e.g. live WC2026)
+        # Implied birth year from the roster age (whole years) at the start; null when age or
+        # the start date is unknown, which routes the player to the name-only fallback below.
+        roster_birth_year = (
+            (pl.lit(as_of.year) - pl.col("age")).round().cast(pl.Int32, strict=False)
+            if as_of is not None
+            else pl.lit(None, dtype=pl.Int32)
+        )
+        roster = (
+            rosters.filter(pl.col("tournament") == tournament)
+            .with_row_index("_roster_idx")
+            .with_columns(roster_birth_year.alias("roster_birth_year"))
+        )
         pool = values if as_of is None else values.filter(pl.col("date") <= as_of)
+        # Keep birth_year in the key so colliding namesakes stay distinct candidates; within each
+        # candidate take the latest point-in-time value (sort by date, take last).
         latest = (
             pool.sort("date")
-            .group_by(["team", "name_key"])
-            .agg(pl.col("market_value_eur").last())
-        )
-        joined = roster.join(latest, on=["team", "name_key"], how="left")
-        total += joined.height
-        matched += int(joined["market_value_eur"].is_not_null().sum())
-        for r in joined.iter_rows(named=True):
-            player_rows.append(
-                {
-                    "player": r["player"],
-                    "market_value": r["market_value_eur"],
-                    "team": r["team"],
-                    "tournament": tournament,
-                }
+            .group_by(["team", "name_key", "birth_year"])
+            .agg(
+                pl.col("market_value_eur").last(),
+                pl.col("date").last().alias("_val_date"),
             )
-    logger.info(
-        "ingest.squad_valuations.kaggle",
-        dataset=dataset,
-        matched=matched,
-        total=total,
-        match_rate=round(matched / total, 3) if total else 0.0,
-    )
-    return _aggregate_squad_valuations(player_rows)
+        )
+        # One row per (roster player x candidate birth_year); rank so the best candidate is first:
+        # birth-year matches within tolerance win, closest birth year next, then latest value.
+        joined = (
+            roster.join(latest, on=["team", "name_key"], how="left")
+            .with_columns(
+                (pl.col("birth_year") - pl.col("roster_birth_year")).abs().alias("_byear_diff")
+            )
+            .with_columns((pl.col("_byear_diff") <= 1).fill_null(False).alias("_in_tol"))
+            .sort(
+                ["_in_tol", "_byear_diff", "_val_date"],
+                descending=[True, False, True],
+                nulls_last=True,
+            )
+            .group_by("_roster_idx", maintain_order=True)
+            .first()
+            .select("team", "tournament", "player", "market_value_eur")
+        )
+        per_tournament.append(joined)
+
+    return pl.concat(per_tournament, how="vertical_relaxed")
 
 
-def ingest_squad_valuations(settings: Settings | None = None) -> int:
-    """Ingest per-team squad market valuations into the ``squad_valuations`` table.
+def squad_coverage(settings: Settings | None = None) -> pl.DataFrame:
+    """Per-``(team, tournament)`` name-match coverage of the Kaggle valuation join, worst-first.
 
-    Source priority: ``data/raw/squad_valuations.csv`` (reproducible, offline) whose columns
-    equal ``TABLE_COLUMNS[Table.SQUAD_VALUATIONS]`` (``team, tournament, total_value,
-    median_value, player_count``) → the offline Kaggle Transfermarkt valuations joined onto the
-    ingested rosters (:func:`_value_squads_from_kaggle`) → the live Transfermarkt kader scrape
-    (:func:`_scrape_squad_valuations`, AWS-WAF-blocked in practice → best-effort last resort).
-    Either non-local path aggregates per-player market values into one row per ``(team,
-    tournament)``. ``team`` is canonicalized via :func:`normalize_team_expr`; ``tournament``
-    must already equal a ``Tournament.name`` (e.g. ``"WC2018"``). Powers the squad-value
-    features (:func:`~polymbappe.features.squad.build_squad_features`).
+    Operator visibility into the bimodal coverage of the offline squad-valuation source: how many
+    of each roster's players matched a Kaggle market value. Returns a frame with columns
+    ``team, tournament, matched, total, rate`` sorted by ascending ``rate`` (then ``team``) so the
+    thinnest-covered nations surface first — these are the rows a partial ``squad_valuations.csv``
+    override (see :func:`ingest_squad_valuations`) should target. ``rate`` is ``matched / total``.
 
-    Skips (returns 0) when the local file is absent AND every fallback yields nothing.
+    Reflects the raw join *before* the :data:`MIN_SQUAD_MATCH_RATE` drop, so groups that ingest
+    discards as too thin are still visible here. Returns an empty (correctly-typed) frame when the
+    Kaggle source isn't configured / the ``squads`` table is absent (nothing to report). The table
+    is also logged (``ingest.squad_valuations.coverage``).
     """
 
     settings = settings or Settings()
-    required = set(TABLE_COLUMNS[Table.SQUAD_VALUATIONS])
-    local = settings.raw_data_dir / "squad_valuations.csv"
-    if local.exists():
-        raw = pl.read_csv(io.BytesIO(local.read_bytes()))
-        logger.info("ingest.squad_valuations.local", path=str(local), rows=raw.height)
-    else:
-        rows = _value_squads_from_kaggle(settings)
-        source = "kaggle"
-        if not rows:
-            rows = _scrape_squad_valuations(settings)
-            source = "transfermarkt"
-        if not rows:
-            logger.info(
-                "ingest.squad_valuations.skip",
-                reason="no data/raw/squad_valuations.csv and Kaggle/scraper empty",
-            )
-            return 0
-        raw = pl.DataFrame(rows)
-        logger.info("ingest.squad_valuations.scraped", rows=raw.height, source=source)
+    empty = pl.DataFrame(
+        schema={
+            "team": pl.Utf8,
+            "tournament": pl.Utf8,
+            "matched": pl.UInt32,
+            "total": pl.UInt32,
+            "rate": pl.Float64,
+        }
+    )
+    joined = _join_rosters_to_kaggle(settings)
+    if joined is None or joined.is_empty():
+        return empty
 
-    missing = required - set(raw.columns)
+    coverage = (
+        joined.group_by(["team", "tournament"])
+        .agg(
+            pl.col("market_value_eur").is_not_null().sum().alias("matched"),
+            pl.len().alias("total"),
+        )
+        .with_columns((pl.col("matched") / pl.col("total")).alias("rate"))
+        .sort(["rate", "team", "tournament"])
+    )
+    logger.info(
+        "ingest.squad_valuations.coverage",
+        groups=coverage.height,
+        rows=coverage.to_dicts(),
+    )
+    return coverage
+
+
+def _value_squads_from_kaggle(settings: Settings) -> list[dict[str, object]]:
+    """Value each ingested squad roster from the offline Kaggle Transfermarkt valuations.
+
+    The ToS-clean, reproducible replacement for the AWS-WAF-blocked live kader scrape. Joins the
+    rosters to the Kaggle valuations via :func:`_join_rosters_to_kaggle`, then aggregates per
+    ``(team, tournament)`` (via :func:`_aggregate_squad_valuations`). Groups whose per-roster
+    match rate falls below :data:`MIN_SQUAD_MATCH_RATE` are dropped before aggregation (so they're
+    absent → null downstream, not a false €0 floor); the dropped groups and overall matched /
+    total coverage are logged so silent under-coverage is visible (see :func:`squad_coverage` for
+    the full report).
+
+    Returns ``[]`` when the config file or the ``squads`` table is absent, or nothing matches.
+    """
+
+    joined = _join_rosters_to_kaggle(settings)
+    if joined is None or joined.is_empty():
+        return []
+
+    coverage = (
+        joined.group_by(["team", "tournament"])
+        .agg(pl.col("market_value_eur").is_not_null().mean().alias("rate"))
+    )
+    kept = coverage.filter(pl.col("rate") >= MIN_SQUAD_MATCH_RATE).select("team", "tournament")
+    dropped = [
+        {"team": r["team"], "tournament": r["tournament"], "match_rate": round(r["rate"], 3)}
+        for r in coverage.filter(pl.col("rate") < MIN_SQUAD_MATCH_RATE).iter_rows(named=True)
+    ]
+    matched = int(joined["market_value_eur"].is_not_null().sum())
+    total = joined.height
+    if dropped:
+        logger.info(
+            "ingest.squad_valuations.kaggle_dropped",
+            count=len(dropped),
+            threshold=MIN_SQUAD_MATCH_RATE,
+            groups=dropped,
+        )
+    logger.info(
+        "ingest.squad_valuations.kaggle",
+        matched=matched,
+        total=total,
+        match_rate=round(matched / total, 3) if total else 0.0,
+        dropped=len(dropped),
+    )
+    player_rows = [
+        {
+            "player": r["player"],
+            "market_value": r["market_value_eur"],
+            "team": r["team"],
+            "tournament": r["tournament"],
+        }
+        for r in joined.join(kept, on=["team", "tournament"], how="inner").iter_rows(named=True)
+    ]
+    return _aggregate_squad_valuations(player_rows)
+
+
+def _normalize_squad_valuations(raw: pl.DataFrame) -> pl.DataFrame:
+    """Canonicalize a raw squad-valuation frame to the ``squad_valuations`` schema.
+
+    Validates the required columns are present, canonicalizes ``team`` via
+    :func:`normalize_team_expr` (so ``"USA"`` and ``"United States"`` merge to one key) and casts
+    the numeric columns. Shared by the local-CSV and Kaggle/scrape paths so both sides of a
+    partial-override merge land on identical, comparable keys.
+    """
+
+    missing = set(TABLE_COLUMNS[Table.SQUAD_VALUATIONS]) - set(raw.columns)
     if missing:
         raise ValueError(f"squad_valuations source missing columns: {sorted(missing)}")
-
-    normalized = raw.select(
+    return raw.select(
         normalize_team_expr("team").alias("team"),
         pl.col("tournament").cast(pl.Utf8),
         pl.col("total_value").cast(pl.Float64),
         pl.col("median_value").cast(pl.Float64),
         pl.col("player_count").cast(pl.Int64),
     ).select(TABLE_COLUMNS[Table.SQUAD_VALUATIONS])
+
+
+def ingest_squad_valuations(settings: Settings | None = None) -> int:
+    """Ingest per-team squad market valuations into the ``squad_valuations`` table.
+
+    Two sources, **merged per ``(team, tournament)``**: a base from the offline Kaggle
+    Transfermarkt valuations joined onto the ingested rosters (:func:`_value_squads_from_kaggle`),
+    falling back to the live Transfermarkt kader scrape (:func:`_scrape_squad_valuations`,
+    AWS-WAF-blocked in practice → best-effort last resort); and an optional
+    ``data/raw/squad_valuations.csv`` (columns = ``TABLE_COLUMNS[Table.SQUAD_VALUATIONS]``:
+    ``team, tournament, total_value, median_value, player_count``).
+
+    Each ``(team, tournament)`` listed in the CSV **overrides** the base for that pair; teams the
+    CSV omits keep their joined values. So a *partial* CSV patches just the thin nations the
+    Kaggle name-match misses (see :func:`squad_coverage`) while everyone else stays auto-valued,
+    and a *full* CSV (or one provided with no Kaggle/scrape source configured) is the entire table
+    — the prior full-override behaviour. ``team`` is canonicalized via :func:`normalize_team_expr`
+    on both sides before the merge; ``tournament`` must already equal a ``Tournament.name`` (e.g.
+    ``"WC2018"``). Powers the squad-value features
+    (:func:`~polymbappe.features.squad.build_squad_features`).
+
+    Skips (returns 0) when the local file is absent AND every base source yields nothing.
+    """
+
+    settings = settings or Settings()
+    local = settings.raw_data_dir / "squad_valuations.csv"
+    override: pl.DataFrame | None = None
+    if local.exists():
+        raw = pl.read_csv(io.BytesIO(local.read_bytes()))
+        override = _normalize_squad_valuations(raw)
+        logger.info("ingest.squad_valuations.local", path=str(local), rows=override.height)
+
+    base_rows = _value_squads_from_kaggle(settings)
+    source = "kaggle"
+    if not base_rows:
+        base_rows = _scrape_squad_valuations(settings)
+        source = "transfermarkt"
+    base = _normalize_squad_valuations(pl.DataFrame(base_rows)) if base_rows else None
+    if base is not None:
+        logger.info("ingest.squad_valuations.scraped", rows=base.height, source=source)
+
+    if override is not None and base is not None:
+        # Partial override: drop the base rows the CSV replaces, then append the CSV rows.
+        kept = base.join(
+            override.select("team", "tournament"), on=["team", "tournament"], how="anti"
+        )
+        normalized = pl.concat([kept, override], how="vertical_relaxed")
+        logger.info(
+            "ingest.squad_valuations.merged",
+            base=base.height,
+            overridden=base.height - kept.height,
+            override=override.height,
+        )
+    elif override is not None:
+        normalized = override
+    elif base is not None:
+        normalized = base
+    else:
+        logger.info(
+            "ingest.squad_valuations.skip",
+            reason="no data/raw/squad_valuations.csv and Kaggle/scraper empty",
+        )
+        return 0
+
     write_table(Table.SQUAD_VALUATIONS, normalized, mode="overwrite", settings=settings)
     logger.info("ingest.squad_valuations.stored", rows=normalized.height)
     return normalized.height

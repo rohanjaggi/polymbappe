@@ -30,8 +30,10 @@ DEFAULT_ALIASES: dict[str, str] = {
     "korea republic": "South Korea",
     "republic of korea": "South Korea",
     "s. korea": "South Korea",
+    "korea, south": "South Korea",  # Kaggle player-scores citizenship spelling
     "korea dpr": "North Korea",
     "dpr korea": "North Korea",
+    "korea, north": "North Korea",  # Kaggle player-scores citizenship spelling
     # Iran
     "ir iran": "Iran",
     "iran (islamic republic of)": "Iran",

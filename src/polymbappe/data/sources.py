@@ -244,11 +244,14 @@ def fetch_kaggle_player_valuations(
 
     The values live in ``player_valuations.csv`` (``player_id, date, market_value_in_eur`` —
     no name) and the names/citizenship in ``players.csv`` (``player_id, name,
-    country_of_citizenship``); this joins them into one long frame so the ingest layer can do
-    leakage-safe point-in-time selection (latest value on/before a tournament's start) and
-    roster name-matching. Returns columns ``player, country_of_citizenship, date,
-    market_value_eur`` (one row per historical valuation, ``date`` as :class:`~datetime.date`,
-    ``market_value_eur`` as ``Float64``).
+    country_of_citizenship, date_of_birth``); this joins them into one long frame so the ingest
+    layer can do leakage-safe point-in-time selection (latest value on/before a tournament's
+    start) and roster name-matching. Returns columns ``player, country_of_citizenship,
+    birth_year, date, market_value_eur`` (one row per historical valuation, ``date`` as
+    :class:`~datetime.date`, ``birth_year`` as ``Int32`` (``null`` when ``date_of_birth`` is
+    missing/unparseable), ``market_value_eur`` as ``Float64``). ``birth_year`` lets the ingest
+    layer disambiguate distinct same-name, same-country players (e.g. the several Brazilian
+    "Marquinhos") that would otherwise collapse to one arbitrary valuation.
 
     Requires the optional ``kagglehub`` package; imported lazily so the dependency is needed
     only when this network path is taken. The dataset is public (no Kaggle auth required).
@@ -263,6 +266,12 @@ def fetch_kaggle_player_valuations(
         pl.col("player_id").cast(pl.Int64, strict=False),
         pl.col("name").cast(pl.Utf8).alias("player"),
         pl.col("country_of_citizenship").cast(pl.Utf8),
+        pl.col("date_of_birth")
+        .cast(pl.Utf8)
+        .str.to_date(format="%Y-%m-%d", strict=False)
+        .dt.year()
+        .cast(pl.Int32, strict=False)
+        .alias("birth_year"),
     )
     valuations = pl.read_csv(
         path / valuations_file, infer_schema_length=10_000, ignore_errors=True
@@ -272,7 +281,7 @@ def fetch_kaggle_player_valuations(
         pl.col("market_value_in_eur").cast(pl.Float64, strict=False).alias("market_value_eur"),
     )
     return valuations.join(players, on="player_id", how="inner").select(
-        "player", "country_of_citizenship", "date", "market_value_eur"
+        "player", "country_of_citizenship", "birth_year", "date", "market_value_eur"
     )
 
 
@@ -609,12 +618,25 @@ def _norm_heading(text: str) -> str:
     return " ".join(text.split()).strip().lower()
 
 
+def _is_non_name_token(text: str) -> bool:
+    """True when ``text`` is a roster annotation rather than a real name.
+
+    Wikipedia marks captains with a trailing ``(c)`` / ``(captain)`` anchor and squads carry
+    shirt-number cells; none of these are player or club names. Matching is case-insensitive
+    and paren-insensitive so ``(c)``, ``C``, ``Captain`` and empty/numeric tokens all drop.
+    """
+
+    token = text.strip().strip("()").strip().lower()
+    return not token or token.isdigit() or token in {"c", "captain", "vc", "vice-captain"}
+
+
 def _cell_text(cells: list, idx: int | None) -> str:
     """Meaningful text of ``cells[idx]``, or ``""`` when out of range.
 
     Wikipedia squad cells often lead with a flag-icon anchor whose text is empty (e.g. the
     Club cell is ``<flag link><club link>``), so the LAST non-empty, non-reference anchor is
-    taken; cells with no usable anchor fall back to their full stripped text.
+    taken; cells with no usable anchor fall back to their full stripped text. Captain-style
+    annotation anchors (``(c)``) are dropped so they are never mistaken for the name.
     """
 
     if idx is None or idx >= len(cells):
@@ -623,7 +645,7 @@ def _cell_text(cells: list, idx: int | None) -> str:
     texts = [
         t
         for a in cell.find_all("a")
-        if (t := a.get_text(strip=True)) and not t.startswith("[")
+        if (t := a.get_text(strip=True)) and not t.startswith("[") and not _is_non_name_token(t)
     ]
     return texts[-1] if texts else cell.get_text(" ", strip=True)
 
@@ -680,8 +702,8 @@ def _parse_wikipedia_squad(
             continue  # skip sub-rows / spanning rows that don't align to the header
 
         player = _cell_text(cells, player_idx)
-        if not player:
-            continue
+        if not player or _is_non_name_token(player):
+            continue  # empty / numeric / leftover captain annotation -> not a real player
         club = _cell_text(cells, club_idx) or None
 
         age: float | None = None
