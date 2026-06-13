@@ -51,6 +51,7 @@ def autotune(
     matches: pl.DataFrame,
     *,
     market_odds: pl.DataFrame | None = None,
+    squad_valuations: pl.DataFrame | None = None,
     tournaments: tuple[Tournament, ...] = DEFAULT_TOURNAMENTS,
     n_structural: int | None = None,
     n_trials: int = 30,
@@ -62,10 +63,19 @@ def autotune(
     gate = gate or AcceptanceGate()
     leaderboard = leaderboard or Leaderboard()
     objective = BacktestObjective(
-        matches=matches, tournaments=tournaments, market_odds=market_odds
+        matches=matches,
+        tournaments=tournaments,
+        market_odds=market_odds,
+        squad_valuations=squad_valuations,
     )
 
-    baseline = config_to_metrics({}, matches, tournaments=tournaments, market_odds=market_odds)
+    baseline = config_to_metrics(
+        {},
+        matches,
+        tournaments=tournaments,
+        market_odds=market_odds,
+        squad_valuations=squad_valuations,
+    )
     best_metrics = baseline
     best_config: dict[str, Any] = {}
     history: list[dict[str, Any]] = []
@@ -77,7 +87,11 @@ def autotune(
         exp = propose_structural_experiment(history)
         odds = None if exp.exclude_market else market_odds
         metrics = config_to_metrics(
-            exp.config, matches, tournaments=tournaments, market_odds=odds
+            exp.config,
+            matches,
+            tournaments=tournaments,
+            market_odds=odds,
+            squad_valuations=squad_valuations,
         )
         decision = gate.decide(metrics, best_metrics)
         leaderboard.record(exp.name, "phase1", decision, metrics, exp.config, exp.hypothesis)
@@ -154,8 +168,19 @@ def run_autotune(
         if table_exists(Table.MARKET_ODDS, settings)
         else None
     )
+    squad_valuations = (
+        read_table(Table.SQUAD_VALUATIONS, settings)
+        if table_exists(Table.SQUAD_VALUATIONS, settings)
+        else None
+    )
     n_trials = parse_budget_to_trials(budget)
-    result = autotune(matches, market_odds=market_odds, n_trials=n_trials, leaderboard=board)
+    result = autotune(
+        matches,
+        market_odds=market_odds,
+        squad_valuations=squad_valuations,
+        n_trials=n_trials,
+        leaderboard=board,
+    )
     print(
         f"baseline RPS={result.baseline_metrics.mean_rps:.4f} -> "
         f"best RPS={result.best_metrics.mean_rps:.4f}"

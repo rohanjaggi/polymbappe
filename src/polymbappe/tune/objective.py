@@ -118,10 +118,17 @@ def config_to_metrics(
     *,
     tournaments: tuple[Tournament, ...] = DEFAULT_TOURNAMENTS,
     market_odds: pl.DataFrame | None = None,
+    squad_valuations: pl.DataFrame | None = None,
 ) -> ExperimentMetrics:
-    """Evaluate one config via the leave-one-tournament-out backtest."""
+    """Evaluate one config via the leave-one-tournament-out backtest.
+
+    ``squad_valuations`` (when supplied) stacks the Tier-1 ``squad_value_ratio`` into the GBM;
+    ``features.toggle_squad_value`` (default True) lets the tuner switch it in/out so its RPS
+    contribution is measurable. The feature only has a path when the GBM is enabled.
+    """
 
     configs = config_to_configs(config)
+    use_squad = bool(_get(config, "features.toggle_squad_value", default=True))
     result = run_leave_one_tournament_out(
         matches,
         tournaments,
@@ -129,6 +136,7 @@ def config_to_metrics(
         ensemble_config=configs.ensemble,
         contextual_config=configs.contextual,
         market_odds=market_odds,
+        squad_valuations=squad_valuations if use_squad else None,
     )
     return ExperimentMetrics(
         mean_rps=result.mean_rps,
@@ -144,6 +152,7 @@ class BacktestObjective:
     matches: pl.DataFrame
     tournaments: tuple[Tournament, ...] = DEFAULT_TOURNAMENTS
     market_odds: pl.DataFrame | None = None
+    squad_valuations: pl.DataFrame | None = None
 
     def __call__(self, config: dict[str, Any]) -> ExperimentMetrics:
         return config_to_metrics(
@@ -151,4 +160,5 @@ class BacktestObjective:
             self.matches,
             tournaments=self.tournaments,
             market_odds=self.market_odds,
+            squad_valuations=self.squad_valuations,
         )

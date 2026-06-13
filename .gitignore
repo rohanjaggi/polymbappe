@@ -14,6 +14,7 @@ data/outputs/*
 !data/raw/polymarket_query.txt
 !data/raw/football_data_urls.txt
 !data/raw/player_attributes_kaggle.txt
+!data/raw/squad_valuations_kaggle.txt
 
 # Autotuner-generated best config (search space is tracked)
 configs/best_config.yaml
