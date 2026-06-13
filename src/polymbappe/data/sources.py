@@ -156,7 +156,15 @@ def cached_get(
     host = urlsplit(url).netloc
     _throttle(host, min_interval)
 
-    response = _fetcher(url, headers=_BROWSER_HEADERS, timeout=timeout)
+    for attempt in range(4):
+        response = _fetcher(url, headers=_BROWSER_HEADERS, timeout=timeout)
+        if response.status_code == 429:
+            backoff = 15 * (2 ** attempt)
+            logger.warning("sources.rate_limited", url=url, backoff=backoff, attempt=attempt + 1)
+            time.sleep(backoff)
+            _throttle(host, min_interval)
+            continue
+        break
     response.raise_for_status()
     content = response.content
 

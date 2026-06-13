@@ -776,6 +776,10 @@ def _player_name_key(col: str) -> pl.Expr:
 # only the few matched values yields a confidently-wrong near-€0 total that the GBM reads as the
 # cheapest possible squad and can't route around; absence is the honest signal.
 MIN_SQUAD_MATCH_RATE = 0.5
+# Groups with at least this fraction matched (but below MIN_SQUAD_MATCH_RATE) get their
+# unmatched players imputed with the team median before aggregation. Groups below this are still
+# dropped — too few real values for the median to be meaningful.
+MIN_SQUAD_IMPUTE_RATE = 0.25
 
 
 def _join_rosters_to_kaggle(settings: Settings) -> pl.DataFrame | None:
@@ -966,9 +970,12 @@ def _value_squads_from_kaggle(settings: Settings) -> list[dict[str, object]]:
         .agg(pl.col("market_value_eur").is_not_null().mean().alias("rate"))
     )
     kept = coverage.filter(pl.col("rate") >= MIN_SQUAD_MATCH_RATE).select("team", "tournament")
+    imputed_groups = coverage.filter(
+        (pl.col("rate") >= MIN_SQUAD_IMPUTE_RATE) & (pl.col("rate") < MIN_SQUAD_MATCH_RATE)
+    ).select("team", "tournament")
     dropped = [
         {"team": r["team"], "tournament": r["tournament"], "match_rate": round(r["rate"], 3)}
-        for r in coverage.filter(pl.col("rate") < MIN_SQUAD_MATCH_RATE).iter_rows(named=True)
+        for r in coverage.filter(pl.col("rate") < MIN_SQUAD_IMPUTE_RATE).iter_rows(named=True)
     ]
     matched = int(joined["market_value_eur"].is_not_null().sum())
     total = joined.height
@@ -976,7 +983,7 @@ def _value_squads_from_kaggle(settings: Settings) -> list[dict[str, object]]:
         logger.info(
             "ingest.squad_valuations.kaggle_dropped",
             count=len(dropped),
-            threshold=MIN_SQUAD_MATCH_RATE,
+            threshold=MIN_SQUAD_IMPUTE_RATE,
             groups=dropped,
         )
     logger.info(
@@ -986,6 +993,40 @@ def _value_squads_from_kaggle(settings: Settings) -> list[dict[str, object]]:
         match_rate=round(matched / total, 3) if total else 0.0,
         dropped=len(dropped),
     )
+
+    # Teams above MIN_SQUAD_MATCH_RATE: use raw values as-is.
+    clean_rows = joined.join(kept, on=["team", "tournament"], how="inner")
+
+    # Teams in the impute band: fill null values with the team median so the aggregate
+    # isn't dragged to a false €0 floor by players whose clubs aren't on Transfermarkt.
+    imputed_frame = joined.join(imputed_groups, on=["team", "tournament"], how="inner")
+    if not imputed_frame.is_empty():
+        team_medians = (
+            imputed_frame.group_by(["team", "tournament"])
+            .agg(pl.col("market_value_eur").median().alias("team_median"))
+        )
+        imputed_frame = (
+            imputed_frame.join(team_medians, on=["team", "tournament"], how="left")
+            .with_columns(
+                pl.when(pl.col("market_value_eur").is_null())
+                .then(pl.col("team_median"))
+                .otherwise(pl.col("market_value_eur"))
+                .alias("market_value_eur")
+            )
+            .drop("team_median")
+        )
+        imputed_teams = imputed_frame.select("team", "tournament").unique().to_series(0).to_list()
+        logger.info(
+            "ingest.squad_valuations.kaggle_imputed",
+            count=len(imputed_teams),
+            impute_threshold=MIN_SQUAD_IMPUTE_RATE,
+            teams=sorted(imputed_teams),
+        )
+
+    all_rows = pl.concat(
+        [f for f in [clean_rows, imputed_frame if not imputed_frame.is_empty() else None] if f is not None],
+        how="vertical_relaxed",
+    )
     player_rows = [
         {
             "player": r["player"],
@@ -993,7 +1034,7 @@ def _value_squads_from_kaggle(settings: Settings) -> list[dict[str, object]]:
             "team": r["team"],
             "tournament": r["tournament"],
         }
-        for r in joined.join(kept, on=["team", "tournament"], how="inner").iter_rows(named=True)
+        for r in all_rows.iter_rows(named=True)
     ]
     return _aggregate_squad_valuations(player_rows)
 
@@ -1419,7 +1460,9 @@ def _scrape_manager_records(settings: Settings) -> pl.DataFrame | None:
     tenure_rows: list[dict[str, object]] = []
     for entry in manifest.iter_rows(named=True):
         tenure_rows.extend(
-            sources.fetch_wikipedia_manager_history(str(entry["manager"]), settings=settings)
+            sources.fetch_wikipedia_manager_history(
+                str(entry["manager"]), settings=settings, min_interval=3.0
+            )
         )
     if not tenure_rows:
         return None

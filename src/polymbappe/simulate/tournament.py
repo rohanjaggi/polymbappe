@@ -638,20 +638,72 @@ def _live_fixture_context(
     return FixtureContext(overperf=overperf, elo=elo or {}, cohesion=cohesion, manager=manager)
 
 
+def _wc2026_team_travel(settings: object) -> dict[str, float]:
+    """Mean per-match travel km for each WC2026 team, derived from the ingested schedule.
+
+    Computes haversine city-to-city travel across each team's group-stage matches (sorted by
+    date) using the ingested ``city_coords`` gazetteer. Returns ``{team: mean_travel_km}``.
+    Falls back to an empty dict (all-zero default) when schedule or coords are missing.
+    """
+
+    from polymbappe.context.fatigue import build_city_coord_lookup, build_match_travel_features
+    from polymbappe.data.store import read_table, table_exists
+    from polymbappe.data.tables import Table
+
+    if not (
+        table_exists(Table.SCHEDULE, settings)  # type: ignore[arg-type]
+        and table_exists(Table.CITY_COORDS, settings)  # type: ignore[arg-type]
+    ):
+        return {}
+
+    schedule = read_table(Table.SCHEDULE, settings)  # type: ignore[arg-type]
+    city_coords = read_table(Table.CITY_COORDS, settings)  # type: ignore[arg-type]
+    coords = build_city_coord_lookup(city_coords)
+    if not coords:
+        return {}
+
+    group_fixtures = schedule.filter(
+        pl.col("stage").str.contains("Matchday") & pl.col("city").is_not_null()
+    )
+    if group_fixtures.is_empty():
+        return {}
+
+    travel = build_match_travel_features(group_fixtures, coords)
+    mean_travel = (
+        travel.group_by("team")
+        .agg(pl.col("travel_km").mean().alias("mean_travel_km"))
+    )
+    return {r["team"]: float(r["mean_travel_km"]) for r in mean_travel.iter_rows(named=True)}
+
+
 def _context_feature_frame(
-    teams: list[str], ctx: FixtureContext
+    teams: list[str], ctx: FixtureContext, team_travel: dict[str, float] | None = None
 ) -> tuple[list[tuple[str, str]], pl.DataFrame]:
     """Per-ordered-pair contextual feature frame for the live teams (testable seam).
 
     Returns the ordered ``(home, away)`` pairs and the matching feature frame whose columns
     are exactly :data:`~polymbappe.context.runtime.SIM_CONTEXT_FEATURES`, built through the
     same :func:`~polymbappe.context.runtime.fixture_feature_row` the fit path uses.
+
+    ``team_travel`` maps each team to its mean within-tournament travel km (computed from
+    the WC2026 schedule). When provided, it is passed as ``home_travel_km`` /
+    ``away_travel_km`` so the contextual adjuster sees realistic travel values rather than
+    the all-zero default — preventing the adjuster from incorrectly treating every away team
+    as "local" (0 km) and inflating their win probability.
     """
 
     from polymbappe.context.runtime import fixture_feature_row
 
+    travel = team_travel or {}
     pairs = [(h, a) for h in teams for a in teams if h != a]
-    rows = [fixture_feature_row(h, a, ctx) for h, a in pairs]
+    rows = [
+        fixture_feature_row(
+            h, a, ctx,
+            home_travel_km=travel.get(h, 0.0),
+            away_travel_km=travel.get(a, 0.0),
+        )
+        for h, a in pairs
+    ]
     return pairs, pl.DataFrame(rows)
 
 
@@ -686,7 +738,8 @@ def _load_context_hook(
         return None
 
     ctx = _live_fixture_context(settings, elo, logger)
-    pairs, frame = _context_feature_frame(structure.teams, ctx)
+    team_travel = _wc2026_team_travel(settings)
+    pairs, frame = _context_feature_frame(structure.teams, ctx, team_travel=team_travel)
     raw = adjuster.predict_adjustment(frame)  # type: ignore[attr-defined]  # one batched call
     cache = {pair: raw[i] for i, pair in enumerate(pairs)}
     cap = adjuster.config.cap  # type: ignore[attr-defined]
