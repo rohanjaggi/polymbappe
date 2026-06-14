@@ -172,6 +172,7 @@ class SimulationResult:
     n_sims: int
     stage_counts: dict[str, dict[str, int]]
     group_finish_counts: dict[str, dict[int, int]]
+    r32_matchup_counts: dict[tuple[str, str], int]
 
     def stage_probabilities(self) -> pl.DataFrame:
         rows = [
@@ -296,6 +297,7 @@ def simulate_tournament(
     teams = structure.teams
     stage_counts: dict[str, dict[str, int]] = {t: {} for t in teams}
     group_finish: dict[str, dict[int, int]] = {t: {} for t in teams}
+    matchup_counts: dict[tuple[str, str], int] = {}
     # The winner of each round reaches the next stage (R16 round -> QF teams, etc.).
     later_rounds = ("QF", "SF", "FINAL", "champion")
 
@@ -325,6 +327,8 @@ def simulate_tournament(
         for tie in ties:
             for team in (tie.home_team, tie.away_team):
                 stage_counts[team]["R32"] = stage_counts[team].get("R32", 0) + 1
+            key = (tie.home_team, tie.away_team)
+            matchup_counts[key] = matchup_counts.get(key, 0) + 1
 
         # R32 round: winners reach R16. The upset floor applies only here (spec 4.2).
         current = [
@@ -350,7 +354,10 @@ def simulate_tournament(
             current = winners_next
 
     return SimulationResult(
-        n_sims=n_sims, stage_counts=stage_counts, group_finish_counts=group_finish
+        n_sims=n_sims,
+        stage_counts=stage_counts,
+        group_finish_counts=group_finish,
+        r32_matchup_counts=matchup_counts,
     )
 
 
@@ -564,6 +571,10 @@ def run_tournament_simulation(
     result.stage_probabilities().write_parquet(out / "stage_probabilities.parquet")
     result.group_probabilities().write_parquet(out / "group_probabilities.parquet")
     predictions.write_parquet(out / "match_predictions.parquet")
+    from polymbappe.simulate.knockout_predictions import compute_knockout_predictions
+    compute_knockout_predictions(result.r32_matchup_counts, n_sims, model).write_parquet(
+        out / "knockout_predictions.parquet"
+    )
     # Refresh odds AFTER fixtures are written so Polymarket can align to them, then edges.
     if refresh_odds or live:
         refresh_market_odds(settings, logger)

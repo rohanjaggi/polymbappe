@@ -68,6 +68,18 @@ EDGES_SCHEMA: dict[str, pl.DataType] = {
     "kelly_fraction": pl.Float64,
 }
 
+KO_SCHEMA: dict[str, pl.DataType] = {
+    "rank": pl.Int32,
+    "home_team": pl.Utf8,
+    "away_team": pl.Utf8,
+    "matchup_prob": pl.Float64,
+    "model_home": pl.Float64,
+    "model_draw": pl.Float64,
+    "model_away": pl.Float64,
+    "exp_home_goals": pl.Float64,
+    "exp_away_goals": pl.Float64,
+}
+
 CHANGELOG_SCHEMA: dict[str, pl.DataType] = {
     "timestamp": pl.Utf8,
     "team": pl.Utf8,
@@ -170,6 +182,16 @@ def load_agent_changelog(settings: Settings) -> pl.DataFrame:
     """
 
     return _read_or_empty(_output_path(settings, "agent_changelog.parquet"), CHANGELOG_SCHEMA)
+
+
+def load_knockout_predictions(settings: Settings) -> pl.DataFrame:
+    """Load R32 probable matchups (``knockout_predictions.parquet``).
+
+    Columns: ``rank, home_team, away_team, matchup_prob, model_home, model_draw,
+    model_away, exp_home_goals, exp_away_goals``.
+    """
+
+    return _read_or_empty(_output_path(settings, "knockout_predictions.parquet"), KO_SCHEMA)
 
 
 def load_recorded_results(settings: Settings) -> pl.DataFrame:

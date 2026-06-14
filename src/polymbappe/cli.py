@@ -291,9 +291,27 @@ def agent_command(
 def dashboard_command() -> None:
     """Launch the Streamlit dashboard (Section 6)."""
 
-    from polymbappe.dashboard.app import main
+    import subprocess
+    import sys
+    from pathlib import Path
 
-    main()
+    app_path = Path(__file__).parent / "dashboard" / "app.py"
+    subprocess.run([sys.executable, "-m", "streamlit", "run", str(app_path)], check=False)
+
+
+@app.command("refresh")
+def refresh_command(
+    n_sims: int = typer.Option(50_000, help="Monte Carlo simulation count."),
+) -> None:
+    """Full live-update cycle: ingest results → re-train DC → re-simulate.
+
+    Run once after each match day. Ingest fetches live results and odds;
+    train re-fits Dixon-Coles; simulate rebuilds all parquet outputs including
+    knockout predictions and market edges.
+    """
+    ingest_all_sources(live=True)
+    train_models(model="dixon_coles")
+    run_tournament_simulation(n_sims=n_sims, live=True, refresh_odds=True)
 
 
 def main() -> None:

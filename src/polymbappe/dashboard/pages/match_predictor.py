@@ -41,6 +41,18 @@ def render(settings: Settings) -> None:
 
     st.header("Match Predictor")
 
+    tab_group, tab_r32 = st.tabs(["Group Stage", "Round of 32"])
+
+    with tab_group:
+        _render_group_stage(st, settings)
+
+    with tab_r32:
+        _render_r32(st, settings)
+
+
+def _render_group_stage(st: object, settings: Settings) -> None:
+    """Group-stage tab: upcoming and finished group fixtures."""
+
     match_df = data.load_match_predictions(settings)
     if match_df.is_empty():
         st.info(
@@ -178,3 +190,63 @@ def _results_table(finished: pl.DataFrame) -> object:
             }
         )
     return pl.DataFrame(rows).to_pandas()
+
+
+def _render_r32(st: object, settings: Settings) -> None:
+    """Round of 32 tab: most probable R32 matchups from simulation frequency."""
+
+    ko_df = data.load_knockout_predictions(settings)
+    if ko_df.is_empty():
+        st.info(
+            "No Round of 32 predictions yet. Run `polymbappe simulate` to generate them."
+        )
+        return
+
+    st.caption(
+        "Matchup probability is the fraction of simulations where these two teams met in the "
+        "Round of 32. The R32 bracket is seeded randomly (beyond the top-4 ranked group "
+        "winners), so this reflects genuine pre-tournament uncertainty."
+    )
+
+    top_n = st.slider("Show top matchups", min_value=8, max_value=min(50, ko_df.height), value=16)
+    view = ko_df.head(top_n)
+
+    table_rows = []
+    for r in view.iter_rows(named=True):
+        home = str(r["home_team"])
+        away = str(r["away_team"])
+        table_rows.append(
+            {
+                "Rank": int(r["rank"]),
+                "Fixture": f"{home} vs {away}",
+                "Match prob": f"{float(r['matchup_prob']):.1%}",
+                f"P({home})": f"{float(r['model_home']):.1%}",
+                "P(Draw)": f"{float(r['model_draw']):.1%}",
+                f"P({away})": f"{float(r['model_away']):.1%}",
+                "xG": f"{float(r['exp_home_goals']):.2f} – {float(r['exp_away_goals']):.2f}",
+            }
+        )
+    st.dataframe(pl.DataFrame(table_rows).to_pandas(), use_container_width=True, hide_index=True)
+
+    st.subheader("Inspect a probable matchup")
+    labels = [f"#{int(r['rank'])}: {r['home_team']} vs {r['away_team']}" for r in view.iter_rows(named=True)]
+    choice = st.selectbox("Choose matchup", labels, key="r32_fixture")
+    record = view.row(labels.index(choice), named=True)
+
+    home = str(record["home_team"])
+    away = str(record["away_team"])
+    st.plotly_chart(
+        charts.hda_bar(
+            float(record["model_home"]),
+            float(record["model_draw"]),
+            float(record["model_away"]),
+            home=home,
+            away=away,
+        ),
+        use_container_width=True,
+    )
+    cols = st.columns(4)
+    cols[0].metric(f"{home} win", f"{float(record['model_home']):.1%}")
+    cols[1].metric("Draw", f"{float(record['model_draw']):.1%}")
+    cols[2].metric(f"{away} win", f"{float(record['model_away']):.1%}")
+    cols[3].metric("Match probability", f"{float(record['matchup_prob']):.1%}")

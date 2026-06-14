@@ -23,6 +23,21 @@ dixon_coles:
   xi: {type: float, low: 0.001, high: 0.003}
   friendly_weight: {type: float, low: 0.1, high: 0.5}
   max_goals: {type: categorical, choices: [8, 10, 12]}
+  # goals_cap: hard cap on observed goals per team to prevent extreme scorelines such as
+  # Norway 11-1 Moldova from dominating the Poisson likelihood and inflating parameters.
+  goals_cap: {type: categorical, choices: [6, 7, 8, null]}
+  # l2_attack / l2_defense: L2 regularization pulling extreme estimates toward the global
+  # mean.  0 = no regularization; higher values shrink parameters more aggressively.
+  l2_attack: {type: float, low: 0.0, high: 2.0}
+  l2_defense: {type: float, low: 0.0, high: 2.0}
+  # afc_qualifier_weight: down-weights AFC-vs-AFC WC qualification matches.  Asian WC
+  # qualifiers include very weak teams (Myanmar, Indonesia, etc.) whose heavy losses
+  # inflate the parameters of stronger Asian sides beyond what European/SA data supports.
+  afc_qualifier_weight: {type: float, low: 0.2, high: 0.7}
+  # altitude_qualifier_weight: down-weights home WC qualifier matches for Ecuador/Bolivia.
+  # Their home venues (Quito ~2800m, La Paz ~3600m) cause visiting teams to score fewer
+  # goals due to altitude rather than defensive quality — an effect absent at WC2026 venues.
+  altitude_qualifier_weight: {type: float, low: 0.2, high: 0.7}
 
 features:
   elo_k_factor: {type: float, low: 10.0, high: 40.0}
