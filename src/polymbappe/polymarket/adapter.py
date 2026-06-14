@@ -13,7 +13,9 @@ from typing import Any
 import polars as pl
 import requests
 
-GAMMA_MARKETS_URL = "https://gamma-api.polymarket.com/markets"
+GAMMA_BASE_URL = "https://gamma-api.polymarket.com"
+GAMMA_MARKETS_URL = f"{GAMMA_BASE_URL}/markets"
+GAMMA_EVENTS_URL = f"{GAMMA_BASE_URL}/events"
 
 _HEADERS = {"User-Agent": "polymbappe/0.1 (+https://github.com/)"}
 
@@ -51,19 +53,65 @@ def parse_market_outcomes(raw: dict[str, Any]) -> list[dict[str, Any]]:
     return rows
 
 
+def _gamma_data(payload: Any) -> list[dict[str, Any]]:
+    """Unwrap a gamma-API JSON payload to its list of objects (handles ``{"data": [...]}``)."""
+
+    objects = payload.get("data", payload) if isinstance(payload, dict) else payload
+    return list(objects)
+
+
+def fetch_polymarket_events(
+    tag_slug: str, *, limit: int = 100, timeout: float = 30.0
+) -> list[dict[str, Any]]:
+    """Page through active, open events grouped under a gamma **tag** slug.
+
+    The gamma ``/events`` endpoint caps each page at ``limit`` rows, so this walks
+    ``offset`` until a short page is returned.
+    """
+
+    events: list[dict[str, Any]] = []
+    offset = 0
+    while True:
+        params: dict[str, Any] = {
+            "tag_slug": tag_slug,
+            "active": "true",
+            "closed": "false",
+            "limit": limit,
+            "offset": offset,
+        }
+        response = requests.get(GAMMA_EVENTS_URL, params=params, headers=_HEADERS, timeout=timeout)
+        response.raise_for_status()
+        page = _gamma_data(response.json())
+        events.extend(page)
+        if len(page) < limit:
+            return events
+        offset += limit
+
+
 def fetch_polymarket_markets(
     *, query: str | None = None, limit: int = 100, timeout: float = 30.0
 ) -> list[dict[str, Any]]:
-    """Fetch active, open market objects from the Polymarket gamma API."""
+    """Fetch active, open market objects from the Polymarket gamma API.
 
-    params: dict[str, Any] = {"limit": limit, "active": "true", "closed": "false"}
-    if query is not None:
-        params["slug"] = query
-    response = requests.get(GAMMA_MARKETS_URL, params=params, headers=_HEADERS, timeout=timeout)
-    response.raise_for_status()
-    payload = response.json()
-    markets = payload.get("data", payload) if isinstance(payload, dict) else payload
-    return list(markets)
+    ``query`` is a gamma **event tag** slug (e.g. ``world-cup``), *not* an individual
+    market slug. Per-match three-way (home/draw/away) markets are listed as sub-markets
+    of the events grouped under a tournament's tag, so they are reached via ``/events``
+    and flattened out of each event's ``markets`` list. Passing a tag/event slug to
+    ``/markets?slug=`` — which filters by an individual *market* slug — silently returns
+    nothing; that mismatch was the original bug. With ``query=None`` the bare ``/markets``
+    listing is returned unchanged.
+    """
+
+    if query is None:
+        params: dict[str, Any] = {"limit": limit, "active": "true", "closed": "false"}
+        response = requests.get(GAMMA_MARKETS_URL, params=params, headers=_HEADERS, timeout=timeout)
+        response.raise_for_status()
+        return _gamma_data(response.json())
+
+    markets: list[dict[str, Any]] = []
+    for event in fetch_polymarket_events(query, limit=limit, timeout=timeout):
+        markets.extend(event.get("markets") or [])
+    return markets
 
 
 def fetch_polymarket_prices(

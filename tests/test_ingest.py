@@ -1165,6 +1165,54 @@ def test_normalize_footballdata_prefix_fallback() -> None:
     assert out.height == 1
 
 
+def test_fetch_polymarket_markets_flattens_event_submarkets(monkeypatch) -> None:
+    """A tag-slug query hits /events and flattens each event's sub-markets (not /markets?slug=)."""
+
+    from polymbappe.polymarket import adapter
+
+    calls: list[dict] = []
+
+    class _Resp:
+        def __init__(self, payload):
+            self._payload = payload
+
+        def raise_for_status(self) -> None:
+            pass
+
+        def json(self):
+            return self._payload
+
+    def _fake_get(url, params=None, headers=None, timeout=None):
+        calls.append({"url": url, "params": params})
+        # One page of events under the tag, then an empty page stops pagination.
+        if params.get("offset", 0) == 0:
+            return _Resp(
+                {
+                    "data": [
+                        {"markets": [{"id": "g1", "question": "ARG v FRA",
+                                      "outcomes": '["Argentina","Draw","France"]',
+                                      "outcomePrices": '["0.5","0.25","0.25"]'}]},
+                        {"markets": [{"id": "g2", "question": "Top scorer",
+                                      "outcomes": '["Messi","No"]',
+                                      "outcomePrices": '["0.1","0.9"]'}]},
+                    ]
+                }
+            )
+        return _Resp({"data": []})
+
+    monkeypatch.setattr(adapter.requests, "get", _fake_get)
+
+    markets = adapter.fetch_polymarket_markets(query="world-cup", limit=2)
+    assert calls[0]["url"] == adapter.GAMMA_EVENTS_URL  # routed to /events, not /markets
+    assert calls[0]["params"]["tag_slug"] == "world-cup"
+    assert {m["id"] for m in markets} == {"g1", "g2"}  # sub-markets flattened out of events
+
+    long = adapter.fetch_polymarket_prices(query="world-cup", limit=2)
+    tw = adapter.normalize_polymarket_three_way(long)
+    assert tw.height == 1  # only the ARG/FRA 3-way survives; the Yes/No prop is dropped
+    assert set(tw.row(0, named=True)["question"].split()) >= {"ARG", "FRA"}
+
+
 def test_polymarket_three_way_and_alignment() -> None:
     from polymbappe.polymarket.adapter import (
         align_polymarket_to_fixtures,
