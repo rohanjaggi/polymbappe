@@ -20,6 +20,7 @@ than crashing before the first ``polymbappe simulate`` run.
 
 from __future__ import annotations
 
+import math
 from datetime import UTC
 from pathlib import Path
 
@@ -371,6 +372,128 @@ def split_fixtures(
         )
     )
     return upcoming, finished
+
+
+#: Per-outcome accuracy frame schema (output of :func:`accuracy_by_outcome`).
+OUTCOME_ACCURACY_SCHEMA: dict[str, pl.DataType] = {
+    "actual_outcome": pl.Utf8,
+    "n": pl.Int64,
+    "hits": pl.Int64,
+    "accuracy": pl.Float64,
+}
+
+#: Calibration-bin frame schema (output of :func:`calibration_bins`).
+CALIBRATION_SCHEMA: dict[str, pl.DataType] = {
+    "bin_lower": pl.Float64,
+    "bin_upper": pl.Float64,
+    "mean_confidence": pl.Float64,
+    "hit_rate": pl.Float64,
+    "count": pl.Int64,
+}
+
+
+def prediction_scorecard(finished: pl.DataFrame) -> dict[str, float]:
+    """Aggregate accuracy / Brier / log-loss over finished fixtures (spec 6.1, page 7).
+
+    Scores the model's pre-match H/D/A probabilities against recorded outcomes. Expects
+    the ``finished`` frame returned by :func:`split_fixtures` (carrying ``model_home``/
+    ``model_draw``/``model_away``, ``actual_outcome`` and ``model_correct``). All metrics
+    are lower-is-better except ``accuracy``:
+
+    - ``accuracy``: share of matches where the model's top pick matched the outcome.
+    - ``brier_score``: mean multiclass Brier score (sum of squared errors over H/D/A),
+      ranging 0 (perfect) to 2 (worst).
+    - ``log_loss``: mean negative log-probability assigned to the realized outcome.
+
+    Returns a zeroed scorecard (``n == 0``) for an empty frame so the page can render a
+    "no data yet" state.
+    """
+
+    if finished.is_empty():
+        return {"n": 0.0, "accuracy": 0.0, "brier_score": 0.0, "log_loss": 0.0}
+
+    n = finished.height
+    eps = 1e-12
+    brier_total = 0.0
+    log_total = 0.0
+    for r in finished.iter_rows(named=True):
+        probs = {
+            "home": float(r["model_home"]),
+            "draw": float(r["model_draw"]),
+            "away": float(r["model_away"]),
+        }
+        actual = str(r["actual_outcome"])
+        for outcome, p in probs.items():
+            target = 1.0 if outcome == actual else 0.0
+            brier_total += (p - target) ** 2
+        log_total += -math.log(max(probs[actual], eps))
+
+    return {
+        "n": float(n),
+        "accuracy": float(finished["model_correct"].sum()) / n,
+        "brier_score": brier_total / n,
+        "log_loss": log_total / n,
+    }
+
+
+def accuracy_by_outcome(finished: pl.DataFrame) -> pl.DataFrame:
+    """Top-pick accuracy grouped by realized outcome (spec 6.1, page 7).
+
+    Splits the ``finished`` frame (see :func:`split_fixtures`) by ``actual_outcome`` and
+    reports the count, hits and accuracy of the model's top pick within each. Returns a
+    typed empty frame when there are no finished fixtures.
+    """
+
+    if finished.is_empty():
+        return pl.DataFrame(schema=OUTCOME_ACCURACY_SCHEMA)
+
+    return (
+        finished.group_by("actual_outcome")
+        .agg(
+            pl.len().alias("n"),
+            pl.col("model_correct").cast(pl.Int64).sum().alias("hits"),
+        )
+        .with_columns((pl.col("hits") / pl.col("n")).alias("accuracy"))
+        .sort("actual_outcome")
+    )
+
+
+def calibration_bins(finished: pl.DataFrame, *, n_bins: int = 5) -> pl.DataFrame:
+    """Reliability bins of forecast confidence vs. observed hit rate (spec 6.1, page 7).
+
+    Bins the finished fixtures by the probability the model assigned to its favoured
+    outcome (its "confidence", the max of H/D/A) into ``n_bins`` equal-width buckets over
+    ``[0, 1]``, and reports the mean confidence, observed hit rate and count per non-empty
+    bucket. A well-calibrated model tracks the diagonal (mean confidence ≈ hit rate).
+    Returns a typed empty frame when there are no finished fixtures.
+    """
+
+    if finished.is_empty():
+        return pl.DataFrame(schema=CALIBRATION_SCHEMA)
+
+    df = finished.with_columns(
+        pl.max_horizontal("model_home", "model_draw", "model_away").alias("confidence")
+    )
+    df = df.with_columns(
+        pl.min_horizontal(
+            (pl.col("confidence") * n_bins).floor().cast(pl.Int64),
+            pl.lit(n_bins - 1),
+        ).alias("_bin")
+    )
+    return (
+        df.group_by("_bin")
+        .agg(
+            pl.col("confidence").mean().alias("mean_confidence"),
+            pl.col("model_correct").cast(pl.Float64).mean().alias("hit_rate"),
+            pl.len().alias("count"),
+        )
+        .sort("_bin")
+        .with_columns(
+            (pl.col("_bin") / n_bins).alias("bin_lower"),
+            ((pl.col("_bin") + 1) / n_bins).alias("bin_upper"),
+        )
+        .select(list(CALIBRATION_SCHEMA.keys()))
+    )
 
 
 def upset_candidates(
