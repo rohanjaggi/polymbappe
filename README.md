@@ -91,7 +91,7 @@ core pipeline.
 
 | File | Enables | Format |
 |------|---------|--------|
-| `polymarket_query.txt` *(tracked)* | Polymarket market slug filter | one slug, e.g. `fifa-world-cup-2026` |
+| `polymarket_query.txt` *(tracked)* | Polymarket event **tag** slug for per-match odds | one tag slug, e.g. `world-cup` |
 | `player_attributes_kaggle.txt` *(tracked)* | Kaggle dataset for player attributes | dataset slug + optional `file=` line |
 | `player_attributes.csv` | local player attributes (skips Kaggle) | `team,player,overall` |
 | `squad_valuations_kaggle.txt` *(tracked)* | Kaggle dataset for offline Transfermarkt squad values | dataset slug |
@@ -110,8 +110,9 @@ joins (results, squads, market odds) line up.
 
 ### Live Polymarket edges
 No credentials and no extra dependency required — reads the public Polymarket
-Gamma API over `requests`. The market slug filter lives in
-`data/raw/polymarket_query.txt` (default `fifa-world-cup-2026`).
+Gamma API over `requests`. Per-match odds are discovered by the event **tag** slug
+in `data/raw/polymarket_query.txt` (default `world-cup`): the adapter pulls every
+active event under that tag and keeps the clean three-way (home/draw/away) markets.
 
 ```bash
 polymbappe simulate --live                          # pull live odds during simulate
