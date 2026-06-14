@@ -58,20 +58,26 @@ def config_to_configs(config: dict[str, Any]) -> BacktestConfigs:
     baseline as before while every sampled group now feeds a real knob.
     """
 
+    _raw_goals_cap = _get(config, "dixon_coles.goals_cap", default=7)
     dc = DixonColesConfig(
-        xi=float(_get(config, "dixon_coles.xi", default=0.0019)),
-        friendly_weight=float(_get(config, "dixon_coles.friendly_weight", default=0.3)),
+        xi=float(_get(config, "dixon_coles.xi", default=0.0015)),
+        friendly_weight=float(_get(config, "dixon_coles.friendly_weight", default=0.46)),
         max_goals=int(_get(config, "dixon_coles.max_goals", default=10)),
+        goals_cap=None if _raw_goals_cap is None else int(_raw_goals_cap),
+        l2_attack=float(_get(config, "dixon_coles.l2_attack", default=0.1)),
+        l2_defense=float(_get(config, "dixon_coles.l2_defense", default=0.1)),
+        afc_qualifier_weight=float(_get(config, "dixon_coles.afc_qualifier_weight", default=0.4)),
+        altitude_qualifier_weight=float(_get(config, "dixon_coles.altitude_qualifier_weight", default=0.4)),
     )
-    elo = EloConfig(k_factor=float(_get(config, "features.elo_k_factor", default=20.0)))
+    elo = EloConfig(k_factor=float(_get(config, "features.elo_k_factor", default=34.0)))
     base = BaseProbConfig(
         dixon_coles=dc,
         elo=elo,
-        draw_max=float(_get(config, "features.draw_max", default=0.28)),
+        draw_max=float(_get(config, "features.draw_max", default=0.23)),
     )
 
     meta = MetaConfig(
-        C=float(_get(config, "ensemble.meta_C", default=1.0)),
+        C=float(_get(config, "ensemble.meta_C", default=0.74)),
         learner=str(_get(config, "ensemble.meta_learner", default="logistic")),
     )
     gbm = GBMConfig(

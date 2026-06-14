@@ -1,6 +1,6 @@
 """Streamlit dashboard entry point (spec section 6).
 
-Six-page sidebar navigation dispatching to the page renderers in
+Seven-page sidebar navigation dispatching to the page renderers in
 :mod:`polymbappe.dashboard.pages` (spec section 6.1). ``streamlit`` is imported
 lazily inside :func:`main` so the module imports without the optional ``dashboard``
 extra installed.
@@ -19,6 +19,7 @@ from polymbappe.dashboard.pages import (
     market_edges,
     match_predictor,
     overview,
+    predictions_vs_actuals,
     team_deep_dive,
     upset_watch,
 )
@@ -28,6 +29,7 @@ PAGES: dict[str, Callable[[Settings], None]] = {
     "Tournament Overview": overview.render,
     "Team Deep Dive": team_deep_dive.render,
     "Match Predictor": match_predictor.render,
+    "Predictions vs Actuals": predictions_vs_actuals.render,
     "Market Edges": market_edges.render,
     "Upset Watch": upset_watch.render,
     "Agent Activity": agent_activity.render,

@@ -30,11 +30,31 @@ class MatchObservation:
 class DixonColesConfig:
     """Dixon-Coles hyperparameters."""
 
-    xi: float = 0.0019
-    friendly_weight: float = 0.3
+    xi: float = 0.0015
+    friendly_weight: float = 0.46
     max_goals: int = 10
     maxiter: int = 5000
     max_history_days: int = 4000
+    goals_cap: int | None = 7
+    """Cap observed goals per team to prevent extreme scorelines (e.g. Norway 11-1 Moldova)
+    from dominating the likelihood and inflating attack/defense parameters."""
+    l2_attack: float = 0.1
+    """L2 penalty on attack parameters — pulls extreme values toward the global mean
+    without distorting well-estimated mid-range teams."""
+    l2_defense: float = 0.1
+    """L2 penalty on defense parameters — same motivation as l2_attack."""
+    afc_qualifier_weight: float = 0.4
+    """Weight multiplier for AFC-vs-AFC WC qualification matches.  Teams in Asia
+    often face much weaker opposition than European/South American qualifiers, so
+    their domination of weak neighbours inflates attack and defense parameters.
+    Setting this below 1.0 moderates that effect without excluding the data."""
+    altitude_qualifier_weight: float = 0.4
+    """Weight multiplier for WC qualification matches where a high-altitude team
+    (Ecuador, Bolivia) plays at home.  Quito sits at ~2,800 m; visiting teams
+    score systematically fewer goals due to altitude, not because the home side
+    has elite defense.  At WC2026 (sea-level US/CAN/MEX venues) this altitude
+    effect disappears, so down-weighting prevents Ecuador's defense from being
+    inflated to #1 globally based on an artifact that won't replicate."""
 
 
 _COMPETITIVE_KEYWORDS = {
@@ -45,10 +65,31 @@ _COMPETITIVE_KEYWORDS = {
     "copa america",
 }
 
+# AFC teams whose WC qualification matches are down-weighted because they face
+# substantially weaker opposition than European / South American qualifiers.
+_AFC_TEAMS: frozenset[str] = frozenset({
+    "Japan", "South Korea", "Australia", "Iran", "Saudi Arabia", "Iraq",
+    "Uzbekistan", "Qatar", "China PR", "China", "Indonesia", "Myanmar",
+    "Vietnam", "Thailand", "Malaysia", "Philippines", "Bahrain", "Syria",
+    "Jordan", "Kuwait", "Oman", "Yemen", "Lebanon", "India", "Afghanistan",
+    "Maldives", "Bangladesh", "Sri Lanka", "Nepal", "Pakistan", "North Korea",
+    "Guam", "Mongolia", "Chinese Taipei", "Macau", "Hong Kong", "Brunei",
+    "Cambodia", "Laos", "Singapore", "Timor-Leste", "Tajikistan",
+    "Kyrgyzstan", "Turkmenistan", "Bhutan",
+})
+
+
+# Teams whose home WC qualification venues sit at high altitude (>2,000 m).
+# Visiting sides score systematically fewer goals there — an effect that
+# disappears at sea-level WC2026 venues but would otherwise inflate host defense.
+_ALTITUDE_TEAMS: frozenset[str] = frozenset({"Ecuador", "Bolivia"})
+
 
 def _is_competitive(competition: str) -> bool:
     lower = competition.lower()
     return any(keyword in lower for keyword in _COMPETITIVE_KEYWORDS)
+
+
 
 
 def tau_correction(x: int, y: int, lam: float, mu: float, rho: float) -> float:
@@ -142,19 +183,65 @@ class DixonColesModel(MatchModel):
         away_goals = np.array([m.away_goals for m in matches], dtype=np.int32)
         neutral = np.array([m.neutral_site for m in matches], dtype=bool)
 
-        # Weights: time decay * competition weight
+        # Fix 1: cap observed goals to prevent extreme scorelines (e.g. 11-1) from
+        # dominating the likelihood and creating unrealistic attack/defense parameters.
+        if self.config.goals_cap is not None:
+            home_goals = np.minimum(home_goals, self.config.goals_cap)
+            away_goals = np.minimum(away_goals, self.config.goals_cap)
+
+        # Weights: time decay * competition weight * confederation weight.
         days_ago = np.array([m.days_ago for m in matches], dtype=np.float64)
         comp_weight = np.array(
             [1.0 if _is_competitive(m.competition) else self.config.friendly_weight for m in matches],
             dtype=np.float64,
         )
-        weights = np.exp(-self.config.xi * days_ago) * comp_weight
+        # Fix 2: downweight AFC-vs-AFC WC qualification matches.  Asian qualifiers
+        # include very weak teams (Myanmar, Indonesia, etc.) that inflate the parameters
+        # of stronger AFC sides far beyond what they'd earn against European/SA opposition.
+        afc_w = self.config.afc_qualifier_weight
+        conf_weight = np.array(
+            [
+                afc_w
+                if (
+                    "world cup" in m.competition.lower()
+                    and "qualif" in m.competition.lower()
+                    and m.home_team in _AFC_TEAMS
+                    and m.away_team in _AFC_TEAMS
+                )
+                else 1.0
+                for m in matches
+            ],
+            dtype=np.float64,
+        )
+        # Fix 3: downweight WC qualifier home matches for altitude teams.  Quito
+        # sits at ~2,800 m; visiting sides score fewer goals there due to altitude,
+        # not Ecuador's defensive quality.  At WC2026 (sea-level venues) this
+        # effect won't replicate, so we reduce the influence of these matches.
+        alt_w = self.config.altitude_qualifier_weight
+        altitude_weight = np.array(
+            [
+                alt_w
+                if (
+                    "world cup" in m.competition.lower()
+                    and "qualif" in m.competition.lower()
+                    and m.home_team in _ALTITUDE_TEAMS
+                )
+                else 1.0
+                for m in matches
+            ],
+            dtype=np.float64,
+        )
+        weights = np.exp(-self.config.xi * days_ago) * comp_weight * conf_weight * altitude_weight
 
         # Tau correction masks (only applies when both goals <= 1).
         m00 = (home_goals == 0) & (away_goals == 0)
         m01 = (home_goals == 0) & (away_goals == 1)
         m10 = (home_goals == 1) & (away_goals == 0)
         m11 = (home_goals == 1) & (away_goals == 1)
+
+        # Capture regularization config for the closure below.
+        l2_attack = self.config.l2_attack
+        l2_defense = self.config.l2_defense
 
         def unpack(params: np.ndarray) -> tuple[np.ndarray, np.ndarray, float, float]:
             attack_free = params[: n_teams - 1]
@@ -188,6 +275,15 @@ class DixonColesModel(MatchModel):
             log_tau[m11] = np.log(tau_val[m11])
 
             nll = -float(np.sum(weights * (log_lik + log_tau)))
+
+            # Fix 3: L2 regularization on attack and defense parameters.
+            # Penalty = l2 * sum(param^2); gradient accounts for the sum-to-zero
+            # constraint: d(sum(p^2))/d(p_free[i]) = 2*(p[i] - p[-1]) where
+            # p[-1] = -sum(p_free) is the constrained (reference) team's parameter.
+            if l2_attack > 0.0:
+                nll += l2_attack * float(np.dot(attack, attack))
+            if l2_defense > 0.0:
+                nll += l2_defense * float(np.dot(defense, defense))
 
             # Gradient of Poisson NLL: d(-log P(k|λ))/dλ = 1 - k/λ, times dλ/dparam.
             # For home goals ~ Poisson(lam): d_nll/d_lam_i = (lam_i - home_goals_i)
@@ -226,12 +322,16 @@ class DixonColesModel(MatchModel):
             np.add.at(grad_attack, away_idx, d_mu_total)
             # Sum-to-zero constraint: free params are attack[0..n-2], attack[n-1] = -sum(free)
             grad[: n_teams - 1] = grad_attack[:-1] - grad_attack[-1]
+            if l2_attack > 0.0:
+                grad[: n_teams - 1] += 2.0 * l2_attack * (attack[:-1] - attack[-1])
 
             # Defense parameters: lam depends on defense[away], mu depends on defense[home]
             grad_defense = np.zeros(n_teams)
             np.add.at(grad_defense, away_idx, d_lam_total)
             np.add.at(grad_defense, home_idx, d_mu_total)
             grad[n_teams - 1 : 2 * (n_teams - 1)] = grad_defense[:-1] - grad_defense[-1]
+            if l2_defense > 0.0:
+                grad[n_teams - 1 : 2 * (n_teams - 1)] += 2.0 * l2_defense * (defense[:-1] - defense[-1])
 
             # Home advantage: lam depends on it (non-neutral only)
             grad[-2] = float(np.sum(d_lam_total * (~neutral)))

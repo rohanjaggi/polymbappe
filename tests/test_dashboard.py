@@ -11,6 +11,7 @@ from datetime import date
 from pathlib import Path
 
 import polars as pl
+import pytest
 
 from polymbappe.config import Settings
 from polymbappe.dashboard import data
@@ -301,3 +302,65 @@ def test_split_fixtures_empty_fixtures_passthrough() -> None:
     upcoming, finished = data.split_fixtures(empty, empty)
     assert upcoming.is_empty()
     assert finished.is_empty()
+
+
+def _finished() -> pl.DataFrame:
+    """The finished frame for the canonical fixtures+results fixtures (both incorrect)."""
+    results = data.tournament_results(_results(), year=2026)
+    _, finished = data.split_fixtures(_fixtures(), results)
+    return finished
+
+
+def test_prediction_scorecard_metrics() -> None:
+    import math
+
+    scorecard = data.prediction_scorecard(_finished())
+    assert scorecard["n"] == 2.0
+    # Both finished matches were model misses (BRA draw, FRA loss).
+    assert scorecard["accuracy"] == 0.0
+    # BRA-SRB draw: (.6)^2+(.25-1)^2+(.15)^2 = 0.945; FRA-CAN away: (.7)^2+(.2)^2+(.1-1)^2 = 1.34.
+    assert scorecard["brier_score"] == pytest.approx((0.945 + 1.34) / 2)
+    # log loss = mean(-log P(actual)) = mean(-log .25, -log .1).
+    expected_log = (-math.log(0.25) - math.log(0.1)) / 2
+    assert scorecard["log_loss"] == pytest.approx(expected_log)
+
+
+def test_prediction_scorecard_empty_zeroed() -> None:
+    empty = data.load_match_predictions(Settings(data_dir=Path("/nonexistent-xyz")))
+    scorecard = data.prediction_scorecard(empty)
+    assert scorecard == {"n": 0.0, "accuracy": 0.0, "brier_score": 0.0, "log_loss": 0.0}
+
+
+def test_accuracy_by_outcome_groups_and_scores() -> None:
+    by_outcome = data.accuracy_by_outcome(_finished())
+    # One draw (BRA) and one away (FRA), both missed -> accuracy 0 in each group.
+    assert by_outcome["actual_outcome"].to_list() == ["away", "draw"]
+    assert by_outcome["n"].to_list() == [1, 1]
+    assert by_outcome["hits"].to_list() == [0, 0]
+    assert by_outcome["accuracy"].to_list() == [0.0, 0.0]
+
+
+def test_accuracy_by_outcome_empty_schema() -> None:
+    empty = data.load_match_predictions(Settings(data_dir=Path("/nonexistent-xyz")))
+    by_outcome = data.accuracy_by_outcome(empty)
+    assert by_outcome.is_empty()
+    assert by_outcome.columns == list(data.OUTCOME_ACCURACY_SCHEMA.keys())
+
+
+def test_calibration_bins_buckets_confidence() -> None:
+    bins = data.calibration_bins(_finished(), n_bins=5)
+    # Favourite confidences are 0.6 and 0.7 -> both fall in the [0.6, 0.8) bucket.
+    assert bins.height == 1
+    row = bins.row(0, named=True)
+    assert row["bin_lower"] == pytest.approx(0.6)
+    assert row["bin_upper"] == pytest.approx(0.8)
+    assert row["mean_confidence"] == pytest.approx(0.65)
+    assert row["hit_rate"] == 0.0  # both misses
+    assert row["count"] == 2
+
+
+def test_calibration_bins_empty_schema() -> None:
+    empty = data.load_match_predictions(Settings(data_dir=Path("/nonexistent-xyz")))
+    bins = data.calibration_bins(empty)
+    assert bins.is_empty()
+    assert bins.columns == list(data.CALIBRATION_SCHEMA.keys())

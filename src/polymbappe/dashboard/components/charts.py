@@ -191,6 +191,90 @@ def stage_waterfall(stage_probs: dict[str, float], *, team: str) -> Figure:
     return fig
 
 
+def outcome_accuracy_bar(df: pl.DataFrame) -> Figure:
+    """Bar chart of top-pick accuracy per realized outcome (spec 6.1, page 7).
+
+    Expects the frame from :func:`polymbappe.dashboard.data.accuracy_by_outcome`
+    (``actual_outcome``, ``n``, ``accuracy``).
+    """
+
+    import plotly.graph_objects as go
+
+    if df.is_empty() or "accuracy" not in df.columns:
+        return _empty_figure("No finished matches yet — accuracy needs recorded results.")
+
+    labels = {"home": "Home win", "draw": "Draw", "away": "Away win"}
+    cats = [labels.get(o, o) for o in df["actual_outcome"].to_list()]
+    fig = go.Figure(
+        go.Bar(
+            x=cats,
+            y=df["accuracy"].to_list(),
+            marker={"color": ["seagreen", "goldenrod", "indianred"][: len(cats)]},
+            customdata=df["n"].to_list(),
+            hovertemplate="%{x}: %{y:.0%} (n=%{customdata})<extra></extra>",
+        )
+    )
+    fig.update_layout(
+        title="Top-pick accuracy by actual outcome",
+        yaxis_title="Accuracy",
+        yaxis_tickformat=".0%",
+        yaxis_range=[0, 1],
+        margin={"l": 20, "r": 20, "t": 50, "b": 30},
+    )
+    return fig
+
+
+def calibration_curve(df: pl.DataFrame) -> Figure:
+    """Reliability diagram of forecast confidence vs. observed hit rate (spec 6.1, page 7).
+
+    Expects the frame from :func:`polymbappe.dashboard.data.calibration_bins`
+    (``mean_confidence``, ``hit_rate``, ``count``). Plots the model's points against the
+    perfect-calibration diagonal; marker size scales with the number of matches per bin.
+    """
+
+    import plotly.graph_objects as go
+
+    needed = {"mean_confidence", "hit_rate"}
+    if df.is_empty() or not needed.issubset(df.columns):
+        return _empty_figure("No finished matches yet — calibration needs recorded results.")
+
+    counts = df["count"].to_list() if "count" in df.columns else [1] * df.height
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=[0, 1],
+            y=[0, 1],
+            mode="lines",
+            line={"dash": "dash", "color": "gray"},
+            name="Perfect calibration",
+            hoverinfo="skip",
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=df["mean_confidence"].to_list(),
+            y=df["hit_rate"].to_list(),
+            mode="markers+lines",
+            marker={"size": [min(40, 10 + 5 * c) for c in counts], "color": "steelblue"},
+            line={"color": "steelblue"},
+            customdata=counts,
+            name="Model",
+            hovertemplate="Predicted %{x:.0%}<br>Observed %{y:.0%}<br>n=%{customdata}<extra></extra>",
+        )
+    )
+    fig.update_layout(
+        title="Calibration — predicted confidence vs. observed hit rate",
+        xaxis_title="Predicted confidence (favourite)",
+        yaxis_title="Observed hit rate",
+        xaxis_tickformat=".0%",
+        yaxis_tickformat=".0%",
+        xaxis_range=[0, 1],
+        yaxis_range=[0, 1],
+        margin={"l": 20, "r": 20, "t": 50, "b": 30},
+    )
+    return fig
+
+
 def edge_scatter(df: pl.DataFrame) -> Figure:
     """Scatter of edge magnitude vs. Kelly stake for flagged edges (spec 6.1, page 4).
 
