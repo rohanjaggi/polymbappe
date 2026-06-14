@@ -1,0 +1,5 @@
+[client]
+# The dashboard provides its own page navigation via st.sidebar.radio in
+# dashboard/app.py, so hide Streamlit's auto-generated multipage nav header
+# (built from the sibling dashboard/pages/ directory).
+showSidebarNavigation = false
