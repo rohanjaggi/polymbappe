@@ -38,6 +38,7 @@ def render(settings: Settings) -> None:
 
     results = data.tournament_results(data.load_recorded_results(settings))
     _, finished = data.split_fixtures(match_df, results)
+    match_xg = data.load_match_xg(settings)
 
     st.caption(
         "How the model's pre-match H/D/A probabilities held up against recorded tournament "
@@ -56,7 +57,7 @@ def render(settings: Settings) -> None:
     st.divider()
     _render_breakdowns(st, finished)
     st.divider()
-    _render_xg_analysis(st, finished)
+    _render_xg_analysis(st, finished, match_xg)
     st.divider()
     _render_match_table(st, finished)
 
@@ -98,8 +99,10 @@ def _render_breakdowns(st: object, finished: pl.DataFrame) -> None:
         )
 
 
-def _render_xg_analysis(st: object, finished: pl.DataFrame) -> None:
-    """xG prediction error: MAE metrics, scatter plot, and per-match breakdown."""
+def _render_xg_analysis(
+    st: object, finished: pl.DataFrame, match_xg: pl.DataFrame
+) -> None:
+    """xG error analysis: model vs goals, model vs actual xG, and finishing luck."""
 
     st.subheader("xG prediction error")
 
@@ -108,53 +111,86 @@ def _render_xg_analysis(st: object, finished: pl.DataFrame) -> None:
         st.info("No xG predictions in this simulation run.")
         return
 
-    summary = data.xg_error_summary(finished)
-    cols = st.columns(3)
-    cols[0].metric(
-        "Home xG MAE",
-        f"{summary['home_mae']:.2f}",
-        help="Mean |predicted home xG − actual home goals|.",
+    has_actual_xg = not match_xg.is_empty()
+    summary = data.xg_error_summary(finished, match_xg if has_actual_xg else None)
+
+    if has_actual_xg and "xg_n" in summary:
+        st.caption(
+            f"Actual xG from FBref available for {int(summary['xg_n'])} matches. "
+            "Error is decomposed into model quality (vs actual xG) and finishing luck "
+            "(actual xG vs goals)."
+        )
+        cols = st.columns(3)
+        cols[0].metric(
+            "Model vs actual xG (MAE)",
+            f"{summary['model_vs_xg_mae']:.2f}",
+            help="Mean |model predicted xG − FBref actual xG|. Pure model quality.",
+        )
+        cols[1].metric(
+            "Finishing luck (MAE)",
+            f"{summary['xg_vs_goals_mae']:.2f}",
+            help="Mean |FBref actual xG − actual goals|. Variance from conversion luck.",
+        )
+        cols[2].metric(
+            "Model vs goals (MAE)",
+            f"{summary['total_mae']:.2f}",
+            help="Combined: model quality + finishing luck.",
+        )
+    else:
+        if not has_actual_xg:
+            st.caption(
+                "Run `polymbappe ingest --live` to pull FBref actual xG and decompose "
+                "model error from finishing-luck variance."
+            )
+        cols = st.columns(3)
+        cols[0].metric("Home xG MAE", f"{summary['home_mae']:.2f}",
+                       help="Mean |predicted home xG − actual home goals|.")
+        cols[1].metric("Away xG MAE", f"{summary['away_mae']:.2f}",
+                       help="Mean |predicted away xG − actual away goals|.")
+        cols[2].metric("Overall xG MAE", f"{summary['total_mae']:.2f}")
+
+    st.plotly_chart(
+        charts.xg_scatter(finished, match_xg if has_actual_xg else None),
+        use_container_width=True,
     )
-    cols[1].metric(
-        "Away xG MAE",
-        f"{summary['away_mae']:.2f}",
-        help="Mean |predicted away xG − actual away goals|.",
-    )
-    cols[2].metric(
-        "Overall xG MAE",
-        f"{summary['total_mae']:.2f}",
-        help="Average of home and away MAE.",
-    )
-    st.caption(
-        "Points above the diagonal = model under-predicted goals; below = over-predicted. "
-        "Even a perfect xG model expects MAE > 0 due to conversion variance."
-    )
-    st.plotly_chart(charts.xg_scatter(finished), use_container_width=True)
 
     st.subheader(f"Per-match xG breakdown ({finished.height})")
-    st.dataframe(_xg_table(finished), use_container_width=True, hide_index=True)
+    st.dataframe(_xg_table(finished, match_xg), use_container_width=True, hide_index=True)
 
 
-def _xg_table(finished: pl.DataFrame) -> object:
-    """Pandas display frame comparing predicted xG to actual goals per finished match."""
+def _xg_table(finished: pl.DataFrame, match_xg: pl.DataFrame) -> object:
+    """Per-match xG table; adds FBref actual xG columns when available."""
+
+    has_xg = not match_xg.is_empty()
+    if has_xg:
+        xg_slim = match_xg.select(["home_team", "away_team", "home_xg", "away_xg"])
+        joined = finished.join(xg_slim, on=["home_team", "away_team"], how="left")
+    else:
+        joined = finished
 
     rows = []
-    for r in finished.iter_rows(named=True):
+    for r in joined.iter_rows(named=True):
         ph = float(r["exp_home_goals"])
         pa = float(r["exp_away_goals"])
         ah = float(r["home_goals"])
         aa = float(r["away_goals"])
-        rows.append(
-            {
-                "Fixture": f"{r['home_team']} vs {r['away_team']}",
-                "Pred xG (H)": f"{ph:.2f}",
-                "Actual (H)": int(r["home_goals"]),
-                "Error (H)": f"{abs(ph - ah):.2f}",
-                "Pred xG (A)": f"{pa:.2f}",
-                "Actual (A)": int(r["away_goals"]),
-                "Error (A)": f"{abs(pa - aa):.2f}",
-            }
-        )
+        row: dict[str, object] = {
+            "Fixture": f"{r['home_team']} vs {r['away_team']}",
+            "Model xG (H)": f"{ph:.2f}",
+            "Model xG (A)": f"{pa:.2f}",
+        }
+        if has_xg and r.get("home_xg") is not None:
+            fh = float(r["home_xg"])
+            fa = float(r["away_xg"])
+            row["FBref xG (H)"] = f"{fh:.2f}"
+            row["FBref xG (A)"] = f"{fa:.2f}"
+            row["Model err (H)"] = f"{abs(ph - fh):.2f}"
+            row["Model err (A)"] = f"{abs(pa - fa):.2f}"
+            row["Luck (H)"] = f"{abs(fh - ah):.2f}"
+            row["Luck (A)"] = f"{abs(fa - aa):.2f}"
+        row["Actual (H)"] = int(ah)
+        row["Actual (A)"] = int(aa)
+        rows.append(row)
     return pl.DataFrame(rows).to_pandas()
 
 

@@ -26,6 +26,7 @@ class Table(StrEnum):
     MANAGER_RECORDS = "manager_records"
     TEAM_XG = "team_xg"
     TEAM_PPDA = "team_ppda"
+    MATCH_XG = "match_xg"
     SCHEDULE = "schedule"
     VENUES = "venues"
     CITY_COORDS = "city_coords"
@@ -77,6 +78,7 @@ TABLE_COLUMNS: dict[Table, tuple[str, ...]] = {
     ),
     Table.TEAM_XG: ("team", "date", "xg", "xga"),
     Table.TEAM_PPDA: ("team", "date", "ppda"),
+    Table.MATCH_XG: ("match_id", "date", "home_team", "away_team", "home_xg", "away_xg"),
     Table.SCHEDULE: (
         "match_id",
         "date",

@@ -195,6 +195,27 @@ def load_knockout_predictions(settings: Settings) -> pl.DataFrame:
     return _read_or_empty(_output_path(settings, "knockout_predictions.parquet"), KO_SCHEMA)
 
 
+def load_match_xg(settings: Settings) -> pl.DataFrame:
+    """Load per-match actual xG from the ``match_xg`` normalized table.
+
+    Populated by ``polymbappe ingest --live`` (scrapes FBref) or a local
+    ``data/raw/match_xg.csv``. Returns a typed empty frame when absent so the
+    xG analysis section degrades gracefully before any live xG is ingested.
+    """
+
+    from polymbappe.data.tables import Table, table_path
+
+    schema: dict[str, pl.DataType] = {
+        "match_id": pl.Utf8,
+        "date": pl.Date,
+        "home_team": pl.Utf8,
+        "away_team": pl.Utf8,
+        "home_xg": pl.Float64,
+        "away_xg": pl.Float64,
+    }
+    return _read_or_empty(table_path(Table.MATCH_XG, settings), schema)
+
+
 def load_recorded_results(settings: Settings) -> pl.DataFrame:
     """Load played-match results from the ``matches`` normalized table (spec 11).
 
@@ -547,12 +568,20 @@ def calibration_bins(finished: pl.DataFrame, *, n_bins: int = 5) -> pl.DataFrame
     )
 
 
-def xg_error_summary(finished: pl.DataFrame) -> dict[str, float]:
-    """MAE of predicted xG vs actual goals scored over finished matches.
+def xg_error_summary(
+    finished: pl.DataFrame,
+    match_xg: pl.DataFrame | None = None,
+) -> dict[str, float]:
+    """MAE of model predicted xG vs actual goals and (optionally) vs actual match xG.
 
-    Compares ``exp_home_goals``/``exp_away_goals`` (model Poisson mean) against
-    ``home_goals``/``away_goals`` (actual result). Returns zeroed dict when xG
-    columns are absent or the frame is empty.
+    Always computes model-vs-goals MAE. When ``match_xg`` is provided and contains rows
+    matching the finished fixtures, additionally computes:
+
+    - ``model_vs_xg_home/away_mae``: model predicted xG vs actual FBref xG (pure model
+      quality, removes finishing-luck noise).
+    - ``xg_vs_goals_home/away_mae``: actual FBref xG vs actual goals (finishing luck).
+
+    Returns zeroed dict when required columns are absent.
     """
 
     needed = {"exp_home_goals", "exp_away_goals", "home_goals", "away_goals"}
@@ -565,12 +594,42 @@ def xg_error_summary(finished: pl.DataFrame) -> dict[str, float]:
     away_mae = float(
         (finished["exp_away_goals"] - finished["away_goals"].cast(pl.Float64)).abs().mean()
     )
-    return {
+    result: dict[str, float] = {
         "n": float(finished.height),
         "home_mae": home_mae,
         "away_mae": away_mae,
         "total_mae": (home_mae + away_mae) / 2,
     }
+
+    if match_xg is None or match_xg.is_empty():
+        return result
+
+    # Join actual xG onto finished fixtures by (home_team, away_team).
+    xg_slim = match_xg.select(["home_team", "away_team", "home_xg", "away_xg"])
+    joined = finished.join(xg_slim, on=["home_team", "away_team"], how="inner")
+    if joined.is_empty():
+        return result
+
+    result["xg_n"] = float(joined.height)
+    result["model_vs_xg_home_mae"] = float(
+        (joined["exp_home_goals"] - joined["home_xg"]).abs().mean()
+    )
+    result["model_vs_xg_away_mae"] = float(
+        (joined["exp_away_goals"] - joined["away_xg"]).abs().mean()
+    )
+    result["model_vs_xg_mae"] = (
+        result["model_vs_xg_home_mae"] + result["model_vs_xg_away_mae"]
+    ) / 2
+    result["xg_vs_goals_home_mae"] = float(
+        (joined["home_xg"] - joined["home_goals"].cast(pl.Float64)).abs().mean()
+    )
+    result["xg_vs_goals_away_mae"] = float(
+        (joined["away_xg"] - joined["away_goals"].cast(pl.Float64)).abs().mean()
+    )
+    result["xg_vs_goals_mae"] = (
+        result["xg_vs_goals_home_mae"] + result["xg_vs_goals_away_mae"]
+    ) / 2
+    return result
 
 
 def upset_candidates(

@@ -275,11 +275,12 @@ def calibration_curve(df: pl.DataFrame) -> Figure:
     return fig
 
 
-def xg_scatter(finished: pl.DataFrame) -> Figure:
-    """Scatter of predicted xG vs actual goals for all finished matches (spec 6.1, page 7).
+def xg_scatter(finished: pl.DataFrame, match_xg: pl.DataFrame | None = None) -> Figure:
+    """Scatter of model predicted xG vs actual goals (and actual xG when available).
 
-    Plots one point per team per match (home and away combined) so the diagonal
-    represents perfect prediction. Hover shows the team name and match context.
+    Plots one point per team per match. When ``match_xg`` is supplied, adds a second
+    series showing actual FBref xG vs actual goals so you can separate model error
+    from finishing-luck variance. The diagonal represents perfect prediction.
     """
 
     import plotly.graph_objects as go
@@ -288,14 +289,15 @@ def xg_scatter(finished: pl.DataFrame) -> Figure:
     if finished.is_empty() or not needed.issubset(finished.columns):
         return _empty_figure("No xG data yet — needs finished matches with predictions.")
 
-    rows = finished.iter_rows(named=True)
-    x_pred, y_actual, labels = [], [], []
+    x_pred, y_goals, labels = [], [], []
     for r in finished.iter_rows(named=True):
+        fixture = f"{r['home_team']} vs {r['away_team']}"
         x_pred += [float(r["exp_home_goals"]), float(r["exp_away_goals"])]
-        y_actual += [float(r["home_goals"]), float(r["away_goals"])]
-        labels += [f"{r['home_team']} vs {r['away_team']} (H)", f"{r['home_team']} vs {r['away_team']} (A)"]
+        y_goals += [float(r["home_goals"]), float(r["away_goals"])]
+        labels += [f"{fixture} (H)", f"{fixture} (A)"]
 
-    max_val = max(max(x_pred, default=0), max(y_actual, default=0), 4.0) + 0.5
+    all_vals = x_pred + y_goals
+    max_val = max(max(all_vals, default=0), 4.0) + 0.5
 
     fig = go.Figure()
     fig.add_trace(go.Scatter(
@@ -306,16 +308,38 @@ def xg_scatter(finished: pl.DataFrame) -> Figure:
         hoverinfo="skip",
     ))
     fig.add_trace(go.Scatter(
-        x=x_pred, y=y_actual,
+        x=x_pred, y=y_goals,
         mode="markers",
         marker={"color": "steelblue", "size": 9, "opacity": 0.75},
         text=labels,
-        hovertemplate="<b>%{text}</b><br>Predicted xG: %{x:.2f}<br>Actual goals: %{y}<extra></extra>",
-        name="Team",
+        hovertemplate="<b>%{text}</b><br>Model xG: %{x:.2f}<br>Actual goals: %{y}<extra></extra>",
+        name="Model xG vs goals",
     ))
+
+    # Overlay actual FBref xG vs goals when available.
+    if match_xg is not None and not match_xg.is_empty():
+        xg_slim = match_xg.select(["home_team", "away_team", "home_xg", "away_xg"])
+        joined = finished.join(xg_slim, on=["home_team", "away_team"], how="inner")
+        if not joined.is_empty():
+            x_actual_xg, y_actual_goals, xg_labels = [], [], []
+            for r in joined.iter_rows(named=True):
+                fixture = f"{r['home_team']} vs {r['away_team']}"
+                x_actual_xg += [float(r["home_xg"]), float(r["away_xg"])]
+                y_actual_goals += [float(r["home_goals"]), float(r["away_goals"])]
+                xg_labels += [f"{fixture} (H)", f"{fixture} (A)"]
+            max_val = max(max_val, max(x_actual_xg, default=0) + 0.5)
+            fig.add_trace(go.Scatter(
+                x=x_actual_xg, y=y_actual_goals,
+                mode="markers",
+                marker={"color": "tomato", "size": 9, "opacity": 0.75, "symbol": "diamond"},
+                text=xg_labels,
+                hovertemplate="<b>%{text}</b><br>FBref xG: %{x:.2f}<br>Actual goals: %{y}<extra></extra>",
+                name="Actual xG vs goals (luck)",
+            ))
+
     fig.update_layout(
-        title="Predicted xG vs actual goals",
-        xaxis_title="Model predicted xG",
+        title="xG error decomposition — model vs actual vs goals",
+        xaxis_title="xG value",
         yaxis_title="Actual goals scored",
         margin={"l": 20, "r": 20, "t": 50, "b": 30},
     )

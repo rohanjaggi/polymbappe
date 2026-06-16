@@ -498,6 +498,79 @@ def ingest_ppda(settings: Settings | None = None, *, live: bool = False) -> int:
     return frame.height
 
 
+def ingest_match_xg(settings: Settings | None = None, *, live: bool = False) -> int:
+    """Ingest per-match actual xG into the ``match_xg`` table.
+
+    Prefers a local ``data/raw/match_xg.csv`` (columns: ``match_id``, ``date``,
+    ``home_team``, ``away_team``, ``home_xg``, ``away_xg``) so offline runs are fully
+    reproducible. When that file is absent and ``live=True``, fetches completed-match
+    xG from FotMob's Next.js data API via
+    :func:`~polymbappe.data.sources.fetch_fotmob_match_xg`. Unlike
+    :func:`ingest_team_xg` this table is match-granular, not team-date-aggregated, and
+    feeds the dashboard xG error analysis (actual xG vs model predicted xG).
+    """
+
+    settings = settings or Settings()
+    local = settings.raw_data_dir / "match_xg.csv"
+
+    if local.exists():
+        raw = pl.read_csv(io.BytesIO(local.read_bytes()))
+        required = {"match_id", "date", "home_team", "away_team", "home_xg", "away_xg"}
+        missing = required - set(raw.columns)
+        if missing:
+            raise ValueError(f"match_xg.csv missing columns: {sorted(missing)}")
+        normalized = (
+            raw.select(
+                pl.col("match_id").cast(pl.Utf8),
+                pl.col("date").cast(pl.Utf8).str.to_date(strict=False),
+                normalize_team_expr("home_team").alias("home_team"),
+                normalize_team_expr("away_team").alias("away_team"),
+                pl.col("home_xg").cast(pl.Float64),
+                pl.col("away_xg").cast(pl.Float64),
+            )
+            .select(TABLE_COLUMNS[Table.MATCH_XG])
+        )
+        write_table(Table.MATCH_XG, normalized, mode="overwrite", settings=settings)
+        logger.info("ingest.match_xg.stored", rows=normalized.height, source="local")
+        return normalized.height
+
+    if not live:
+        logger.info(
+            "ingest.match_xg.skip",
+            reason="no data/raw/match_xg.csv (pass live=True to fetch from FotMob)",
+        )
+        return 0
+
+    rows = sources.fetch_fotmob_match_xg(settings=settings)
+    if not rows:
+        logger.info("ingest.match_xg.skip", reason="FotMob returned no completed match xG")
+        return 0
+
+    frame = (
+        pl.DataFrame(
+            rows,
+            schema={
+                "match_id": pl.Utf8,
+                "date": pl.Utf8,
+                "home_team": pl.Utf8,
+                "away_team": pl.Utf8,
+                "home_xg": pl.Float64,
+                "away_xg": pl.Float64,
+            },
+        )
+        .with_columns(
+            normalize_team_expr("home_team").alias("home_team"),
+            normalize_team_expr("away_team").alias("away_team"),
+            pl.col("date").str.to_date(strict=False),
+        )
+        .unique(subset=["home_team", "away_team"], keep="last")
+        .select(TABLE_COLUMNS[Table.MATCH_XG])
+    )
+    write_table(Table.MATCH_XG, frame, mode="overwrite", settings=settings)
+    logger.info("ingest.match_xg.stored", rows=frame.height, source="fotmob")
+    return frame.height
+
+
 def ingest_venues(settings: Settings | None = None) -> int:
     """Ingest tournament venue coordinates into the ``venues`` table.
 
@@ -1500,6 +1573,7 @@ def ingest_all_sources(live: bool = False, settings: Settings | None = None) -> 
         ("market_odds", ingest_market_odds, True),
         ("team_xg", ingest_team_xg, True),
         ("team_ppda", ingest_ppda, True),
+        ("match_xg", ingest_match_xg, True),
         ("venues", ingest_venues, False),
         ("schedule", ingest_schedule, False),
         ("city_coords", ingest_city_coords, False),

@@ -1116,8 +1116,118 @@ def fetch_statsbomb_events(
     return data if isinstance(data, list) else []
 
 
-# TODO(live-xg): StatsBomb open data is published only AFTER a tournament, so it cannot feed
-# live 2026 xG/PPDA during the World Cup. A separate in-tournament scraper (e.g. Understat,
-# fotmob, or a paid feed) is needed for the live layer — kept in view, not yet built. It
-# would land here as a thin fetcher + a normalizer producing the same team_xg / team_ppda
-# rows, so the ingest wiring downstream stays unchanged.
+def fetch_fotmob_match_xg(
+    *,
+    settings: Settings | None = None,
+    timeout: float = 30.0,
+) -> list[dict[str, object]]:
+    """Fetch per-match xG from FotMob's Next.js data API for the 2026 World Cup.
+
+    FotMob uses Next.js server-side rendering. We:
+      1. Fetch the homepage to extract the ``buildId`` from ``__NEXT_DATA__``.
+      2. Fetch ``/_next/data/{buildId}/leagues/77/matches/world-cup.json`` for all
+         fixtures (league 77 = FIFA World Cup).
+      3. For each finished match, fetch its detail page and extract
+         ``content.stats.Periods.All.stats`` → entry with ``key == "expected_goals"``
+         and ``format == "double"`` → ``stats[0]`` = home xG, ``stats[1]`` = away xG.
+
+    Returns a list of row dicts with keys ``match_id``, ``date``, ``home_team``,
+    ``away_team``, ``home_xg``, ``away_xg``. Matches without xG data are skipped.
+    """
+
+    import re
+    import ssl
+    import time
+    import urllib.request
+
+    import json as _json
+
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        )
+    }
+
+    def _get(url: str) -> dict:
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
+            return _json.loads(resp.read())
+
+    # Step 1: extract buildId from homepage HTML
+    req0 = urllib.request.Request("https://www.fotmob.com/", headers=headers)
+    with urllib.request.urlopen(req0, timeout=timeout, context=ctx) as resp:
+        html = resp.read().decode("utf-8", errors="replace")
+    m = re.search(r'"buildId":"([^"]+)"', html)
+    if not m:
+        raise RuntimeError("FotMob: could not find buildId in homepage HTML")
+    build_id = m.group(1)
+
+    # Step 2: fetch all World Cup fixtures
+    league_url = (
+        f"https://www.fotmob.com/_next/data/{build_id}/leagues/77/matches/world-cup.json"
+    )
+    league_data = _get(league_url)
+    all_matches = league_data["pageProps"]["fixtures"]["allMatches"]
+
+    # Step 3: fetch per-match xG for finished matches
+    rows: list[dict[str, object]] = []
+    for match in all_matches:
+        status = match.get("status", {})
+        if not status.get("finished"):
+            continue
+
+        page_url = match["pageUrl"].split("#")[0]  # strip fragment
+        match_url = f"https://www.fotmob.com/_next/data/{build_id}{page_url}.json"
+        try:
+            match_data = _get(match_url)
+        except Exception:
+            continue
+
+        pp = match_data.get("pageProps", {})
+        general = pp.get("general", {})
+        home_name = general.get("homeTeam", {}).get("name", "")
+        away_name = general.get("awayTeam", {}).get("name", "")
+
+        # Parse date from utcTime
+        utc_time = status.get("utcTime", "")
+        date_str = utc_time[:10] if utc_time else ""
+
+        # Extract xG from stats
+        home_xg: float | None = None
+        away_xg: float | None = None
+        try:
+            stat_groups = pp["content"]["stats"]["Periods"]["All"]["stats"]
+            for group in stat_groups:
+                for stat in group.get("stats", []):
+                    if stat.get("key") == "expected_goals" and stat.get("format") == "double":
+                        vals = stat.get("stats", [None, None])
+                        if vals[0] is not None and vals[1] is not None:
+                            home_xg = float(vals[0])
+                            away_xg = float(vals[1])
+                        break
+                if home_xg is not None:
+                    break
+        except (KeyError, TypeError, ValueError):
+            pass
+
+        if home_xg is None or away_xg is None:
+            continue
+
+        rows.append(
+            {
+                "match_id": f"2026__{home_name}__{away_name}",
+                "date": date_str,
+                "home_team": home_name,
+                "away_team": away_name,
+                "home_xg": home_xg,
+                "away_xg": away_xg,
+            }
+        )
+        time.sleep(0.1)  # gentle rate-limit
+
+    return rows
