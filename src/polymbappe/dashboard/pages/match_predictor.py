@@ -51,7 +51,7 @@ def render(settings: Settings) -> None:
 
 
 def _render_group_stage(st: object, settings: Settings) -> None:
-    """Group-stage tab: upcoming and finished group fixtures."""
+    """Group-stage tab: all fixtures with predictions; actuals fill in as games complete."""
 
     match_df = data.load_match_predictions(settings)
     if match_df.is_empty():
@@ -62,59 +62,34 @@ def _render_group_stage(st: object, settings: Settings) -> None:
         return
 
     results = data.tournament_results(data.load_recorded_results(settings))
-    upcoming, finished = data.split_fixtures(match_df, results)
+    all_df = data.all_fixtures_with_results(match_df, results)
 
     st.caption(
-        "Only scheduled tournament fixtures are shown. H/D/A probabilities come from the "
-        "calibration pipeline (spec 3.6); finished matches are joined against recorded "
-        "results."
+        "All scheduled group-stage fixtures with H/D/A probabilities from the calibration "
+        "pipeline. Actual scores and ✅/❌ fill in as `polymbappe ingest` records results."
     )
 
-    _render_upcoming(st, upcoming)
-    st.divider()
-    _render_finished(st, finished)
+    _render_all_fixtures(st, all_df)
 
 
-def _render_upcoming(st: object, upcoming: pl.DataFrame) -> None:
-    """Upcoming fixtures: full probability table plus a per-fixture breakdown."""
+def _render_all_fixtures(st: object, all_df: pl.DataFrame) -> None:
+    """Unified fixture table: predictions always visible, actuals appear as games complete."""
 
-    st.subheader(f"Upcoming fixtures ({upcoming.height})")
-    if upcoming.is_empty():
-        st.info("No upcoming fixtures — every scheduled match already has a recorded result.")
-        return
+    played = all_df.filter(pl.col("model_correct").is_not_null())
+    if not played.is_empty():
+        hits = int(played["model_correct"].sum())
+        st.metric("Model top-pick accuracy so far", f"{hits}/{played.height}")
 
-    groups = ["All"] + sorted(upcoming["group"].unique().to_list())
-    chosen_group = st.selectbox("Filter by group", groups, key="upcoming_group")
-    view = upcoming if chosen_group == "All" else upcoming.filter(pl.col("group") == chosen_group)
+    groups = ["All"] + sorted(all_df["group"].unique().to_list())
+    chosen_group = st.selectbox("Filter by group", groups, key="all_group")
+    view = all_df if chosen_group == "All" else all_df.filter(pl.col("group") == chosen_group)
 
-    st.dataframe(_probability_table(view), use_container_width=True, hide_index=True)
+    st.dataframe(_unified_table(view), use_container_width=True, hide_index=True)
 
     labels = [_fixture_label(r) for r in view.iter_rows(named=True)]
-    choice = st.selectbox("Inspect a fixture", labels, key="upcoming_fixture")
+    choice = st.selectbox("Inspect a fixture", labels, key="all_fixture")
     record = view.row(labels.index(choice), named=True)
-    _render_fixture_detail(st, record)
-
-
-def _render_finished(st: object, finished: pl.DataFrame) -> None:
-    """Finished matches: recorded scoreline vs. the model's pre-match probabilities."""
-
-    st.subheader(f"Finished matches ({finished.height})")
-    if finished.is_empty():
-        st.info(
-            "No finished matches recorded yet. Ingest results (`polymbappe ingest`) as the "
-            "tournament progresses."
-        )
-        return
-
-    hits = int(finished["model_correct"].sum())
-    st.metric("Model top-pick accuracy", f"{hits}/{finished.height}")
-
-    st.dataframe(_results_table(finished), use_container_width=True, hide_index=True)
-
-    labels = [_fixture_label(r) for r in finished.iter_rows(named=True)]
-    choice = st.selectbox("Inspect a finished match", labels, key="finished_fixture")
-    record = finished.row(labels.index(choice), named=True)
-    _render_fixture_detail(st, record, finished=True)
+    _render_fixture_detail(st, record, finished=record.get("model_correct") is not None)
 
 
 def _render_fixture_detail(
@@ -155,38 +130,28 @@ def _render_fixture_detail(
         )
 
 
-def _probability_table(view: pl.DataFrame) -> object:
-    """Pandas display frame of upcoming fixtures and their H/D/A probabilities."""
+def _unified_table(view: pl.DataFrame) -> object:
+    """Pandas display frame of all fixtures: predictions always shown, actuals fill in."""
 
     rows = []
     for r in view.iter_rows(named=True):
+        has_result = r.get("home_goals") is not None
+        actual_key = str(r["actual_outcome"]) if has_result else None
         rows.append(
             {
-                "Group": r["group"],
+                "Grp": r["group"],
                 "Fixture": _fixture_label(r),
-                f"P({r['home_team']})": f"{float(r['model_home']):.1%}",
-                "P(Draw)": f"{float(r['model_draw']):.1%}",
-                f"P({r['away_team']})": f"{float(r['model_away']):.1%}",
-                "Favourite": _outcome_label(r, str(r["model_pick"])),
-            }
-        )
-    return pl.DataFrame(rows).to_pandas()
-
-
-def _results_table(finished: pl.DataFrame) -> object:
-    """Pandas display frame of finished matches: score, outcome, and the model's call."""
-
-    rows = []
-    for r in finished.iter_rows(named=True):
-        rows.append(
-            {
-                "Date": str(r["date"]) if r.get("date") is not None else "",
-                "Group": r["group"],
-                "Fixture": _fixture_label(r),
-                "Score": f"{int(r['home_goals'])} – {int(r['away_goals'])}",
-                "Result": _outcome_label(r, str(r["actual_outcome"])),
-                "Model pick": _outcome_label(r, str(r["model_pick"])),
-                "Correct": "✅" if r["model_correct"] else "❌",
+                "P(Home)": f"{float(r['model_home']):.0%}",
+                "P(Draw)": f"{float(r['model_draw']):.0%}",
+                "P(Away)": f"{float(r['model_away']):.0%}",
+                "xG": (
+                    f"{float(r['exp_home_goals']):.2f} – {float(r['exp_away_goals']):.2f}"
+                    if r.get("exp_home_goals") is not None
+                    else ""
+                ),
+                "Score": f"{int(r['home_goals'])} – {int(r['away_goals'])}" if has_result else "—",
+                "Result": _outcome_label(r, actual_key) if has_result else "—",
+                "Correct": ("✅" if r["model_correct"] else "❌") if has_result else "⏳",
             }
         )
     return pl.DataFrame(rows).to_pandas()

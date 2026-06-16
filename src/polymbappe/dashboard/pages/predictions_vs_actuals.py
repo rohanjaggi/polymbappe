@@ -56,6 +56,8 @@ def render(settings: Settings) -> None:
     st.divider()
     _render_breakdowns(st, finished)
     st.divider()
+    _render_xg_analysis(st, finished)
+    st.divider()
     _render_match_table(st, finished)
 
 
@@ -94,6 +96,66 @@ def _render_breakdowns(st: object, finished: pl.DataFrame) -> None:
             charts.calibration_curve(data.calibration_bins(finished)),
             use_container_width=True,
         )
+
+
+def _render_xg_analysis(st: object, finished: pl.DataFrame) -> None:
+    """xG prediction error: MAE metrics, scatter plot, and per-match breakdown."""
+
+    st.subheader("xG prediction error")
+
+    needed = {"exp_home_goals", "exp_away_goals", "home_goals", "away_goals"}
+    if not needed.issubset(finished.columns):
+        st.info("No xG predictions in this simulation run.")
+        return
+
+    summary = data.xg_error_summary(finished)
+    cols = st.columns(3)
+    cols[0].metric(
+        "Home xG MAE",
+        f"{summary['home_mae']:.2f}",
+        help="Mean |predicted home xG − actual home goals|.",
+    )
+    cols[1].metric(
+        "Away xG MAE",
+        f"{summary['away_mae']:.2f}",
+        help="Mean |predicted away xG − actual away goals|.",
+    )
+    cols[2].metric(
+        "Overall xG MAE",
+        f"{summary['total_mae']:.2f}",
+        help="Average of home and away MAE.",
+    )
+    st.caption(
+        "Points above the diagonal = model under-predicted goals; below = over-predicted. "
+        "Even a perfect xG model expects MAE > 0 due to conversion variance."
+    )
+    st.plotly_chart(charts.xg_scatter(finished), use_container_width=True)
+
+    st.subheader(f"Per-match xG breakdown ({finished.height})")
+    st.dataframe(_xg_table(finished), use_container_width=True, hide_index=True)
+
+
+def _xg_table(finished: pl.DataFrame) -> object:
+    """Pandas display frame comparing predicted xG to actual goals per finished match."""
+
+    rows = []
+    for r in finished.iter_rows(named=True):
+        ph = float(r["exp_home_goals"])
+        pa = float(r["exp_away_goals"])
+        ah = float(r["home_goals"])
+        aa = float(r["away_goals"])
+        rows.append(
+            {
+                "Fixture": f"{r['home_team']} vs {r['away_team']}",
+                "Pred xG (H)": f"{ph:.2f}",
+                "Actual (H)": int(r["home_goals"]),
+                "Error (H)": f"{abs(ph - ah):.2f}",
+                "Pred xG (A)": f"{pa:.2f}",
+                "Actual (A)": int(r["away_goals"]),
+                "Error (A)": f"{abs(pa - aa):.2f}",
+            }
+        )
+    return pl.DataFrame(rows).to_pandas()
 
 
 def _render_match_table(st: object, finished: pl.DataFrame) -> None:

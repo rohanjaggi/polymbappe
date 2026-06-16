@@ -275,6 +275,53 @@ def calibration_curve(df: pl.DataFrame) -> Figure:
     return fig
 
 
+def xg_scatter(finished: pl.DataFrame) -> Figure:
+    """Scatter of predicted xG vs actual goals for all finished matches (spec 6.1, page 7).
+
+    Plots one point per team per match (home and away combined) so the diagonal
+    represents perfect prediction. Hover shows the team name and match context.
+    """
+
+    import plotly.graph_objects as go
+
+    needed = {"exp_home_goals", "exp_away_goals", "home_goals", "away_goals"}
+    if finished.is_empty() or not needed.issubset(finished.columns):
+        return _empty_figure("No xG data yet — needs finished matches with predictions.")
+
+    rows = finished.iter_rows(named=True)
+    x_pred, y_actual, labels = [], [], []
+    for r in finished.iter_rows(named=True):
+        x_pred += [float(r["exp_home_goals"]), float(r["exp_away_goals"])]
+        y_actual += [float(r["home_goals"]), float(r["away_goals"])]
+        labels += [f"{r['home_team']} vs {r['away_team']} (H)", f"{r['home_team']} vs {r['away_team']} (A)"]
+
+    max_val = max(max(x_pred, default=0), max(y_actual, default=0), 4.0) + 0.5
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=[0, max_val], y=[0, max_val],
+        mode="lines",
+        line={"dash": "dash", "color": "gray"},
+        name="Perfect prediction",
+        hoverinfo="skip",
+    ))
+    fig.add_trace(go.Scatter(
+        x=x_pred, y=y_actual,
+        mode="markers",
+        marker={"color": "steelblue", "size": 9, "opacity": 0.75},
+        text=labels,
+        hovertemplate="<b>%{text}</b><br>Predicted xG: %{x:.2f}<br>Actual goals: %{y}<extra></extra>",
+        name="Team",
+    ))
+    fig.update_layout(
+        title="Predicted xG vs actual goals",
+        xaxis_title="Model predicted xG",
+        yaxis_title="Actual goals scored",
+        margin={"l": 20, "r": 20, "t": 50, "b": 30},
+    )
+    return fig
+
+
 def edge_scatter(df: pl.DataFrame) -> Figure:
     """Scatter of edge magnitude vs. Kelly stake for flagged edges (spec 6.1, page 4).
 

@@ -374,6 +374,57 @@ def split_fixtures(
     return upcoming, finished
 
 
+def all_fixtures_with_results(
+    match_df: pl.DataFrame, results_df: pl.DataFrame
+) -> pl.DataFrame:
+    """All fixtures with predictions; unplayed rows have null result columns.
+
+    Like :func:`split_fixtures` but returns a single unified frame instead of two.
+    Unplayed fixtures carry null ``home_goals``/``away_goals``/``actual_outcome``/
+    ``model_correct`` so the Match Predictor page can render one table with ⏳ for
+    pending matches and ✅/❌ for finished ones.
+    """
+
+    if match_df.is_empty():
+        return match_df
+
+    fixtures = match_df.with_columns(_model_pick_expr().alias("model_pick"))
+
+    result_cols = ["home_team", "away_team", "home_goals", "away_goals", "date"]
+    if results_df.is_empty():
+        results_slim = pl.DataFrame(schema={c: RESULTS_SCHEMA[c] for c in result_cols})
+    else:
+        results_slim = (
+            results_df.select(result_cols)
+            .sort("date")
+            .group_by(["home_team", "away_team"], maintain_order=True)
+            .last()
+        )
+
+    joined = fixtures.join(results_slim, on=["home_team", "away_team"], how="left")
+    played = pl.col("home_goals").is_not_null()
+
+    return (
+        joined
+        .with_columns(
+            pl.when(played)
+            .then(
+                pl.when(pl.col("home_goals") > pl.col("away_goals"))
+                .then(pl.lit("home"))
+                .when(pl.col("home_goals") < pl.col("away_goals"))
+                .then(pl.lit("away"))
+                .otherwise(pl.lit("draw"))
+            )
+            .alias("actual_outcome")
+        )
+        .with_columns(
+            pl.when(played)
+            .then(pl.col("model_pick") == pl.col("actual_outcome"))
+            .alias("model_correct")
+        )
+    )
+
+
 #: Per-outcome accuracy frame schema (output of :func:`accuracy_by_outcome`).
 OUTCOME_ACCURACY_SCHEMA: dict[str, pl.DataType] = {
     "actual_outcome": pl.Utf8,
@@ -494,6 +545,32 @@ def calibration_bins(finished: pl.DataFrame, *, n_bins: int = 5) -> pl.DataFrame
         )
         .select(list(CALIBRATION_SCHEMA.keys()))
     )
+
+
+def xg_error_summary(finished: pl.DataFrame) -> dict[str, float]:
+    """MAE of predicted xG vs actual goals scored over finished matches.
+
+    Compares ``exp_home_goals``/``exp_away_goals`` (model Poisson mean) against
+    ``home_goals``/``away_goals`` (actual result). Returns zeroed dict when xG
+    columns are absent or the frame is empty.
+    """
+
+    needed = {"exp_home_goals", "exp_away_goals", "home_goals", "away_goals"}
+    if finished.is_empty() or not needed.issubset(finished.columns):
+        return {"n": 0.0, "home_mae": 0.0, "away_mae": 0.0, "total_mae": 0.0}
+
+    home_mae = float(
+        (finished["exp_home_goals"] - finished["home_goals"].cast(pl.Float64)).abs().mean()
+    )
+    away_mae = float(
+        (finished["exp_away_goals"] - finished["away_goals"].cast(pl.Float64)).abs().mean()
+    )
+    return {
+        "n": float(finished.height),
+        "home_mae": home_mae,
+        "away_mae": away_mae,
+        "total_mae": (home_mae + away_mae) / 2,
+    }
 
 
 def upset_candidates(
