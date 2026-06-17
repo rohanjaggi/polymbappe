@@ -156,6 +156,65 @@ def test_structural_fallback_cycles(monkeypatch) -> None:
     assert second.name == exps[1].name
 
 
+def test_llm_proposal_filters_and_logs_dropped_keys(monkeypatch) -> None:
+    import json
+    from unittest.mock import patch
+
+    from structlog.testing import capture_logs
+
+    import polymbappe.tune.llm_search as ls
+
+    reply = {
+        "message": {
+            "content": json.dumps(
+                {
+                    "name": "mixed",
+                    "config": {
+                        "dixon_coles.l2_attack": 0.5,  # valid -> kept
+                        "ensemble.architecture.type": "x",  # unknown key -> dropped
+                        "dixon_coles.max_goals": 9,  # not a choice -> dropped
+                    },
+                    "hypothesis": "h",
+                }
+            )
+        }
+    }
+    monkeypatch.setattr(ls, "_ollama_available", lambda: True)
+    with patch("ollama.chat", return_value=reply), capture_logs() as logs:
+        exp = ls.propose_structural_experiment([])
+
+    # Only the live knob survives; hallucinated key and out-of-spec value are filtered out.
+    assert exp.config == {"dixon_coles.l2_attack": 0.5}
+    dropped = next(
+        log["dropped"] for log in logs if log["event"] == "autotune.llm_proposal_dropped_keys"
+    )
+    assert dropped == {
+        "ensemble.architecture.type": "unknown_key",
+        "dixon_coles.max_goals": "out_of_spec_value",
+    }
+
+
+def test_llm_proposal_all_invalid_falls_back(monkeypatch) -> None:
+    import json
+    from unittest.mock import patch
+
+    from structlog.testing import capture_logs
+
+    import polymbappe.tune.llm_search as ls
+
+    reply = {"message": {"content": json.dumps({"name": "junk", "config": {"foo.bar": 1}})}}
+    monkeypatch.setattr(ls, "_ollama_available", lambda: True)
+    with patch("ollama.chat", return_value=reply), capture_logs() as logs:
+        exp = ls.propose_structural_experiment([])
+
+    # Nothing usable -> curated fallback, and the discard is logged (not silently inconclusive).
+    assert exp.name == default_structural_experiments()[0].name
+    assert {log["event"] for log in logs} >= {
+        "autotune.llm_proposal_dropped_keys",
+        "autotune.llm_proposal_discarded",
+    }
+
+
 def test_parse_budget() -> None:
     assert parse_budget_to_trials("2h", trials_per_hour=10) == 20
     assert parse_budget_to_trials("30m", trials_per_hour=60) == 30

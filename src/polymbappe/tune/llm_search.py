@@ -21,6 +21,10 @@ import json
 from dataclasses import dataclass, field
 from typing import Any
 
+import structlog
+
+logger = structlog.get_logger(__name__)
+
 
 @dataclass(slots=True)
 class StructuralExperiment:
@@ -166,18 +170,35 @@ def propose_structural_experiment(
         except Exception:  # noqa: BLE001 - older Ollama / non-thinking model rejects think=
             resp = ollama.chat(model=model, messages=messages, format="json")
         data = json.loads(resp["message"]["content"])
-        config = {
-            k: v
-            for k, v in dict(data.get("config", {})).items()
-            if k in specs and _valid_value(specs[k], v)
-        }
+        name = str(data.get("name", next_fallback.name))
+        config: dict[str, Any] = {}
+        dropped: dict[str, str] = {}
+        for key, value in dict(data.get("config", {})).items():
+            if key not in specs:
+                dropped[key] = "unknown_key"
+            elif not _valid_value(specs[key], value):
+                dropped[key] = "out_of_spec_value"
+            else:
+                config[key] = value
+        if dropped:
+            # Surface keys the LLM proposed that the objective cannot act on, so an
+            # experiment that silently collapses toward the baseline is visible in the log
+            # rather than hiding behind a bare "inconclusive".
+            logger.warning(
+                "autotune.llm_proposal_dropped_keys",
+                name=name,
+                dropped=dropped,
+                kept=sorted(config),
+            )
         if not config:
-            # Every proposed key was hallucinated/out-of-spec -> the experiment would just
-            # rerun the baseline (or crash a cast). Fall back to a curated change so the
-            # loop makes real progress.
+            # Nothing survived -> this proposal would just rerun the baseline (or crash a
+            # cast). Fall back to a curated change so the loop makes real progress.
+            logger.warning(
+                "autotune.llm_proposal_discarded", name=name, fallback=next_fallback.name
+            )
             return next_fallback
         return StructuralExperiment(
-            name=str(data.get("name", next_fallback.name)),
+            name=name,
             config=config,
             hypothesis=str(data.get("hypothesis", "")),
         )

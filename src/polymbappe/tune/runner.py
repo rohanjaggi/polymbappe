@@ -100,8 +100,15 @@ def autotune(
         history.append({"name": exp.name, "mean_rps": metrics.mean_rps, "decision": decision})
         if decision == "accept":
             best_metrics, best_config = metrics, exp.config
+        # An experiment that lands exactly on the baseline RPS changed no live knob; flag it
+        # so a no-op is visible rather than hiding behind a bare "inconclusive".
+        no_op = abs(metrics.mean_rps - baseline.mean_rps) < 1e-9
         logger.info(
-            "autotune.phase1", name=exp.name, rps=round(metrics.mean_rps, 4), decision=decision
+            "autotune.phase1",
+            name=exp.name,
+            rps=round(metrics.mean_rps, 4),
+            decision=decision,
+            no_op=no_op,
         )
 
     # -- Phase 2: numeric TPE within the locked structure --
