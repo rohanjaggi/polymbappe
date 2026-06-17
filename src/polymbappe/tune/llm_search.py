@@ -78,8 +78,8 @@ def _ollama_available() -> bool:
     return True
 
 
-def _tunable_schema() -> tuple[str, set[str]]:
-    """Return (human-readable param menu for the prompt, set of valid namespaced keys).
+def _tunable_schema() -> tuple[str, dict[str, Any]]:
+    """Return (human-readable param menu for the prompt, specs keyed by namespaced name).
 
     Sourced from the Phase-2 search space so the two phases share one definition of which
     knobs the backtest actually exercises.
@@ -88,9 +88,9 @@ def _tunable_schema() -> tuple[str, set[str]]:
     from polymbappe.tune.search_space import load_search_space
 
     lines: list[str] = []
-    keys: set[str] = set()
+    specs: dict[str, Any] = {}
     for spec in load_search_space().params:
-        keys.add(spec.name)
+        specs[spec.name] = spec
         if spec.kind == "categorical":
             desc = f"categorical, one of {spec.choices}"
         elif spec.kind == "int":
@@ -98,7 +98,28 @@ def _tunable_schema() -> tuple[str, set[str]]:
         else:
             desc = f"float in [{spec.low}, {spec.high}]" + (" (log scale)" if spec.log else "")
         lines.append(f"- {spec.name}: {desc}")
-    return "\n".join(lines), keys
+    return "\n".join(lines), specs
+
+
+def _valid_value(spec: Any, value: Any) -> bool:
+    """Whether ``value`` respects ``spec``'s declared type and bound/choice set.
+
+    The LLM can return a valid key with an out-of-spec value (e.g. the string ``"None"``
+    for a categorical, or a number past its range). Such values would otherwise reach the
+    objective and either skew the backtest or crash a cast, so they are rejected here.
+    """
+
+    if spec.kind == "categorical":
+        return value in (spec.choices or [])
+    if isinstance(value, bool):  # bool subclasses int; never a valid numeric knob value
+        return False
+    if not isinstance(value, (int, float)):
+        return False
+    if spec.low is not None and value < spec.low:
+        return False
+    if spec.high is not None and value > spec.high:
+        return False
+    return True
 
 
 def propose_structural_experiment(
@@ -124,7 +145,7 @@ def propose_structural_experiment(
     try:  # pragma: no cover - exercised only with a live Ollama server
         import ollama
 
-        schema, valid_keys = _tunable_schema()
+        schema, specs = _tunable_schema()
         prompt = (
             "You are tuning a football forecasting ensemble. Given prior experiment "
             "results (JSON), propose ONE structural change as JSON with keys "
@@ -136,18 +157,24 @@ def propose_structural_experiment(
             f"Tunable parameters:\n{schema}\n"
             f"Prior results: {json.dumps(prior_results)}"
         )
-        resp = ollama.chat(
-            model=model,
-            messages=[{"role": "user", "content": prompt}],
-            format="json",
-        )
+        messages = [{"role": "user", "content": prompt}]
+        try:
+            # Disable "thinking" on reasoning models (e.g. Qwen3): with format=json the
+            # reasoning budget is spent on a long hidden trace that intermittently leaves
+            # the JSON content empty. think=False makes the model emit the JSON directly.
+            resp = ollama.chat(model=model, messages=messages, format="json", think=False)
+        except Exception:  # noqa: BLE001 - older Ollama / non-thinking model rejects think=
+            resp = ollama.chat(model=model, messages=messages, format="json")
         data = json.loads(resp["message"]["content"])
         config = {
-            k: v for k, v in dict(data.get("config", {})).items() if k in valid_keys
+            k: v
+            for k, v in dict(data.get("config", {})).items()
+            if k in specs and _valid_value(specs[k], v)
         }
         if not config:
-            # Every proposed key was hallucinated/inert -> the experiment would just rerun
-            # the baseline. Fall back to a curated change so the loop makes real progress.
+            # Every proposed key was hallucinated/out-of-spec -> the experiment would just
+            # rerun the baseline (or crash a cast). Fall back to a curated change so the
+            # loop makes real progress.
             return next_fallback
         return StructuralExperiment(
             name=str(data.get("name", next_fallback.name)),

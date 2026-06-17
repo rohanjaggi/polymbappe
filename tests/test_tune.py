@@ -146,7 +146,9 @@ def test_leaderboard_roundtrip(tmp_path) -> None:
     assert best["experiment_id"].item() == "e1"
 
 
-def test_structural_fallback_cycles() -> None:
+def test_structural_fallback_cycles(monkeypatch) -> None:
+    # Force the offline path so the test is deterministic regardless of a local Ollama server.
+    monkeypatch.setattr("polymbappe.tune.llm_search._ollama_available", lambda: False)
     exps = default_structural_experiments()
     first = propose_structural_experiment([])
     assert first.name == exps[0].name
@@ -160,7 +162,10 @@ def test_parse_budget() -> None:
     assert parse_budget_to_trials("garbage", trials_per_hour=42) == 42
 
 
-def test_autotune_end_to_end(tmp_path) -> None:
+def test_autotune_end_to_end(tmp_path, monkeypatch) -> None:
+    # Force the offline structural path so the end-to-end run is deterministic and does not
+    # depend on a local Ollama server (live LLM coverage is exercised separately).
+    monkeypatch.setattr("polymbappe.tune.llm_search._ollama_available", lambda: False)
     board = Leaderboard(Settings(data_dir=tmp_path))
     result = autotune(
         _matches(),
