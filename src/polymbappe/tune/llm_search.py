@@ -76,7 +76,7 @@ def _ollama_available() -> bool:
 def propose_structural_experiment(
     prior_results: list[dict[str, Any]],
     *,
-    model: str = "qwen2.5:7b",
+    model: str = "qwen3.5:9b",
     fallback: list[StructuralExperiment] | None = None,
 ) -> StructuralExperiment:
     """Propose the next structural experiment from prior results.
