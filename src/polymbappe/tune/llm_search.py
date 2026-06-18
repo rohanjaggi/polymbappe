@@ -17,7 +17,9 @@ onto a live knob instead of degenerating into a no-op rerun of the baseline.
 
 from __future__ import annotations
 
+import ast
 import json
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -72,6 +74,37 @@ def default_structural_experiments() -> list[StructuralExperiment]:
             exclude_market=True,
         ),
     ]
+
+
+def _parse_llm_json(content: str) -> dict[str, Any]:
+    """Parse the model's reply into a dict, tolerating two qwen quirks.
+
+    Even with ``format="json"`` set, qwen3.5 (via Ollama 0.30) routinely (a) wraps the
+    object in a ```json ... ``` markdown fence and (b) emits Python literals such as
+    ``None`` for a nullable value. Either makes a bare ``json.loads`` raise, which the
+    caller's broad ``except`` would silently turn into a fallback -- so the LLM path would
+    run (paying ~30s/call) yet never contribute a single proposal. Strip the fence and, on
+    failure, recover via ``ast.literal_eval`` after normalizing JSON keywords to Python.
+    """
+
+    text = content.strip()
+    fence = re.match(r"^```(?:json)?\s*(.*?)\s*```$", text, re.DOTALL)
+    if fence:
+        text = fence.group(1).strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        start, end = text.find("{"), text.rfind("}")
+        if start == -1 or end <= start:
+            raise
+        span = text[start : end + 1]
+        span = re.sub(r"\btrue\b", "True", span)
+        span = re.sub(r"\bfalse\b", "False", span)
+        span = re.sub(r"\bnull\b", "None", span)
+        parsed = ast.literal_eval(span)
+        if not isinstance(parsed, dict):
+            raise
+        return parsed
 
 
 def _ollama_available() -> bool:
@@ -150,15 +183,21 @@ def propose_structural_experiment(
         import ollama
 
         schema, specs = _tunable_schema()
+        allowed_keys = list(specs)
         prompt = (
             "You are tuning a football forecasting ensemble. Given prior experiment "
             "results (JSON), propose ONE structural change as JSON with keys "
             '"name", "config", "hypothesis".\n'
-            '"config" MUST be a flat dict whose keys are chosen ONLY from this menu of '
-            "tunable parameters (use the exact key names; values must respect the stated "
-            "type/range). Pick a qualitatively different combination from the prior "
-            "experiments; do not invent keys outside the menu.\n"
-            f"Tunable parameters:\n{schema}\n"
+            '"config" MUST be a flat dict. Every key MUST be copied CHARACTER-FOR-CHARACTER '
+            "from the allowed-keys list below -- do not rename, abbreviate, reorder letters, "
+            "add or remove underscores, or pluralize. In particular the boosting namespace is "
+            'exactly "gbm." (g-b-m), never "gmb." or "g_bm.". Any key that is not a verbatim '
+            "match is silently discarded, which collapses your experiment into a no-op rerun "
+            "of the baseline, so accuracy of the key strings matters more than how many you "
+            "include. Values must respect the stated type/range. Pick a qualitatively "
+            "different combination from the prior experiments; do not invent keys.\n"
+            f"Allowed keys (use these exact strings only): {json.dumps(allowed_keys)}\n"
+            f"Per-key types/ranges:\n{schema}\n"
             f"Prior results: {json.dumps(prior_results)}"
         )
         messages = [{"role": "user", "content": prompt}]
@@ -169,7 +208,7 @@ def propose_structural_experiment(
             resp = ollama.chat(model=model, messages=messages, format="json", think=False)
         except Exception:  # noqa: BLE001 - older Ollama / non-thinking model rejects think=
             resp = ollama.chat(model=model, messages=messages, format="json")
-        data = json.loads(resp["message"]["content"])
+        data = _parse_llm_json(resp["message"]["content"])
         name = str(data.get("name", next_fallback.name))
         config: dict[str, Any] = {}
         dropped: dict[str, str] = {}
