@@ -57,6 +57,7 @@ def autotune(
     n_trials: int = 30,
     gate: AcceptanceGate | None = None,
     leaderboard: Leaderboard | None = None,
+    llm_model: str | None = None,
 ) -> AutotuneResult:
     """Run the two-phase autoresearch loop and return the best accepted config."""
 
@@ -83,8 +84,9 @@ def autotune(
     # -- Phase 1: structural search --
     experiments = default_structural_experiments()
     limit = n_structural if n_structural is not None else len(experiments)
+    propose_kwargs = {"model": llm_model} if llm_model else {}
     for _ in range(limit):
-        exp = propose_structural_experiment(history)
+        exp = propose_structural_experiment(history, **propose_kwargs)
         odds = None if exp.exclude_market else market_odds
         metrics = config_to_metrics(
             exp.config,
@@ -98,8 +100,15 @@ def autotune(
         history.append({"name": exp.name, "mean_rps": metrics.mean_rps, "decision": decision})
         if decision == "accept":
             best_metrics, best_config = metrics, exp.config
+        # An experiment that lands exactly on the baseline RPS changed no live knob; flag it
+        # so a no-op is visible rather than hiding behind a bare "inconclusive".
+        no_op = abs(metrics.mean_rps - baseline.mean_rps) < 1e-9
         logger.info(
-            "autotune.phase1", name=exp.name, rps=round(metrics.mean_rps, 4), decision=decision
+            "autotune.phase1",
+            name=exp.name,
+            rps=round(metrics.mean_rps, 4),
+            decision=decision,
+            no_op=no_op,
         )
 
     # -- Phase 2: numeric TPE within the locked structure --
@@ -180,6 +189,7 @@ def run_autotune(
         squad_valuations=squad_valuations,
         n_trials=n_trials,
         leaderboard=board,
+        llm_model=settings.autotune_llm_model,
     )
     print(
         f"baseline RPS={result.baseline_metrics.mean_rps:.4f} -> "

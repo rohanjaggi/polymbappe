@@ -203,6 +203,49 @@ class _LatentStrength:
         self._delta[team] = self.get(team) + self.lr * (observed_gd - expected_gd)
 
 
+def build_played_group_results(
+    matches: pl.DataFrame, structure: TournamentStructure
+) -> dict[str, dict[frozenset[str], dict[str, int]]]:
+    """Map already-played 2026 group-stage results onto their groups.
+
+    Returns ``group -> {frozenset(home, away): {team: goals}}`` so the Monte Carlo can lock
+    in real scorelines instead of re-sampling them. The ingested results carry no group tag,
+    so each match is assigned to a group by team membership in ``structure.groups``; a match
+    whose two teams are not both in one configured group (a name mismatch, or a knockout
+    fixture) is skipped — degrading to "simulate it" rather than corrupting a table.
+    """
+
+    import structlog
+
+    logger = structlog.get_logger(__name__)
+    team_group = {t: g for g, members in structure.groups.items() for t in members}
+    played: dict[str, dict[frozenset[str], dict[str, int]]] = {}
+    if matches.is_empty():
+        return played
+    wc = matches.filter(
+        (pl.col("competition") == "FIFA World Cup")
+        & (~pl.col("is_knockout"))
+        & (pl.col("date") >= WC2026_START)
+    )
+    skipped = 0
+    for r in wc.sort("date").iter_rows(named=True):
+        home, away = r["home_team"], r["away_team"]
+        group = team_group.get(home)
+        if group is None or team_group.get(away) != group:
+            skipped += 1
+            continue
+        played.setdefault(group, {})[frozenset((home, away))] = {
+            home: int(r["home_goals"]),
+            away: int(r["away_goals"]),
+        }
+    logger.info(
+        "simulate.played_results",
+        locked=sum(len(v) for v in played.values()),
+        skipped=skipped,
+    )
+    return played
+
+
 def _simulate_group(
     group: str,
     teams: list[str],
@@ -210,18 +253,32 @@ def _simulate_group(
     latent: _LatentStrength,
     rng: np.random.Generator,
     context_hook: ContextHook | None = None,
+    played: dict[frozenset[str], dict[str, int]] | None = None,
 ) -> list[GroupStanding]:
-    """Play one group's six matches and return the resolved standings."""
+    """Play one group's six matches and return the resolved standings.
+
+    Fixtures present in ``played`` (real, ingested results) are locked to their actual
+    scoreline instead of being sampled, so mid-tournament standings reflect what has really
+    happened; the remaining fixtures are simulated as usual. A locked result still feeds the
+    latent-strength update, so real group form propagates into the knockout rounds.
+    """
 
     matches: list[Match] = []
     for k, (i, j, _matchday) in enumerate(_GROUP_SCHEDULE):
         home, away = teams[i], teams[j]
         dh, da = latent.get(home), latent.get(away)
-        matrix = _contextualize(
-            model.score_matrix(home, away, neutral=True, dh=dh, da=da), home, away, context_hook
-        )
-        hg, ag = sample_scoreline(matrix, rng)
         lam, mu = model.rates(home, away, neutral=True, dh=dh, da=da)
+        locked = played.get(frozenset((home, away))) if played else None
+        if locked is not None:
+            hg, ag = locked[home], locked[away]
+        else:
+            matrix = _contextualize(
+                model.score_matrix(home, away, neutral=True, dh=dh, da=da),
+                home,
+                away,
+                context_hook,
+            )
+            hg, ag = sample_scoreline(matrix, rng)
         latent.update(home, hg - ag, lam - mu)
         latent.update(away, ag - hg, mu - lam)
         matches.append(
@@ -286,11 +343,16 @@ def simulate_tournament(
     rng: np.random.Generator | None = None,
     learning_rate: float = 0.05,
     context_hook: ContextHook | None = None,
+    played_results: dict[str, dict[frozenset[str], dict[str, int]]] | None = None,
 ) -> SimulationResult:
     """Run the full Monte Carlo tournament simulation.
 
     ``context_hook`` (optional) applies a per-match contextual H/D/A adjustment by
     reweighting each score matrix (spec 4.1 per-match contextual injection).
+
+    ``played_results`` (optional, keyed by group from :func:`build_played_group_results`)
+    locks already-played group fixtures to their real scoreline, so a mid-tournament re-run
+    reflects the current standings instead of re-rolling the whole group stage.
     """
 
     rng = rng or np.random.default_rng()
@@ -307,7 +369,10 @@ def simulate_tournament(
         runners_up: list[str] = []
         thirds: list[GroupStanding] = []
         for group, members in structure.groups.items():
-            standings = _simulate_group(group, members, model, latent, rng, context_hook)
+            standings = _simulate_group(
+                group, members, model, latent, rng, context_hook,
+                played=played_results.get(group) if played_results else None,
+            )
             for rank, row in enumerate(standings, start=1):
                 group_finish[row.team][rank] = group_finish[row.team].get(rank, 0) + 1
             winners.append(standings[0])
@@ -561,7 +626,17 @@ def run_tournament_simulation(
             settings, structure, elo, logger, historical=historical_context
         )
 
-    result = simulate_tournament(structure, model, n_sims=n_sims, context_hook=context_hook)
+    # Lock already-played 2026 group results so standings reflect the live tournament.
+    played_results = (
+        build_played_group_results(read_table(Table.MATCHES, settings), structure)
+        if table_exists(Table.MATCHES, settings)
+        else None
+    )
+
+    result = simulate_tournament(
+        structure, model, n_sims=n_sims, context_hook=context_hook,
+        played_results=played_results,
+    )
     predictions = compute_match_predictions(
         structure, model, context_hook, bayesian_model=bayesian_model
     )

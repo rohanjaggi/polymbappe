@@ -146,12 +146,73 @@ def test_leaderboard_roundtrip(tmp_path) -> None:
     assert best["experiment_id"].item() == "e1"
 
 
-def test_structural_fallback_cycles() -> None:
+def test_structural_fallback_cycles(monkeypatch) -> None:
+    # Force the offline path so the test is deterministic regardless of a local Ollama server.
+    monkeypatch.setattr("polymbappe.tune.llm_search._ollama_available", lambda: False)
     exps = default_structural_experiments()
     first = propose_structural_experiment([])
     assert first.name == exps[0].name
     second = propose_structural_experiment([{"name": exps[0].name}])
     assert second.name == exps[1].name
+
+
+def test_llm_proposal_filters_and_logs_dropped_keys(monkeypatch) -> None:
+    import json
+    from unittest.mock import patch
+
+    from structlog.testing import capture_logs
+
+    import polymbappe.tune.llm_search as ls
+
+    reply = {
+        "message": {
+            "content": json.dumps(
+                {
+                    "name": "mixed",
+                    "config": {
+                        "dixon_coles.l2_attack": 0.5,  # valid -> kept
+                        "ensemble.architecture.type": "x",  # unknown key -> dropped
+                        "dixon_coles.max_goals": 9,  # not a choice -> dropped
+                    },
+                    "hypothesis": "h",
+                }
+            )
+        }
+    }
+    monkeypatch.setattr(ls, "_ollama_available", lambda: True)
+    with patch("ollama.chat", return_value=reply), capture_logs() as logs:
+        exp = ls.propose_structural_experiment([])
+
+    # Only the live knob survives; hallucinated key and out-of-spec value are filtered out.
+    assert exp.config == {"dixon_coles.l2_attack": 0.5}
+    dropped = next(
+        log["dropped"] for log in logs if log["event"] == "autotune.llm_proposal_dropped_keys"
+    )
+    assert dropped == {
+        "ensemble.architecture.type": "unknown_key",
+        "dixon_coles.max_goals": "out_of_spec_value",
+    }
+
+
+def test_llm_proposal_all_invalid_falls_back(monkeypatch) -> None:
+    import json
+    from unittest.mock import patch
+
+    from structlog.testing import capture_logs
+
+    import polymbappe.tune.llm_search as ls
+
+    reply = {"message": {"content": json.dumps({"name": "junk", "config": {"foo.bar": 1}})}}
+    monkeypatch.setattr(ls, "_ollama_available", lambda: True)
+    with patch("ollama.chat", return_value=reply), capture_logs() as logs:
+        exp = ls.propose_structural_experiment([])
+
+    # Nothing usable -> curated fallback, and the discard is logged (not silently inconclusive).
+    assert exp.name == default_structural_experiments()[0].name
+    assert {log["event"] for log in logs} >= {
+        "autotune.llm_proposal_dropped_keys",
+        "autotune.llm_proposal_discarded",
+    }
 
 
 def test_parse_budget() -> None:
@@ -160,7 +221,10 @@ def test_parse_budget() -> None:
     assert parse_budget_to_trials("garbage", trials_per_hour=42) == 42
 
 
-def test_autotune_end_to_end(tmp_path) -> None:
+def test_autotune_end_to_end(tmp_path, monkeypatch) -> None:
+    # Force the offline structural path so the end-to-end run is deterministic and does not
+    # depend on a local Ollama server (live LLM coverage is exercised separately).
+    monkeypatch.setattr("polymbappe.tune.llm_search._ollama_available", lambda: False)
     board = Leaderboard(Settings(data_dir=tmp_path))
     result = autotune(
         _matches(),

@@ -15,6 +15,7 @@ class Settings(BaseSettings):
     data_dir: Path = Field(default=Path("data"))
     friendly_weight: float = Field(default=0.3, ge=0.0, le=1.0)
     dixon_coles_xi: float = Field(default=0.0019, ge=0.0)
+    autotune_llm_model: str = Field(default="qwen3.5:9b")
 
     @property
     def raw_data_dir(self) -> Path:
