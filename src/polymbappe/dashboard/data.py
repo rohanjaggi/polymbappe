@@ -374,7 +374,23 @@ def split_fixtures(
             .last()
         )
 
+    # Join on exact (home, away) first
     joined = fixtures.join(results_slim, on=["home_team", "away_team"], how="left")
+
+    # For unmatched rows, try the reversed pairing (neutral-venue fixtures may have
+    # home/away swapped between the prediction schedule and the results feed).
+    unmatched = joined.filter(pl.col("home_goals").is_null()).select(fixtures.columns)
+    if not unmatched.is_empty() and not results_slim.is_empty():
+        reversed_results = results_slim.rename(
+            {"home_team": "away_team", "away_team": "home_team",
+             "home_goals": "away_goals", "away_goals": "home_goals"}
+        )
+        reverse_joined = unmatched.join(
+            reversed_results, on=["home_team", "away_team"], how="left"
+        )
+        matched_fwd = joined.filter(pl.col("home_goals").is_not_null())
+        joined = pl.concat([matched_fwd, reverse_joined], how="diagonal_relaxed")
+
     played = pl.col("home_goals").is_not_null()
 
     upcoming = joined.filter(~played).select(fixtures.columns)
@@ -423,6 +439,20 @@ def all_fixtures_with_results(
         )
 
     joined = fixtures.join(results_slim, on=["home_team", "away_team"], how="left")
+
+    # Try reversed pairing for unmatched rows (neutral-venue home/away swaps).
+    unmatched = joined.filter(pl.col("home_goals").is_null()).select(fixtures.columns)
+    if not unmatched.is_empty() and not results_slim.is_empty():
+        reversed_results = results_slim.rename(
+            {"home_team": "away_team", "away_team": "home_team",
+             "home_goals": "away_goals", "away_goals": "home_goals"}
+        )
+        reverse_joined = unmatched.join(
+            reversed_results, on=["home_team", "away_team"], how="left"
+        )
+        matched_fwd = joined.filter(pl.col("home_goals").is_not_null())
+        joined = pl.concat([matched_fwd, reverse_joined], how="diagonal_relaxed")
+
     played = pl.col("home_goals").is_not_null()
 
     return (

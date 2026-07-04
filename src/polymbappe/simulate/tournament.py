@@ -174,12 +174,30 @@ class SimulationResult:
     group_finish_counts: dict[str, dict[int, int]]
     r32_matchup_counts: dict[tuple[str, str], int]
 
-    def stage_probabilities(self) -> pl.DataFrame:
+    def stage_probabilities(
+        self, eliminated: set[str] | None = None
+    ) -> pl.DataFrame:
+        """Per-team stage-reaching probabilities.
+
+        When ``eliminated`` is supplied, those teams are zeroed out and the
+        remaining probabilities are renormalised so each stage sums to 1.
+        """
+
         rows = [
             {"team": team, **{s: counts.get(s, 0) / self.n_sims for s in STAGES}}
             for team, counts in self.stage_counts.items()
         ]
-        return pl.DataFrame(rows).sort("champion", descending=True)
+        df = pl.DataFrame(rows)
+        if eliminated:
+            mask = pl.col("team").is_in(list(eliminated))
+            df = df.with_columns(
+                [pl.when(mask).then(0.0).otherwise(pl.col(s)).alias(s) for s in STAGES]
+            )
+            for s in STAGES:
+                total = df[s].sum()
+                if total > 0:
+                    df = df.with_columns((pl.col(s) / total).alias(s))
+        return df.sort("champion", descending=True)
 
     def group_probabilities(self) -> pl.DataFrame:
         rows = [
@@ -201,6 +219,49 @@ class _LatentStrength:
 
     def update(self, team: str, observed_gd: float, expected_gd: float) -> None:
         self._delta[team] = self.get(team) + self.lr * (observed_gd - expected_gd)
+
+
+def build_eliminated_teams(
+    matches: pl.DataFrame,
+    schedule: pl.DataFrame | None = None,
+) -> set[str]:
+    """Derive the set of teams eliminated from WC 2026 knockout rounds.
+
+    A team that played a knockout match but does not appear in any future scheduled
+    fixture is eliminated. Uses the upcoming schedule (null-score fixtures from the
+    upstream feed) as the source of truth for who is still alive.
+    """
+
+    import structlog
+
+    logger = structlog.get_logger(__name__)
+    ko = matches.filter(
+        (pl.col("competition") == "FIFA World Cup")
+        & pl.col("is_knockout")
+        & (pl.col("date") >= WC2026_START)
+    )
+    if ko.is_empty():
+        return set()
+
+    # All teams that have played at least one knockout match.
+    ko_teams = set(ko["home_team"].to_list() + ko["away_team"].to_list())
+
+    # Teams in upcoming scheduled fixtures are still alive.
+    alive_in_schedule: set[str] = set()
+    if schedule is not None and not schedule.is_empty():
+        future = schedule.filter(
+            (pl.col("competition") == "FIFA World Cup")
+            & (pl.col("date") >= WC2026_START)
+        )
+        alive_in_schedule = set(
+            future["home_team"].to_list() + future["away_team"].to_list()
+        )
+
+    # A team is eliminated if it entered the knockout rounds but has no future fixture.
+    eliminated = ko_teams - alive_in_schedule
+
+    logger.info("simulate.eliminated_teams", count=len(eliminated), teams=sorted(eliminated))
+    return eliminated
 
 
 def build_played_group_results(
@@ -413,7 +474,7 @@ def simulate_tournament(
                 winner = _knockout_winner(
                     current[i], current[i + 1], model, latent, structure, rng,
                     apply_upset_floor=False, context_hook=context_hook,
-                )
+                    )
                 stage_counts[winner][stage_name] = stage_counts[winner].get(stage_name, 0) + 1
                 winners_next.append(winner)
             current = winners_next
@@ -488,6 +549,67 @@ def compute_match_predictions(
     return pl.DataFrame(rows)
 
 
+def compute_knockout_fixture_predictions(
+    model: StrengthModel,
+    matches: pl.DataFrame,
+    context_hook: ContextHook | None = None,
+    exclude_pairs: set[tuple[str, str]] | None = None,
+) -> pl.DataFrame:
+    """H/D/A predictions for known knockout fixtures (played + scheduled).
+
+    Reads the ingested matches table for WC 2026 knockout fixtures and generates
+    model predictions in the same schema as :func:`compute_match_predictions`.
+    Pairings in ``exclude_pairs`` (e.g. group-stage fixtures misclassified as
+    knockout) are skipped to avoid duplicates.
+    """
+
+    _empty = pl.DataFrame(
+        schema={
+            "match_id": pl.Utf8, "group": pl.Utf8, "home_team": pl.Utf8,
+            "away_team": pl.Utf8, "model_home": pl.Float64, "model_draw": pl.Float64,
+            "model_away": pl.Float64, "exp_home_goals": pl.Float64,
+            "exp_away_goals": pl.Float64,
+        }
+    )
+
+    ko = matches.filter(
+        (pl.col("competition") == "FIFA World Cup")
+        & (pl.col("is_knockout"))
+        & (pl.col("date") >= WC2026_START)
+    )
+    if ko.is_empty():
+        return _empty
+
+    exclude = exclude_pairs or set()
+    grid = np.arange(model.max_goals + 1)
+    rows: list[dict[str, object]] = []
+    seen: set[frozenset[str]] = set()
+    for r in ko.iter_rows(named=True):
+        home, away = r["home_team"], r["away_team"]
+        pair = frozenset((home, away))
+        if pair in seen:
+            continue
+        if (home, away) in exclude or (away, home) in exclude:
+            continue
+        seen.add(pair)
+        matrix = _contextualize(
+            model.score_matrix(home, away, neutral=True), home, away, context_hook
+        )
+        h, d, a = hda_marginals(matrix)
+        rows.append({
+            "match_id": f"2026__{home}__{away}",
+            "group": "KO",
+            "home_team": home,
+            "away_team": away,
+            "model_home": h,
+            "model_draw": d,
+            "model_away": a,
+            "exp_home_goals": float((matrix.sum(axis=1) * grid).sum()),
+            "exp_away_goals": float((matrix.sum(axis=0) * grid).sum()),
+        })
+    return pl.DataFrame(rows) if rows else _empty
+
+
 # -- staleness detection (spec 4.5) -------------------------------------------
 
 
@@ -495,6 +617,50 @@ def surprise_increment(predicted_prob: float, occurred: bool) -> float:
     """Per-match surprise: ``|actual - predicted|`` for the realized outcome."""
 
     return abs((1.0 if occurred else 0.0) - predicted_prob)
+
+
+def _load_scheduled_fixtures(settings: object, logger: object) -> pl.DataFrame | None:
+    """Load upcoming (null-score) WC fixtures from the raw results CSV.
+
+    The upstream Kaggle mirror includes scheduled fixtures before scores are filled in.
+    Normalization drops these, but they're useful for inferring knockout-draw winners
+    (a team scheduled in a later round must have advanced).
+    """
+
+    import io
+    from pathlib import Path
+
+    raw_path = Path(getattr(settings, "raw_data_dir", "data/raw")) / "results.csv"
+    try:
+        if raw_path.exists():
+            raw = pl.read_csv(io.BytesIO(raw_path.read_bytes()), null_values=["NA"])
+        else:
+            from polymbappe.data.sources import KAGGLE_RESULTS_RAW_URL
+            import requests
+            resp = requests.get(KAGGLE_RESULTS_RAW_URL, timeout=30)
+            resp.raise_for_status()
+            raw = pl.read_csv(io.BytesIO(resp.content), null_values=["NA"])
+    except Exception:
+        return None
+
+    score_col = "home_score" if "home_score" in raw.columns else "home_goals"
+    scheduled = raw.filter(pl.col(score_col).is_null())
+    if scheduled.is_empty():
+        return None
+
+    rename = {"home_score": "home_goals", "away_score": "away_goals"}
+    rename = {k: v for k, v in rename.items() if k in scheduled.columns}
+    if rename:
+        scheduled = scheduled.rename(rename)
+
+    from polymbappe.data.aliases import normalize_team_expr
+
+    return scheduled.with_columns(
+        pl.col("date").cast(pl.Utf8).str.to_date(strict=False).alias("date"),
+        normalize_team_expr("home_team").alias("home_team"),
+        normalize_team_expr("away_team").alias("away_team"),
+        pl.col("tournament").cast(pl.Utf8).alias("competition"),
+    )
 
 
 @dataclass(slots=True)
@@ -626,10 +792,18 @@ def run_tournament_simulation(
             settings, structure, elo, logger, historical=historical_context
         )
 
-    # Lock already-played 2026 group results so standings reflect the live tournament.
+    # Lock already-played 2026 results so the sim reflects the live tournament.
+    matches_df = read_table(Table.MATCHES, settings) if table_exists(Table.MATCHES, settings) else pl.DataFrame()
     played_results = (
-        build_played_group_results(read_table(Table.MATCHES, settings), structure)
-        if table_exists(Table.MATCHES, settings)
+        build_played_group_results(matches_df, structure)
+        if not matches_df.is_empty()
+        else None
+    )
+    # Build the set of teams eliminated from knockout rounds so they can't advance.
+    scheduled_fixtures = _load_scheduled_fixtures(settings, logger)
+    eliminated_teams = (
+        build_eliminated_teams(matches_df, schedule=scheduled_fixtures)
+        if not matches_df.is_empty()
         else None
     )
 
@@ -641,9 +815,23 @@ def run_tournament_simulation(
         structure, model, context_hook, bayesian_model=bayesian_model
     )
 
+    # Append predictions for known knockout fixtures (played + scheduled),
+    # excluding any pairing already covered by the group-stage predictions.
+    if not matches_df.is_empty():
+        group_pairs = set(
+            zip(predictions["home_team"].to_list(), predictions["away_team"].to_list())
+        )
+        ko_preds = compute_knockout_fixture_predictions(
+            model, matches_df, context_hook, exclude_pairs=group_pairs
+        )
+        if not ko_preds.is_empty():
+            predictions = pl.concat(
+                [predictions, ko_preds.select(predictions.columns)], how="diagonal_relaxed"
+            )
+
     settings.outputs_data_dir.mkdir(parents=True, exist_ok=True)
     out = settings.outputs_data_dir
-    result.stage_probabilities().write_parquet(out / "stage_probabilities.parquet")
+    result.stage_probabilities(eliminated=eliminated_teams).write_parquet(out / "stage_probabilities.parquet")
     result.group_probabilities().write_parquet(out / "group_probabilities.parquet")
     predictions.write_parquet(out / "match_predictions.parquet")
     from polymbappe.simulate.knockout_predictions import compute_knockout_predictions
@@ -654,7 +842,7 @@ def run_tournament_simulation(
     if refresh_odds or live:
         refresh_market_odds(settings, logger)
     _write_edges(predictions, settings, logger).write_parquet(out / "edges.parquet")
-    print(result.stage_probabilities().head(15))
+    print(result.stage_probabilities(eliminated=eliminated_teams).head(15))
 
 
 class _LiveTournament:
