@@ -1,11 +1,27 @@
 # polymbappe
 
-Probabilistic forecasting toolkit for the 2026 FIFA World Cup: ingests
-international results, ratings, squads, xG/PPDA and market odds; fits a
-Dixon-Coles / GBM / Bayesian ensemble; simulates the tournament by Monte Carlo;
-and compares model probabilities against live Polymarket prices to surface
-edges. An optional LangGraph agent watches news/Reddit for late team-news and
-re-simulates, and a Streamlit dashboard visualizes the output.
+Probabilistic forecasting system for the 2026 FIFA World Cup. Stacks
+Dixon-Coles, Bayesian hierarchical, Elo, and market-implied models through a
+LightGBM + meta-learner ensemble, simulates the full 48-team tournament
+100,000 times by Monte Carlo, and compares predictions against live Polymarket
+prices to surface betting edges. A LangGraph agent monitors news for late
+team changes, and a Streamlit dashboard tracks everything live.
+
+**After 90 matches, the model is running at 70% accuracy** on a
+3-way prediction problem where random guessing gets 33%.
+See [full results](docs/results.md) and [architecture](docs/architecture.md).
+
+## Results
+
+Scored against actual WC2026 group-stage outcomes as they came in:
+
+- **70% accuracy** across 90 matches (home win / draw / away win)
+- **87% accuracy** when model confidence was 70%+ (20 out of 23)
+- **90% accuracy** on decisive outcomes — home and away wins combined (60/67)
+- **0.185 RPS** on historical backtest across 11 major tournaments over 14 years (target: < 0.21)
+
+Full breakdown with Brier score, log loss, calibration tables, and methodology
+in [docs/results.md](docs/results.md).
 
 ## Quickstart
 
@@ -292,13 +308,20 @@ LightGBM adjuster is known to hurt the LOTO backtest (contextual features
 accessible via `simulate --historical-context` for diagnostic comparison.
 
 ### Dashboard
-Six-page Streamlit app (overview, team deep-dive, match predictor, market edges,
-upset watch, agent activity).
+Seven-page Streamlit app (overview, team deep-dive, match predictor,
+predictions vs actuals, market edges, upset watch, agent activity).
 
 ```bash
 pip install -e .[dashboard]
 polymbappe dashboard
 ```
+
+## Architecture
+
+The system stacks 4 base models through a LightGBM + meta-learner ensemble,
+layers a contextual adjuster on top, and runs dual pipelines (calibration +
+edge detection). Full technical breakdown with component-level detail in
+[docs/architecture.md](docs/architecture.md).
 
 ## Project layout
 
