@@ -51,6 +51,26 @@ When the model assigns higher confidence, it delivers higher accuracy:
 This is the calibration story: the model knows what it knows. When it's
 uncertain, it says so. When it's confident, it's almost always right.
 
+## xG prediction quality
+
+The model predicts expected goals (xG) for each team per match. Comparing
+against FBref's actual xG (derived from real shot data) across all 90
+matches:
+
+| Comparison | MAE |
+|------------|----:|
+| Model xG vs FBref xG (pure model quality) | 0.47 |
+| FBref xG vs actual goals (finishing luck) | 0.75 |
+| Model xG vs actual goals (combined) | 0.76 |
+
+The model's predicted xG correlates at **0.74** with FBref's ground truth.
+Its prediction error (0.47) is smaller than the inherent randomness of
+whether shots go in (0.75). In other words, the gap between FBref's
+ground-truth xG and the actual scoreline — pure finishing variance that no
+pre-match model can predict — is larger than the gap between the model and
+FBref. The model is closer to what *should* have happened than what *did*
+happen.
+
 ## Historical validation
 
 The model was validated before the tournament using **leave-one-tournament-out**

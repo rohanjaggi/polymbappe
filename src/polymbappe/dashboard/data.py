@@ -634,9 +634,20 @@ def xg_error_summary(
     if match_xg is None or match_xg.is_empty():
         return result
 
-    # Join actual xG onto finished fixtures by (home_team, away_team).
+    # Join actual xG onto finished fixtures by (home_team, away_team), with a
+    # reversed-pairing fallback for neutral-venue matches where FBref and the
+    # prediction schedule list home/away in opposite order.
     xg_slim = match_xg.select(["home_team", "away_team", "home_xg", "away_xg"])
     joined = finished.join(xg_slim, on=["home_team", "away_team"], how="inner")
+    unmatched = finished.join(xg_slim, on=["home_team", "away_team"], how="anti")
+    if not unmatched.is_empty():
+        xg_rev = xg_slim.rename(
+            {"home_team": "away_team", "away_team": "home_team",
+             "home_xg": "away_xg", "away_xg": "home_xg"}
+        )
+        rev_joined = unmatched.join(xg_rev, on=["home_team", "away_team"], how="inner")
+        if not rev_joined.is_empty():
+            joined = pl.concat([joined, rev_joined], how="diagonal_relaxed")
     if joined.is_empty():
         return result
 

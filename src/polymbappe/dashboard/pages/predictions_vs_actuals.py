@@ -165,6 +165,15 @@ def _xg_table(finished: pl.DataFrame, match_xg: pl.DataFrame) -> object:
     if has_xg:
         xg_slim = match_xg.select(["home_team", "away_team", "home_xg", "away_xg"])
         joined = finished.join(xg_slim, on=["home_team", "away_team"], how="left")
+        unmatched = joined.filter(pl.col("home_xg").is_null()).select(finished.columns)
+        if not unmatched.is_empty():
+            xg_rev = xg_slim.rename(
+                {"home_team": "away_team", "away_team": "home_team",
+                 "home_xg": "away_xg", "away_xg": "home_xg"}
+            )
+            rev_joined = unmatched.join(xg_rev, on=["home_team", "away_team"], how="left")
+            matched = joined.filter(pl.col("home_xg").is_not_null())
+            joined = pl.concat([matched, rev_joined], how="diagonal_relaxed")
     else:
         joined = finished
 

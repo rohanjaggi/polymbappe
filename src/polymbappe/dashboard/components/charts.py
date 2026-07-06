@@ -320,6 +320,15 @@ def xg_scatter(finished: pl.DataFrame, match_xg: pl.DataFrame | None = None) -> 
     if match_xg is not None and not match_xg.is_empty():
         xg_slim = match_xg.select(["home_team", "away_team", "home_xg", "away_xg"])
         joined = finished.join(xg_slim, on=["home_team", "away_team"], how="inner")
+        unmatched = finished.join(xg_slim, on=["home_team", "away_team"], how="anti")
+        if not unmatched.is_empty():
+            xg_rev = xg_slim.rename(
+                {"home_team": "away_team", "away_team": "home_team",
+                 "home_xg": "away_xg", "away_xg": "home_xg"}
+            )
+            rev_joined = unmatched.join(xg_rev, on=["home_team", "away_team"], how="inner")
+            if not rev_joined.is_empty():
+                joined = pl.concat([joined, rev_joined], how="diagonal_relaxed")
         if not joined.is_empty():
             x_actual_xg, y_actual_goals, xg_labels = [], [], []
             for r in joined.iter_rows(named=True):
