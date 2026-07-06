@@ -16,6 +16,7 @@ from collections.abc import Callable
 from polymbappe.config import Settings
 from polymbappe.dashboard.pages import (
     agent_activity,
+    knockout_bracket,
     market_edges,
     match_predictor,
     overview,
@@ -29,6 +30,7 @@ PAGES: dict[str, Callable[[Settings], None]] = {
     "Tournament Overview": overview.render,
     "Team Deep Dive": team_deep_dive.render,
     "Match Predictor": match_predictor.render,
+    "Knockout Bracket": knockout_bracket.render,
     "Predictions vs Actuals": predictions_vs_actuals.render,
     "Market Edges": market_edges.render,
     "Upset Watch": upset_watch.render,

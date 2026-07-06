@@ -57,27 +57,45 @@ def render(settings: Settings) -> None:
     st.divider()
     _render_breakdowns(st, finished)
     st.divider()
+    _render_significance(st, finished)
+    st.divider()
+    _render_competitive_subset(st, finished)
+    st.divider()
+    _render_market(st, finished, settings)
+    st.divider()
     _render_xg_analysis(st, finished, match_xg)
     st.divider()
     _render_match_table(st, finished)
 
 
 def _render_scorecard(st: object, finished: pl.DataFrame) -> None:
-    """Headline accuracy / Brier / log-loss metrics across all finished matches."""
+    """Headline scoring rules across all finished matches, with skill vs. a uniform guess."""
 
     scorecard = data.prediction_scorecard(finished)
-    cols = st.columns(4)
+    cols = st.columns(5)
     cols[0].metric("Matches scored", int(scorecard["n"]))
     cols[1].metric("Top-pick accuracy", f"{scorecard['accuracy']:.1%}")
     cols[2].metric(
-        "Brier score",
-        f"{scorecard['brier_score']:.3f}",
-        help="Mean squared error over H/D/A — lower is better (0 best, 2 worst).",
+        "RPS",
+        f"{scorecard['rps']:.3f}",
+        help="Ranked Probability Score — the ordinal (H<D<A) proper scoring rule and the "
+        "standard headline for 1X2 football. Lower is better; uniform ≈ 0.198.",
     )
     cols[3].metric(
+        "Brier score",
+        f"{scorecard['brier_score']:.3f}",
+        help="Summed squared error over H/D/A — lower is better (0 best, 2 worst).",
+    )
+    cols[4].metric(
         "Log loss",
         f"{scorecard['log_loss']:.3f}",
         help="Mean negative log-probability of the realized outcome — lower is better.",
+    )
+    st.caption(
+        "**Skill vs. a uniform (1/3,1/3,1/3) guess** — positive means the model carries "
+        f"information: RPS **{scorecard['rps_skill']:+.1%}**, "
+        f"log-loss **{scorecard['log_loss_skill']:+.1%}**, "
+        f"Brier **{scorecard['brier_skill']:+.1%}**."
     )
 
 
@@ -97,6 +115,91 @@ def _render_breakdowns(st: object, finished: pl.DataFrame) -> None:
             charts.calibration_curve(data.calibration_bins(finished)),
             use_container_width=True,
         )
+        cal = data.calibration_summary(finished)
+        slope = "—" if cal["slope"] != cal["slope"] else f"{cal['slope']:.2f}"  # nan check
+        intercept = "—" if cal["intercept"] != cal["intercept"] else f"{cal['intercept']:+.2f}"
+        st.caption(
+            f"**ECE {cal['ece']:.3f}** · MCE {cal['mce']:.3f} · calibration slope "
+            f"**{slope}** (1 = perfect; <1 overconfident, >1 underconfident), "
+            f"intercept {intercept}."
+        )
+
+
+def _render_significance(st: object, finished: pl.DataFrame) -> None:
+    """Paired test that the model's per-match RPS genuinely beats a uniform forecast."""
+
+    st.subheader("Is the edge real? (RPS vs. uniform)")
+    sig = data.rps_significance(finished)
+    cols = st.columns(3)
+    cols[0].metric(
+        "Mean per-match RPS gap",
+        f"{sig['mean_diff']:+.4f}",
+        help="Model minus uniform per-match RPS. Negative = the model is sharper.",
+    )
+    cols[1].metric(
+        "95% bootstrap CI",
+        f"[{sig['ci_low']:+.4f}, {sig['ci_high']:+.4f}]",
+        help="Paired bootstrap over matches. Entirely below 0 ⇒ significant at 95%.",
+    )
+    cols[2].metric("Wilcoxon p", f"{sig['wilcoxon_p']:.3f}")
+    beats = sig["ci_high"] < 0
+    st.caption(
+        "✅ The model's probabilities significantly beat a uniform guess on these "
+        "fixtures (bootstrap CI below 0)." if beats else
+        "⚠️ Not yet significant vs. a uniform guess at this sample size — expected with "
+        "few matches; scoring rules need more fixtures to separate."
+    )
+
+
+def _render_competitive_subset(st: object, finished: pl.DataFrame) -> None:
+    """Re-report the headline scoring rules on close games (favourite prob 40–60%)."""
+
+    st.subheader("Competitive subset (favourite 40–60%)")
+    st.caption(
+        "The number that actually reveals skill: restrict to close games where the "
+        "favourite's probability is 40–60%. If the edge survives here, it isn't just "
+        "calling blowouts."
+    )
+    subset = data.competitive_subset(finished)
+    if subset.is_empty():
+        st.info("No finished matches fall in the 40–60% favourite band yet.")
+        return
+    card = data.prediction_scorecard(subset)
+    cols = st.columns(4)
+    cols[0].metric("Close games", int(card["n"]))
+    cols[1].metric("Accuracy", f"{card['accuracy']:.1%}")
+    cols[2].metric("RPS", f"{card['rps']:.3f}")
+    cols[3].metric("RPS skill vs uniform", f"{card['rps_skill']:+.1%}")
+
+
+def _render_market(st: object, finished: pl.DataFrame, settings: Settings) -> None:
+    """Head-to-head vs. the bookmaker favorite (accuracy + McNemar); market-prob stub."""
+
+    st.subheader("Vs. the bookmaker (shortest-odds favorite)")
+    cmp = data.bookmaker_comparison(finished, settings)
+    if not cmp.get("available"):
+        st.info(f"Bookmaker comparison unavailable: {cmp.get('reason', 'no data')}")
+    else:
+        cols = st.columns(4)
+        cols[0].metric("Matches compared", int(cmp["n_overlap"]))
+        cols[1].metric("Model accuracy", f"{cmp['model_accuracy']:.1%}")
+        cols[2].metric("Bookmaker accuracy", f"{cmp['book_accuracy']:.1%}")
+        cols[3].metric(
+            "McNemar p",
+            f"{cmp['mcnemar_p']:.3f}",
+            help="Paired test on the fixtures where model and bookmaker disagree. "
+            f"Model-right/book-wrong={int(cmp['mcnemar_b'])}, "
+            f"book-right/model-wrong={int(cmp['mcnemar_c'])}.",
+        )
+        if cmp.get("n_unmatched"):
+            st.caption(
+                f"{int(cmp['n_unmatched'])} model fixture(s) had no workbook match and "
+                "were excluded from the head-to-head."
+            )
+    st.warning(
+        "**Probability-level market metrics (market RPS skill, ROI, CLV) are not shown.** "
+        + str(cmp.get("market_prob_reason", ""))
+    )
 
 
 def _render_xg_analysis(

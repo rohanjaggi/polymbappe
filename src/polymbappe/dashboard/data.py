@@ -24,9 +24,13 @@ import math
 from datetime import UTC
 from pathlib import Path
 
+import numpy as np
 import polars as pl
 
 from polymbappe.config import Settings
+from polymbappe.eval import bookmaker as bookmaker_eval
+from polymbappe.eval import metrics as metrics_eval
+from polymbappe.eval import significance as significance_eval
 
 #: Schemas for each output artifact (spec section 11). Used to construct correctly
 #: typed empty frames when an artifact has not been produced yet, and to document
@@ -80,6 +84,32 @@ KO_SCHEMA: dict[str, pl.DataType] = {
     "exp_home_goals": pl.Float64,
     "exp_away_goals": pl.Float64,
 }
+
+#: Per-round knockout-bracket artifact (``knockout_bracket.parquet``). Mirrors
+#: :data:`polymbappe.simulate.knockout_bracket.BRACKET_SCHEMA`; anchored to the real draw, one
+#: row per possible matchup at each fixture (``rank`` 1 = most-probable slot occupant),
+#: ``match_number`` orders the bracket and ``p_decided_*`` is the FT/ET/pens split.
+KO_BRACKET_SCHEMA: dict[str, pl.DataType] = {
+    "round": pl.Utf8,
+    "match_number": pl.Int32,
+    "rank": pl.Int32,
+    "team_a": pl.Utf8,
+    "team_b": pl.Utf8,
+    "matchup_prob": pl.Float64,
+    "p_a_advance": pl.Float64,
+    "p_b_advance": pl.Float64,
+    "p_decided_reg": pl.Float64,
+    "p_decided_et": pl.Float64,
+    "p_decided_pens": pl.Float64,
+    "model_a": pl.Float64,
+    "model_draw": pl.Float64,
+    "model_b": pl.Float64,
+    "exp_a_goals": pl.Float64,
+    "exp_b_goals": pl.Float64,
+}
+
+#: Knockout matchup rounds, broadest to narrowest (mirrors simulate.tournament.KNOCKOUT_ROUNDS).
+KNOCKOUT_ROUND_ORDER: tuple[str, ...] = ("R32", "R16", "QF", "SF", "FINAL")
 
 CHANGELOG_SCHEMA: dict[str, pl.DataType] = {
     "timestamp": pl.Utf8,
@@ -193,6 +223,68 @@ def load_knockout_predictions(settings: Settings) -> pl.DataFrame:
     """
 
     return _read_or_empty(_output_path(settings, "knockout_predictions.parquet"), KO_SCHEMA)
+
+
+def load_knockout_bracket(settings: Settings) -> pl.DataFrame:
+    """Load the per-round knockout bracket (``knockout_bracket.parquet``).
+
+    Columns: ``round, rank, team_a, team_b, matchup_prob, p_a_advance, p_b_advance,
+    p_decided_reg, p_decided_et, p_decided_pens, model_a, model_draw, model_b,
+    exp_a_goals, exp_b_goals`` (spec 4.3). Drives the Knockout Bracket page.
+    """
+
+    return _read_or_empty(_output_path(settings, "knockout_bracket.parquet"), KO_BRACKET_SCHEMA)
+
+
+def bracket_round(bracket_df: pl.DataFrame, round_name: str) -> pl.DataFrame:
+    """Rows of one knockout round in bracket order (``match_number`` then ``rank``).
+
+    Returns an empty (schema-preserving) frame when the bracket is empty or the round is
+    absent. Powers both the bracket tree and the per-round drill-down tables.
+    """
+
+    if bracket_df.is_empty() or "round" not in bracket_df.columns:
+        return bracket_df
+    return bracket_df.filter(pl.col("round") == round_name).sort(["match_number", "rank"])
+
+
+def bracket_slots(bracket_df: pl.DataFrame, round_name: str) -> pl.DataFrame:
+    """The single most-probable matchup (``rank`` 1) per fixture of a round, in bracket order.
+
+    This is the "expected bracket" view — one row per real fixture/slot. For an already-decided
+    tie the rank-1 row *is* the concrete matchup; for a future slot it is the likeliest occupants.
+    """
+
+    view = bracket_round(bracket_df, round_name)
+    if view.is_empty():
+        return view
+    return view.filter(pl.col("rank") == 1).sort("match_number")
+
+
+def bracket_slot_candidates(bracket_df: pl.DataFrame, match_number: int) -> pl.DataFrame:
+    """Every possible matchup at one fixture, most-probable first (the "all possible games" view).
+
+    A future slot fans out into the matchups its two feeder subtrees can produce; each row carries
+    the probability that exact matchup occurs plus the model's advance / FT-ET-pens breakdown.
+    """
+
+    if bracket_df.is_empty() or "match_number" not in bracket_df.columns:
+        return bracket_df
+    return bracket_df.filter(pl.col("match_number") == match_number).sort("rank")
+
+
+def knockout_results(results_df: pl.DataFrame, *, year: int = 2026) -> pl.DataFrame:
+    """Played WC knockout fixtures (real R32/R16/… results), newest pairing kept.
+
+    Narrows the recorded-results frame to this tournament's knockout games (``is_knockout``
+    true, ``date`` year ``>= year``) so the bracket can show actual scorelines and who
+    advanced alongside the forecasts. Returns a typed empty frame when none are recorded.
+    """
+
+    if results_df.is_empty() or "is_knockout" not in results_df.columns:
+        return pl.DataFrame(schema=RESULTS_SCHEMA)
+    df = tournament_results(results_df, year=year)
+    return df.filter(pl.col("is_knockout") == True)  # noqa: E712 - polars boolean mask
 
 
 def load_match_xg(settings: Settings) -> pl.DataFrame:
@@ -512,7 +604,10 @@ def prediction_scorecard(finished: pl.DataFrame) -> dict[str, float]:
     """
 
     if finished.is_empty():
-        return {"n": 0.0, "accuracy": 0.0, "brier_score": 0.0, "log_loss": 0.0}
+        return {
+            "n": 0.0, "accuracy": 0.0, "brier_score": 0.0, "log_loss": 0.0,
+            "rps": 0.0, "rps_skill": 0.0, "log_loss_skill": 0.0, "brier_skill": 0.0,
+        }
 
     n = finished.height
     eps = 1e-12
@@ -530,11 +625,203 @@ def prediction_scorecard(finished: pl.DataFrame) -> dict[str, float]:
             brier_total += (p - target) ** 2
         log_total += -math.log(max(probs[actual], eps))
 
+    # RPS (ordinal H-D-A) and skill scores vs. a uniform (1/3,1/3,1/3) forecast scored
+    # on the same outcomes — the honest "does the model carry information?" benchmark.
+    y_true_idx, y_prob = _hda_arrays(finished)
+    rps = metrics_eval.ranked_probability_score(y_true_idx, y_prob)
+    brier = brier_total / n
+    log_loss = log_total / n
+    ref = metrics_eval.uniform_reference_scores(y_true_idx, n_classes=3)
     return {
         "n": float(n),
         "accuracy": float(finished["model_correct"].sum()) / n,
-        "brier_score": brier_total / n,
-        "log_loss": log_total / n,
+        "brier_score": brier,
+        "log_loss": log_loss,
+        "rps": rps,
+        "rps_skill": metrics_eval.skill_score(rps, ref["rps"]),
+        "log_loss_skill": metrics_eval.skill_score(log_loss, ref["log_loss"]),
+        "brier_skill": metrics_eval.skill_score(brier, ref["brier"]),
+    }
+
+
+#: Ordinal class order for the H/D/A probability vector (home < draw < away). RPS relies
+#: on this ordering, so keep it fixed across every consumer.
+_HDA_OUTCOMES = ("home", "draw", "away")
+
+
+def _hda_arrays(finished: pl.DataFrame) -> tuple[np.ndarray, np.ndarray]:
+    """Build ``(y_true_idx, y_prob)`` arrays from a finished frame in H-D-A order.
+
+    ``y_prob`` has one row per match with columns ``[home, draw, away]``; ``y_true_idx``
+    is the realized outcome's column index. Shared by every probability-scoring metric so
+    they agree on class order.
+    """
+
+    y_prob = finished.select(
+        [pl.col(f"model_{o}").cast(pl.Float64) for o in _HDA_OUTCOMES]
+    ).to_numpy()
+    idx_map = {o: i for i, o in enumerate(_HDA_OUTCOMES)}
+    y_true_idx = np.array(
+        [idx_map[str(o)] for o in finished["actual_outcome"].to_list()], dtype=int
+    )
+    return y_true_idx, y_prob
+
+
+def calibration_summary(finished: pl.DataFrame, *, n_bins: int = 10) -> dict[str, float]:
+    """Single-number calibration diagnostics complementing the reliability diagram.
+
+    Returns ``ece``/``mce`` (top-pick confidence vs. hit rate) and the logistic
+    ``slope``/``intercept`` fit over the pooled per-class (probability, outcome) pairs.
+    Well-calibrated ⇒ ECE≈0, slope≈1, intercept≈0. Returns zeroed/``nan`` fields for an
+    empty frame.
+    """
+
+    if finished.is_empty():
+        return {"n": 0.0, "ece": 0.0, "mce": 0.0,
+                "slope": float("nan"), "intercept": float("nan")}
+
+    y_true_idx, y_prob = _hda_arrays(finished)
+    confidence = y_prob.max(axis=1)
+    correct = finished["model_correct"].cast(pl.Int64).to_numpy()
+    cal = metrics_eval.expected_calibration_error(confidence, correct, n_bins=n_bins)
+
+    # Pool all H/D/A (predicted prob, realized 0/1) pairs for the slope/intercept fit.
+    one_hot = np.zeros_like(y_prob)
+    one_hot[np.arange(len(y_true_idx)), y_true_idx] = 1.0
+    fit = metrics_eval.calibration_slope_intercept(y_prob.ravel(), one_hot.ravel())
+    return {"n": float(finished.height), "ece": cal["ece"], "mce": cal["mce"],
+            "slope": fit["slope"], "intercept": fit["intercept"]}
+
+
+def competitive_subset(
+    finished: pl.DataFrame, *, low: float = 0.40, high: float = 0.60
+) -> pl.DataFrame:
+    """Restrict finished fixtures to close games (favourite probability in ``[low, high]``).
+
+    The favourite probability is the max of H/D/A. This is the subset that actually
+    reveals skill: if a model's edge survives only on blowouts, it is just naming
+    favourites like everyone else. Returns the filtered frame (same schema).
+    """
+
+    if finished.is_empty():
+        return finished
+    return finished.with_columns(
+        pl.max_horizontal("model_home", "model_draw", "model_away").alias("_fav")
+    ).filter((pl.col("_fav") >= low) & (pl.col("_fav") <= high)).drop("_fav")
+
+
+def rps_significance(finished: pl.DataFrame) -> dict[str, float]:
+    """Paired significance of the model's per-match RPS vs. a uniform forecast.
+
+    Establishes that the model's probability edge over guessing is not sampling noise:
+    runs a paired bootstrap CI and a Wilcoxon signed-rank test on the per-match RPS
+    difference (model − uniform). A negative mean difference with a CI below 0 means the
+    model is genuinely sharper. Returns zeroed fields for an empty frame.
+    """
+
+    if finished.is_empty():
+        return {"n": 0.0, "mean_diff": 0.0, "ci_low": 0.0, "ci_high": 0.0,
+                "bootstrap_p": float("nan"), "wilcoxon_p": float("nan")}
+
+    y_true_idx, y_prob = _hda_arrays(finished)
+    model_rps = metrics_eval.per_match_rps(y_true_idx, y_prob)
+    uniform = np.full_like(y_prob, 1.0 / y_prob.shape[1])
+    uniform_rps = metrics_eval.per_match_rps(y_true_idx, uniform)
+
+    boot = significance_eval.paired_bootstrap_loss_diff(model_rps, uniform_rps)
+    wil = significance_eval.wilcoxon_loss_diff(model_rps, uniform_rps)
+    return {"n": float(finished.height), "mean_diff": boot["mean_diff"],
+            "ci_low": boot["ci_low"], "ci_high": boot["ci_high"],
+            "bootstrap_p": boot["p_two_sided"], "wilcoxon_p": wil["p_value"]}
+
+
+def _pair_key_expr() -> pl.Expr:
+    """Order-independent fixture key from normalized ``home_team``/``away_team``."""
+
+    from polymbappe.data.aliases import normalize_team_expr
+
+    return (
+        pl.concat_list(
+            normalize_team_expr("home_team"), normalize_team_expr("away_team")
+        )
+        .list.sort()
+        .list.join(" | ")
+        .alias("pair_key")
+    )
+
+
+def bookmaker_comparison(
+    finished: pl.DataFrame, settings: Settings, *, path: Path | None = None
+) -> dict[str, object]:
+    """Head-to-head vs. the bookmaker "shortest-odds favorite" tracker (accuracy only).
+
+    Joins the model's finished fixtures to the external accuracy workbook by an
+    order-independent team-pair key, then compares **top-pick accuracy** on the overlapping
+    matches and runs **McNemar's test** on the disagreements. Probability-scoring metrics
+    (market RPS skill, ROI, CLV) are intentionally left as ``None``: the workbook publishes
+    the favorite pick plus at most one moneyline leg, not the full H/D/A closing price, so
+    the market cannot be honestly scored on proper scoring rules (see
+    :mod:`polymbappe.eval.bookmaker`).
+
+    ``available`` is ``False`` (with a ``reason``) when the workbook is missing or nothing
+    joins, so the page can render a "not available" state instead of misleading numbers.
+    """
+
+    market_stub = {
+        "market_rps_skill": None,
+        "roi_vs_closing": None,
+        "clv": None,
+        "market_prob_reason": (
+            "Needs full per-match home/draw/away closing odds. The current workbook "
+            "carries only the favorite pick (and one moneyline leg on 30/72 matches), "
+            "which cannot be de-vigged into a 1X2 probability vector."
+        ),
+    }
+
+    workbook = path or bookmaker_eval.default_workbook_path(settings.data_dir)
+    if workbook is None or not Path(workbook).exists():
+        return {"available": False, "reason": "No bookmaker accuracy workbook found.",
+                **market_stub}
+    if finished.is_empty():
+        return {"available": False, "reason": "No finished matches to compare.",
+                **market_stub}
+
+    book = bookmaker_eval.load_bookmaker_accuracy(Path(workbook))
+    if book.is_empty():
+        return {"available": False, "reason": "Bookmaker workbook has no gradable rows.",
+                **market_stub}
+
+    model = finished.with_columns(_pair_key_expr())
+    book_slim = book.select(["pair_key", "book_correct"]).unique(
+        subset="pair_key", keep="first"
+    )
+    joined = model.join(book_slim, on="pair_key", how="inner")
+
+    n_model = finished.height
+    n_book = book.height
+    n_overlap = joined.height
+    if n_overlap == 0:
+        return {"available": False,
+                "reason": (f"No fixtures matched between the model ({n_model}) and the "
+                           f"workbook ({n_book}) — check team-name alignment."),
+                "n_model": float(n_model), "n_book": float(n_book), **market_stub}
+
+    model_correct = joined["model_correct"].cast(pl.Boolean).to_numpy()
+    book_correct = joined["book_correct"].cast(pl.Boolean).to_numpy()
+    mcnemar = significance_eval.mcnemar_test(model_correct, book_correct)
+
+    return {
+        "available": True,
+        "n_model": float(n_model),
+        "n_book": float(n_book),
+        "n_overlap": float(n_overlap),
+        "n_unmatched": float(n_model - n_overlap),
+        "model_accuracy": float(model_correct.mean()),
+        "book_accuracy": float(book_correct.mean()),
+        "mcnemar_b": mcnemar["b"],
+        "mcnemar_c": mcnemar["c"],
+        "mcnemar_p": mcnemar["p_value"],
+        **market_stub,
     }
 
 
