@@ -1,7 +1,7 @@
-"""Page 2 — Team Deep Dive (spec section 6.1).
+"""Page 4 — Team Deep Dive.
 
-Team selector, stage-reaching probability waterfall, and group-finish breakdown for
-a single team. ``streamlit`` is imported lazily.
+Team selector, stage-reaching probability waterfall, group-stage fixture
+retrospective, and knockout journey.
 """
 
 from __future__ import annotations
@@ -14,14 +14,13 @@ from polymbappe.dashboard.components import charts
 
 
 def render(settings: Settings) -> None:
-    """Render the Team Deep Dive page (spec 6.1, page 2)."""
+    """Render the Team Deep Dive page."""
 
     import streamlit as st
 
     st.header("Team Deep Dive")
 
     stage_df = data.load_stage_probabilities(settings)
-    group_df = data.load_group_probabilities(settings)
 
     teams = data.available_teams(stage_df)
     if not teams:
@@ -40,39 +39,27 @@ def render(settings: Settings) -> None:
         use_container_width=True,
     )
 
-    if not group_df.is_empty() and "team" in group_df.columns:
-        st.subheader("Group-finish probabilities")
-        team_group = group_df.filter(group_df["team"] == team)
-        if team_group.is_empty():
-            st.caption("No group-finish data for this team.")
-        else:
-            st.dataframe(team_group.to_pandas(), use_container_width=True)
-
     _render_group_predictions(st, settings, team)
+    st.divider()
+    _render_knockout_journey(st, settings, team)
 
 
 def _render_group_predictions(st: object, settings: Settings, team: str) -> None:
-    """Group-stage fixture predictions for ``team``, oriented to its perspective.
+    """Group-stage fixture predictions for the selected team."""
 
-    Reuses the Match Predictor data path (:func:`data.load_match_predictions` +
-    :func:`data.split_fixtures`) so the H/D/A probabilities and the played/upcoming
-    split stay consistent across pages. Each of the team's three group fixtures is
-    re-pivoted so probabilities read as ``P(team win) / P(draw) / P(opponent win)``,
-    and a projected-points metric blends actual points for played matches with
-    expected points (3·P(win) + P(draw)) for upcoming ones.
-    """
-
-    st.subheader("Group-stage fixture predictions")
+    st.subheader("Group-stage results")
 
     match_df = data.load_match_predictions(settings)
     if match_df.is_empty():
-        st.caption(
-            "No match predictions yet. Run `polymbappe simulate`/`report` to populate them."
-        )
+        st.caption("No match predictions yet.")
         return
 
     results = data.tournament_results(data.load_recorded_results(settings))
     upcoming, finished = data.split_fixtures(match_df, results)
+    if "group" in upcoming.columns:
+        upcoming = upcoming.filter(pl.col("group") != "KO")
+    if "group" in finished.columns:
+        finished = finished.filter(pl.col("group") != "KO")
     team_upcoming = _team_fixtures(upcoming, team)
     team_finished = _team_fixtures(finished, team)
 
@@ -92,25 +79,78 @@ def _render_group_predictions(st: object, settings: Settings, team: str) -> None
         rows.append(_prediction_row(record, team, status="Upcoming"))
 
     st.caption(
-        f"H/D/A probabilities for every scheduled group-stage fixture, oriented to {team}. "
-        "Played matches show the recorded result; projected points blend actual points "
-        "(played) with expected points 3·P(win)+P(draw) (upcoming)."
+        f"H/D/A probabilities oriented to {team}. "
+        "Projected points blend actual (played) with expected 3·P(win)+P(draw) (upcoming)."
     )
     st.metric(f"{team} projected group points", f"{projected_points:.1f}")
     st.dataframe(pl.DataFrame(rows).to_pandas(), use_container_width=True, hide_index=True)
 
 
-def _team_fixtures(fixtures: pl.DataFrame, team: str) -> pl.DataFrame:
-    """Fixtures in which ``team`` plays (home or away)."""
+def _render_knockout_journey(st: object, settings: Settings, team: str) -> None:
+    """Show the team's knockout path: R32 result, R16 status, future outlook."""
 
+    match_df = data.load_match_predictions(settings)
+    if match_df.is_empty():
+        return
+
+    results = data.tournament_results(data.load_recorded_results(settings))
+    ko = data.classify_ko_fixtures(match_df, results)
+    if ko.is_empty() or "stage" not in ko.columns:
+        return
+
+    team_ko = ko.filter(
+        (pl.col("home_team") == team) | (pl.col("away_team") == team)
+    )
+    if team_ko.is_empty():
+        st.caption(f"{team} did not qualify for the knockout stage.")
+        return
+
+    st.subheader("Knockout Journey")
+
+    for r in team_ko.sort("date").iter_rows(named=True):
+        stage = str(r.get("stage", "KO"))
+        h, a = str(r["home_team"]), str(r["away_team"])
+        opp = a if h == team else h
+        hg, ag = r.get("home_goals"), r.get("away_goals")
+
+        if hg is not None and ag is not None:
+            hg, ag = int(hg), int(ag)
+            at_home = h == team
+            team_goals = hg if at_home else ag
+            opp_goals = ag if at_home else hg
+            if team_goals > opp_goals:
+                result_str = f"Won {team_goals}–{opp_goals}"
+            elif team_goals < opp_goals:
+                result_str = f"Lost {team_goals}–{opp_goals}"
+            else:
+                result_str = f"Drew {team_goals}–{opp_goals}"
+            st.markdown(f"**{stage}**: {team} vs {opp} — {result_str}")
+        else:
+            st.markdown(f"**{stage}**: {team} vs {opp} — Upcoming")
+
+    # Future outlook from stage probabilities
+    stage_df = data.load_stage_probabilities(settings)
+    if not stage_df.is_empty():
+        team_row = stage_df.filter(pl.col("team") == team)
+        if not team_row.is_empty():
+            r = team_row.row(0, named=True)
+            future_stages = []
+            for col, label in [("QF", "Quarter-Final"), ("SF", "Semi-Final"),
+                                ("FINAL", "Final"), ("champion", "Champion")]:
+                prob = float(r.get(col, 0))
+                if prob > 0:
+                    future_stages.append(f"{label}: {prob:.0%}")
+            if future_stages:
+                st.caption("Advancement odds: " + " · ".join(future_stages))
+
+
+def _team_fixtures(fixtures: pl.DataFrame, team: str) -> pl.DataFrame:
     if fixtures.is_empty():
         return fixtures
     return fixtures.filter((pl.col("home_team") == team) | (pl.col("away_team") == team))
 
 
 def _team_perspective(record: dict[str, object], team: str) -> tuple[float, float, float]:
-    """Return ``(P(team win), P(draw), P(opponent win))`` for one fixture."""
-
     at_home = record["home_team"] == team
     p_team = float(record["model_home"] if at_home else record["model_away"])
     p_opp = float(record["model_away"] if at_home else record["model_home"])
@@ -118,8 +158,6 @@ def _team_perspective(record: dict[str, object], team: str) -> tuple[float, floa
 
 
 def _favoured_team(record: dict[str, object]) -> str:
-    """Name of the team the model favours (or ``"Draw"``) for one fixture."""
-
     pick = str(record["model_pick"])
     if pick == "draw":
         return "Draw"
@@ -129,8 +167,6 @@ def _favoured_team(record: dict[str, object]) -> str:
 def _result_for_team(
     record: dict[str, object], team: str
 ) -> tuple[str, int, str]:
-    """``(verdict, points, score)`` for a finished fixture, from ``team``'s view."""
-
     at_home = record["home_team"] == team
     team_goals = int(record["home_goals"] if at_home else record["away_goals"])
     opp_goals = int(record["away_goals"] if at_home else record["home_goals"])
@@ -149,8 +185,6 @@ def _prediction_row(
     result: str = "—",
     score: str = "—",
 ) -> dict[str, object]:
-    """One team-perspective display row for the group-stage predictions table."""
-
     at_home = record["home_team"] == team
     opponent = str(record["away_team"] if at_home else record["home_team"])
     p_team, p_draw, p_opp = _team_perspective(record, team)

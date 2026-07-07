@@ -1,12 +1,7 @@
-"""Page 7 — Predictions vs Actuals (spec section 6.1).
+"""Page 3 — Predictions vs Actuals.
 
-Scores the model's pre-match H/D/A forecasts against recorded tournament results. Where
-the Match Predictor page (page 3) lists fixtures and per-fixture probabilities, this page
-is the *evaluation* view: headline accuracy / Brier / log-loss, a calibration reliability
-diagram, accuracy broken down by realized outcome, and a per-match scorecard. It reuses
-:func:`polymbappe.dashboard.data.split_fixtures` to join predictions to results, so it
-stays in sync with how finished matches are determined elsewhere. ``streamlit`` is
-imported lazily.
+Scores the model's pre-match H/D/A forecasts against recorded tournament results
+with a stage filter (All / Group Stage / Knockout).
 """
 
 from __future__ import annotations
@@ -22,7 +17,7 @@ _OUTCOME_LABEL = {"home": "Home win", "draw": "Draw", "away": "Away win"}
 
 
 def render(settings: Settings) -> None:
-    """Render the Predictions vs Actuals page (spec 6.1, page 7)."""
+    """Render the Predictions vs Actuals page."""
 
     import streamlit as st
 
@@ -30,27 +25,27 @@ def render(settings: Settings) -> None:
 
     match_df = data.load_match_predictions(settings)
     if match_df.is_empty():
-        st.info(
-            "No match predictions yet. Run `polymbappe simulate`/`report` to populate the "
-            "dashboard."
-        )
+        st.info("No match predictions yet. Run `polymbappe simulate`/`report` to populate.")
         return
 
     results = data.tournament_results(data.load_recorded_results(settings))
     _, finished = data.split_fixtures(match_df, results)
     match_xg = data.load_match_xg(settings)
 
-    st.caption(
-        "How the model's pre-match H/D/A probabilities held up against recorded tournament "
-        "results. Only finished fixtures are scored; predictions come from the calibration "
-        "pipeline (spec 3.6) and results from `polymbappe ingest`."
+    if finished.is_empty():
+        st.info("No finished matches recorded yet.")
+        return
+
+    stage_filter = st.radio(
+        "Stage", ["All", "Group Stage", "Knockout"], horizontal=True
     )
+    if stage_filter == "Group Stage":
+        finished = finished.filter(pl.col("group") != "KO") if "group" in finished.columns else finished
+    elif stage_filter == "Knockout":
+        finished = finished.filter(pl.col("group") == "KO") if "group" in finished.columns else pl.DataFrame()
 
     if finished.is_empty():
-        st.info(
-            "No finished matches recorded yet. Ingest results (`polymbappe ingest`) as the "
-            "tournament progresses."
-        )
+        st.info(f"No finished {stage_filter.lower()} matches yet.")
         return
 
     _render_scorecard(st, finished)
@@ -104,7 +99,7 @@ def _render_xg_analysis(
 ) -> None:
     """xG error analysis: model vs goals, model vs actual xG, and finishing luck."""
 
-    st.subheader("xG prediction error")
+    st.subheader("Expected Goals (xG) Analysis")
 
     needed = {"exp_home_goals", "exp_away_goals", "home_goals", "away_goals"}
     if not needed.issubset(finished.columns):
@@ -114,27 +109,60 @@ def _render_xg_analysis(
     has_actual_xg = not match_xg.is_empty()
     summary = data.xg_error_summary(finished, match_xg if has_actual_xg else None)
 
+    # High-level overview metrics
+    total_pred = float((finished["exp_home_goals"] + finished["exp_away_goals"]).sum())
+    total_actual = float((finished["home_goals"] + finished["away_goals"]).sum())
+    avg_pred = float((finished["exp_home_goals"] + finished["exp_away_goals"]).mean())
+    avg_actual = float((finished["home_goals"] + finished["away_goals"]).mean())
+
+    xg_winner_correct = 0
+    for r in finished.iter_rows(named=True):
+        ph, pa = float(r["exp_home_goals"]), float(r["exp_away_goals"])
+        ah, aa = int(r["home_goals"]), int(r["away_goals"])
+        pred_w = "home" if ph > pa else ("away" if pa > ph else "draw")
+        act_w = "home" if ah > aa else ("away" if aa > ah else "draw")
+        if pred_w == act_w:
+            xg_winner_correct += 1
+
+    row1 = st.columns(4)
+    row1[0].metric(
+        "Total predicted goals", f"{total_pred:.0f}",
+        delta=f"{total_pred - total_actual:+.0f} vs actual {total_actual:.0f}",
+        delta_color="off",
+    )
+    row1[1].metric("Avg goals/match (predicted)", f"{avg_pred:.2f}")
+    row1[2].metric("Avg goals/match (actual)", f"{avg_actual:.2f}")
+    row1[3].metric(
+        "xG winner accuracy",
+        f"{xg_winner_correct}/{finished.height} ({xg_winner_correct / finished.height:.0%})",
+        help="How often the team with higher predicted xG actually won.",
+    )
+
+    st.divider()
+
+    # Error decomposition
     if has_actual_xg and "xg_n" in summary:
         st.caption(
-            f"Actual xG from FBref available for {int(summary['xg_n'])} matches. "
-            "Error is decomposed into model quality (vs actual xG) and finishing luck "
-            "(actual xG vs goals)."
+            f"FBref actual xG available for {int(summary['xg_n'])} matches. "
+            "The model's goal prediction error breaks down into two parts: "
+            "how well it predicted the chances created (model error), and "
+            "how much finishing variance affected the outcome (luck)."
         )
-        cols = st.columns(3)
-        cols[0].metric(
-            "Model vs actual xG (MAE)",
+        row2 = st.columns(3)
+        row2[0].metric(
+            "Model error (MAE)",
             f"{summary['model_vs_xg_mae']:.2f}",
-            help="Mean |model predicted xG − FBref actual xG|. Pure model quality.",
+            help="Avg difference between our predicted xG and FBref's actual xG. Measures pure model quality.",
         )
-        cols[1].metric(
+        row2[1].metric(
             "Finishing luck (MAE)",
             f"{summary['xg_vs_goals_mae']:.2f}",
-            help="Mean |FBref actual xG − actual goals|. Variance from conversion luck.",
+            help="Avg difference between actual xG and goals scored. Variance outside model control.",
         )
-        cols[2].metric(
-            "Model vs goals (MAE)",
+        row2[2].metric(
+            "Total error (MAE)",
             f"{summary['total_mae']:.2f}",
-            help="Combined: model quality + finishing luck.",
+            help="Avg difference between predicted xG and actual goals. Combines model error + luck.",
         )
     else:
         if not has_actual_xg:
@@ -142,12 +170,12 @@ def _render_xg_analysis(
                 "Run `polymbappe ingest --live` to pull FBref actual xG and decompose "
                 "model error from finishing-luck variance."
             )
-        cols = st.columns(3)
-        cols[0].metric("Home xG MAE", f"{summary['home_mae']:.2f}",
+        row2 = st.columns(3)
+        row2[0].metric("Home xG MAE", f"{summary['home_mae']:.2f}",
                        help="Mean |predicted home xG − actual home goals|.")
-        cols[1].metric("Away xG MAE", f"{summary['away_mae']:.2f}",
+        row2[1].metric("Away xG MAE", f"{summary['away_mae']:.2f}",
                        help="Mean |predicted away xG − actual away goals|.")
-        cols[2].metric("Overall xG MAE", f"{summary['total_mae']:.2f}")
+        row2[2].metric("Total xG MAE", f"{summary['total_mae']:.2f}")
 
     st.plotly_chart(
         charts.xg_scatter(finished, match_xg if has_actual_xg else None),
@@ -159,7 +187,7 @@ def _render_xg_analysis(
 
 
 def _xg_table(finished: pl.DataFrame, match_xg: pl.DataFrame) -> object:
-    """Per-match xG table; adds FBref actual xG columns when available."""
+    """Per-match xG table with combined H-A columns for readability."""
 
     has_xg = not match_xg.is_empty()
     if has_xg:
@@ -181,24 +209,21 @@ def _xg_table(finished: pl.DataFrame, match_xg: pl.DataFrame) -> object:
     for r in joined.iter_rows(named=True):
         ph = float(r["exp_home_goals"])
         pa = float(r["exp_away_goals"])
-        ah = float(r["home_goals"])
-        aa = float(r["away_goals"])
+        ah = int(r["home_goals"])
+        aa = int(r["away_goals"])
+        total_err = abs(ph - ah) + abs(pa - aa)
         row: dict[str, object] = {
             "Fixture": f"{r['home_team']} vs {r['away_team']}",
-            "Model xG (H)": f"{ph:.2f}",
-            "Model xG (A)": f"{pa:.2f}",
+            "Predicted xG": f"{ph:.2f} - {pa:.2f}",
+            "Score": f"{ah} - {aa}",
         }
         if has_xg and r.get("home_xg") is not None:
             fh = float(r["home_xg"])
             fa = float(r["away_xg"])
-            row["FBref xG (H)"] = f"{fh:.2f}"
-            row["FBref xG (A)"] = f"{fa:.2f}"
-            row["Model err (H)"] = f"{abs(ph - fh):.2f}"
-            row["Model err (A)"] = f"{abs(pa - fa):.2f}"
-            row["Luck (H)"] = f"{abs(fh - ah):.2f}"
-            row["Luck (A)"] = f"{abs(fa - aa):.2f}"
-        row["Actual (H)"] = int(ah)
-        row["Actual (A)"] = int(aa)
+            row["Actual xG"] = f"{fh:.2f} - {fa:.2f}"
+            row["Model err"] = f"{abs(ph - fh) + abs(pa - fa):.2f}"
+            row["Luck"] = f"{abs(fh - ah) + abs(fa - aa):.2f}"
+        row["Total err"] = f"{total_err:.2f}"
         rows.append(row)
     return pl.DataFrame(rows).to_pandas()
 

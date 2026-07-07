@@ -767,3 +767,566 @@ def data_freshness(settings: Settings) -> dict[str, str]:
         else:
             freshness[name] = "missing"
     return freshness
+
+
+# -- new loaders ---------------------------------------------------------------
+
+SCHEDULE_SCHEMA: dict[str, pl.DataType] = {
+    "match_id": pl.Utf8,
+    "date": pl.Date,
+    "stage": pl.Utf8,
+    "group": pl.Utf8,
+    "home_team": pl.Utf8,
+    "away_team": pl.Utf8,
+    "city": pl.Utf8,
+}
+
+AUTOTUNE_SCHEMA: dict[str, pl.DataType] = {
+    "experiment_id": pl.Utf8,
+    "phase": pl.Utf8,
+    "decision": pl.Utf8,
+    "mean_rps": pl.Float64,
+    "config": pl.Utf8,
+    "per_tournament": pl.Utf8,
+    "hypothesis": pl.Utf8,
+}
+
+
+def load_schedule(settings: Settings) -> pl.DataFrame:
+    """Load the tournament match schedule (``schedule.parquet``)."""
+
+    from polymbappe.data.tables import Table, table_path
+
+    return _read_or_empty(table_path(Table.SCHEDULE, settings), SCHEDULE_SCHEMA)
+
+
+def load_autotune_leaderboard(settings: Settings) -> pl.DataFrame:
+    """Load autotuner experiment results (``autotune_leaderboard.parquet``)."""
+
+    return _read_or_empty(
+        _output_path(settings, "autotune_leaderboard.parquet"), AUTOTUNE_SCHEMA
+    )
+
+
+# -- new helpers ---------------------------------------------------------------
+
+
+def compute_group_standings(
+    match_df: pl.DataFrame, results_df: pl.DataFrame
+) -> pl.DataFrame:
+    """Compute actual group standings from played matches.
+
+    Group membership comes from ``match_df`` (which carries the ``group`` column).
+    Returns a frame with: ``group, team, played, won, drawn, lost, gf, ga, gd, points``,
+    sorted by group then points (desc), gd (desc), gf (desc).
+    """
+
+    if match_df.is_empty() or results_df.is_empty():
+        return pl.DataFrame(
+            schema={
+                "group": pl.Utf8, "team": pl.Utf8, "played": pl.Int64,
+                "won": pl.Int64, "drawn": pl.Int64, "lost": pl.Int64,
+                "gf": pl.Int64, "ga": pl.Int64, "gd": pl.Int64, "points": pl.Int64,
+            }
+        )
+
+    gs = match_df.filter(pl.col("group") != "KO")
+    group_map: dict[str, str] = {}
+    for r in gs.iter_rows(named=True):
+        group_map.setdefault(str(r["home_team"]), str(r["group"]))
+        group_map.setdefault(str(r["away_team"]), str(r["group"]))
+
+    _, finished = split_fixtures(gs, results_df)
+    if finished.is_empty():
+        return pl.DataFrame(
+            schema={
+                "group": pl.Utf8, "team": pl.Utf8, "played": pl.Int64,
+                "won": pl.Int64, "drawn": pl.Int64, "lost": pl.Int64,
+                "gf": pl.Int64, "ga": pl.Int64, "gd": pl.Int64, "points": pl.Int64,
+            }
+        )
+
+    rows: list[dict[str, object]] = []
+    team_stats: dict[str, dict[str, int]] = {}
+    for r in finished.iter_rows(named=True):
+        h, a = str(r["home_team"]), str(r["away_team"])
+        hg, ag = int(r["home_goals"]), int(r["away_goals"])
+        for team, gf, ga in [(h, hg, ag), (a, ag, hg)]:
+            s = team_stats.setdefault(team, {"played": 0, "won": 0, "drawn": 0, "lost": 0, "gf": 0, "ga": 0})
+            s["played"] += 1
+            s["gf"] += gf
+            s["ga"] += ga
+            if gf > ga:
+                s["won"] += 1
+            elif gf == ga:
+                s["drawn"] += 1
+            else:
+                s["lost"] += 1
+
+    for team, s in team_stats.items():
+        gd = s["gf"] - s["ga"]
+        pts = 3 * s["won"] + s["drawn"]
+        rows.append({
+            "group": group_map.get(team, "?"),
+            "team": team,
+            "played": s["played"],
+            "won": s["won"],
+            "drawn": s["drawn"],
+            "lost": s["lost"],
+            "gf": s["gf"],
+            "ga": s["ga"],
+            "gd": gd,
+            "points": pts,
+        })
+
+    return (
+        pl.DataFrame(rows)
+        .sort(["group", "points", "gd", "gf"], descending=[False, True, True, True])
+    )
+
+
+def predicted_group_points(match_df: pl.DataFrame) -> pl.DataFrame:
+    """Compute expected group points per team from model H/D/A probabilities.
+
+    For each fixture: home expected pts = 3*P(home) + P(draw),
+    away expected pts = 3*P(away) + P(draw). Summed per team.
+    Returns frame: ``group, team, predicted_points``.
+    """
+
+    if match_df.is_empty():
+        return pl.DataFrame(schema={"group": pl.Utf8, "team": pl.Utf8, "predicted_points": pl.Float64})
+
+    gs = match_df.filter(pl.col("group") != "KO")
+    team_pts: dict[str, float] = {}
+    team_group: dict[str, str] = {}
+    for r in gs.iter_rows(named=True):
+        h, a = str(r["home_team"]), str(r["away_team"])
+        ph, pd, pa = float(r["model_home"]), float(r["model_draw"]), float(r["model_away"])
+        team_pts[h] = team_pts.get(h, 0.0) + 3.0 * ph + pd
+        team_pts[a] = team_pts.get(a, 0.0) + 3.0 * pa + pd
+        team_group.setdefault(h, str(r["group"]))
+        team_group.setdefault(a, str(r["group"]))
+
+    rows = [
+        {"group": team_group.get(t, "?"), "team": t, "predicted_points": round(p, 1)}
+        for t, p in team_pts.items()
+    ]
+    return pl.DataFrame(rows).sort(["group", "predicted_points"], descending=[False, True])
+
+
+def biggest_surprises(finished: pl.DataFrame, *, n: int = 5) -> pl.DataFrame:
+    """Matches where the model was most wrong — sorted by P(actual_outcome) ascending."""
+
+    if finished.is_empty() or "actual_outcome" not in finished.columns:
+        return finished
+
+    rows = []
+    for r in finished.iter_rows(named=True):
+        probs = {
+            "home": float(r["model_home"]),
+            "draw": float(r["model_draw"]),
+            "away": float(r["model_away"]),
+        }
+        actual = str(r["actual_outcome"])
+        pick = max(probs, key=probs.get)  # type: ignore[arg-type]
+        rows.append({
+            "Fixture": f"{r['home_team']} vs {r['away_team']}",
+            "Model Pick": {"home": str(r["home_team"]), "draw": "Draw", "away": str(r["away_team"])}.get(pick, pick),
+            "Pick Confidence": f"{max(probs.values()):.0%}",
+            "Actual Result": {"home": str(r["home_team"]), "draw": "Draw", "away": str(r["away_team"])}.get(actual, actual),
+            "P(Actual)": f"{probs[actual]:.0%}",
+            "p_actual_raw": probs[actual],
+            "Score": (
+                f"{int(r['home_goals'])} – {int(r['away_goals'])}"
+                if r.get("home_goals") is not None else "—"
+            ),
+        })
+
+    return (
+        pl.DataFrame(rows)
+        .sort("p_actual_raw")
+        .head(n)
+        .drop("p_actual_raw")
+    )
+
+
+def classify_ko_fixtures(
+    match_df: pl.DataFrame, results_df: pl.DataFrame
+) -> pl.DataFrame:
+    """Classify KO entries from match_predictions as R32 or R16 based on result dates.
+
+    Returns the KO subset of match_df joined with results, adding columns:
+    ``stage, home_goals, away_goals, actual_outcome, model_correct, date``.
+    """
+
+    ko = match_df.filter(pl.col("group") == "KO")
+    if ko.is_empty():
+        return ko
+
+    ko = ko.with_columns(_model_pick_expr().alias("model_pick"))
+
+    result_cols = ["home_team", "away_team", "home_goals", "away_goals", "date"]
+    if results_df.is_empty():
+        results_slim = pl.DataFrame(schema={c: RESULTS_SCHEMA[c] for c in result_cols})
+    else:
+        results_slim = (
+            results_df.select(result_cols)
+            .sort("date")
+            .group_by(["home_team", "away_team"], maintain_order=True)
+            .last()
+        )
+
+    joined = ko.join(results_slim, on=["home_team", "away_team"], how="left")
+    unmatched = joined.filter(pl.col("home_goals").is_null()).select(ko.columns)
+    if not unmatched.is_empty() and not results_slim.is_empty():
+        reversed_results = results_slim.rename(
+            {"home_team": "away_team", "away_team": "home_team",
+             "home_goals": "away_goals", "away_goals": "home_goals"}
+        )
+        reverse_joined = unmatched.join(
+            reversed_results, on=["home_team", "away_team"], how="left"
+        )
+        matched_fwd = joined.filter(pl.col("home_goals").is_not_null())
+        joined = pl.concat([matched_fwd, reverse_joined], how="diagonal_relaxed")
+
+    played = pl.col("home_goals").is_not_null()
+    import datetime as _dt
+    r32_cutoff = _dt.date(2026, 7, 4)
+
+    joined = joined.with_columns(
+        pl.when(~played)
+        .then(pl.lit("upcoming"))
+        .when(pl.col("date") < r32_cutoff)
+        .then(pl.lit("R32"))
+        .otherwise(pl.lit("R16"))
+        .alias("stage")
+    )
+
+    joined = joined.with_columns(
+        pl.when(played)
+        .then(
+            pl.when(pl.col("home_goals") > pl.col("away_goals"))
+            .then(pl.lit("home"))
+            .when(pl.col("home_goals") < pl.col("away_goals"))
+            .then(pl.lit("away"))
+            .otherwise(pl.lit("draw"))
+        )
+        .alias("actual_outcome")
+    ).with_columns(
+        pl.when(played)
+        .then(pl.col("model_pick") == pl.col("actual_outcome"))
+        .alias("model_correct")
+    )
+
+    return joined
+
+
+def _build_position_map(
+    group_probs: pl.DataFrame, match_df: pl.DataFrame
+) -> dict[tuple[str, str], str]:
+    """Map ``(position, group)`` to team name using deterministic group probabilities.
+
+    E.g. ``("1", "A") -> "Mexico"``, ``("3", "D") -> "Paraguay"``.
+    """
+
+    gs = match_df.filter(pl.col("group") != "KO")
+    team_group: dict[str, str] = {}
+    for r in gs.iter_rows(named=True):
+        team_group.setdefault(str(r["home_team"]), str(r["group"]))
+        team_group.setdefault(str(r["away_team"]), str(r["group"]))
+
+    pos_map: dict[tuple[str, str], str] = {}
+    for r in group_probs.iter_rows(named=True):
+        team = str(r["team"])
+        group = team_group.get(team)
+        if not group:
+            continue
+        for pos, col in [(1, "finish_1"), (2, "finish_2"), (3, "finish_3"), (4, "finish_4")]:
+            if float(r[col]) == 1.0:
+                pos_map[(str(pos), group)] = team
+                break
+    return pos_map
+
+
+def resolve_bracket(
+    schedule_df: pl.DataFrame,
+    ko_fixtures: pl.DataFrame,
+    group_probs: pl.DataFrame | None = None,
+    match_df: pl.DataFrame | None = None,
+    stage_probs: pl.DataFrame | None = None,
+) -> pl.DataFrame:
+    """Resolve placeholder codes in the KO schedule to actual team names.
+
+    Uses group_probabilities to map simple position codes (1A, 2B) and matches
+    KO fixture results against schedule slots to resolve third-place wildcards.
+    """
+
+    if schedule_df.is_empty():
+        return schedule_df
+
+    ko_sched = schedule_df.filter(pl.col("group").is_null()).sort("date")
+
+    pos_map: dict[tuple[str, str], str] = {}
+    if group_probs is not None and match_df is not None:
+        pos_map = _build_position_map(group_probs, match_df)
+
+    r16_teams: set[str] = set()
+    if not ko_fixtures.is_empty() and "stage" in ko_fixtures.columns:
+        r16_rows = ko_fixtures.filter(pl.col("stage") == "R16")
+        for r in r16_rows.iter_rows(named=True):
+            r16_teams.add(str(r["home_team"]))
+            r16_teams.add(str(r["away_team"]))
+
+    eliminated_teams: set[str] = set()
+    if stage_probs is not None and not stage_probs.is_empty() and "R16" in stage_probs.columns:
+        for r in stage_probs.iter_rows(named=True):
+            if float(r["R16"]) == 0.0:
+                eliminated_teams.add(str(r["team"]))
+
+    # Build list of R32 fixtures from ko_fixtures for matching
+    r32_fixture_pairs: list[tuple[str, str]] = []
+    if not ko_fixtures.is_empty() and "stage" in ko_fixtures.columns:
+        for r in ko_fixtures.filter(pl.col("stage") == "R32").iter_rows(named=True):
+            r32_fixture_pairs.append((str(r["home_team"]), str(r["away_team"])))
+
+    def _resolve_simple(code: str) -> str | None:
+        if not code or len(code) < 2 or "/" in code:
+            return None
+        pos, group = code[0], code[1:]
+        return pos_map.get((pos, group))
+
+    def _wildcard_candidates(code: str) -> set[str]:
+        if "/" not in code:
+            return set()
+        pos = code[0]
+        groups = code[1:].split("/")
+        return {pos_map[(pos, g)] for g in groups if (pos, g) in pos_map}
+
+    # Enumerate KO schedule matches
+    match_numbers: dict[int, dict[str, object]] = {}
+    for i, r in enumerate(ko_sched.iter_rows(named=True)):
+        mn = 73 + i
+        match_numbers[mn] = {
+            "stage": r["stage"], "date": r["date"], "city": r["city"],
+            "home_code": str(r["home_team"]), "away_code": str(r["away_team"]),
+        }
+
+    bracket: dict[str, str | None] = {}
+    used_fixtures: set[tuple[str, str]] = set()
+
+    # Resolve R32: for each slot, resolve the fixed side then find the actual opponent
+    for mn, info in sorted(match_numbers.items()):
+        if info["stage"] != "Round of 32":
+            continue
+        code_h, code_a = str(info["home_code"]), str(info["away_code"])
+        fixed_h = _resolve_simple(code_h)
+        fixed_a = _resolve_simple(code_a)
+
+        if fixed_h and fixed_a:
+            # Both sides are simple position codes
+            winner = _find_winner(ko_fixtures, fixed_h, fixed_a, r16_teams, eliminated_teams)
+            bracket[f"W{mn}"] = winner
+            if winner:
+                bracket[f"L{mn}"] = fixed_a if winner == fixed_h else fixed_h
+            used_fixtures.add((fixed_h, fixed_a))
+        elif fixed_h and not fixed_a:
+            # Home is known, away is wildcard — find which fixture has fixed_h
+            candidates = _wildcard_candidates(code_a)
+            for h, a in r32_fixture_pairs:
+                pair = {h, a}
+                if fixed_h in pair and (h, a) not in used_fixtures:
+                    other = a if h == fixed_h else h
+                    if other in candidates:
+                        fixed_a = other
+                        winner = _find_winner(ko_fixtures, h, a, r16_teams, eliminated_teams)
+                        bracket[f"W{mn}"] = winner
+                        if winner:
+                            bracket[f"L{mn}"] = a if winner == h else h
+                        used_fixtures.add((h, a))
+                        break
+        elif fixed_a and not fixed_h:
+            candidates = _wildcard_candidates(code_h)
+            for h, a in r32_fixture_pairs:
+                pair = {h, a}
+                if fixed_a in pair and (h, a) not in used_fixtures:
+                    other = h if a == fixed_a else a
+                    if other in candidates:
+                        fixed_h = other
+                        winner = _find_winner(ko_fixtures, h, a, r16_teams, eliminated_teams)
+                        bracket[f"W{mn}"] = winner
+                        if winner:
+                            bracket[f"L{mn}"] = a if winner == h else h
+                        used_fixtures.add((h, a))
+                        break
+
+        # Store resolved teams for this match
+        match_numbers[mn]["home_resolved"] = fixed_h
+        match_numbers[mn]["away_resolved"] = fixed_a
+
+    # Resolve R16+ using bracket cascade
+    def _resolve_code(code: str) -> str | None:
+        if code.startswith("W") or code.startswith("L"):
+            return bracket.get(code)
+        return _resolve_simple(code) or code
+
+    for mn, info in sorted(match_numbers.items()):
+        if info["stage"] not in ("Round of 16",):
+            continue
+        h = _resolve_code(str(info["home_code"]))
+        a = _resolve_code(str(info["away_code"]))
+        match_numbers[mn]["home_resolved"] = h
+        match_numbers[mn]["away_resolved"] = a
+        if h and a:
+            winner = _find_winner(ko_fixtures, h, a, set(), eliminated_teams)
+            bracket[f"W{mn}"] = winner
+            if winner:
+                bracket[f"L{mn}"] = a if winner == h else h
+
+    # Resolve QF/SF/Final
+    for mn, info in sorted(match_numbers.items()):
+        if info["stage"] in ("Round of 32", "Round of 16"):
+            continue
+        h = _resolve_code(str(info["home_code"]))
+        a = _resolve_code(str(info["away_code"]))
+        match_numbers[mn]["home_resolved"] = h
+        match_numbers[mn]["away_resolved"] = a
+
+    # Build output
+    rows = []
+    for mn in sorted(match_numbers.keys()):
+        info = match_numbers[mn]
+        res_h = info.get("home_resolved")
+        res_a = info.get("away_resolved")
+        status = "tbd"
+        if res_h and res_a:
+            status = "played" if _has_result(ko_fixtures, str(res_h), str(res_a)) else "upcoming"
+        rows.append({
+            "match_number": mn,
+            "stage": str(info["stage"]),
+            "date": info["date"],
+            "city": str(info["city"]),
+            "home_code": str(info["home_code"]),
+            "away_code": str(info["away_code"]),
+            "home_resolved": str(res_h) if res_h else None,
+            "away_resolved": str(res_a) if res_a else None,
+            "status": status,
+        })
+
+    return pl.DataFrame(rows)
+
+
+def _find_winner(
+    ko_fixtures: pl.DataFrame,
+    team_a: str,
+    team_b: str,
+    later_stage_teams: set[str],
+    eliminated_teams: set[str] | None = None,
+) -> str | None:
+    """Find the winner of a match between team_a and team_b from ko_fixtures results."""
+
+    if ko_fixtures.is_empty():
+        return None
+
+    for r in ko_fixtures.iter_rows(named=True):
+        h, a = str(r["home_team"]), str(r["away_team"])
+        if not ({h, a} == {team_a, team_b}):
+            continue
+        hg, ag = r.get("home_goals"), r.get("away_goals")
+        if hg is None or ag is None:
+            return None
+        hg, ag = int(hg), int(ag)
+        if hg > ag:
+            return h
+        if ag > hg:
+            return a
+        # Draw — check later stage appearances
+        if h in later_stage_teams:
+            return h
+        if a in later_stage_teams:
+            return a
+        # Draw — check if one team was eliminated (R16 prob = 0 in stage probs)
+        if eliminated_teams:
+            if h in eliminated_teams and a not in eliminated_teams:
+                return a
+            if a in eliminated_teams and h not in eliminated_teams:
+                return h
+        return None
+    return None
+
+
+def _has_result(ko_fixtures: pl.DataFrame, team_a: str, team_b: str) -> bool:
+    """Check if a match between these teams has a recorded result in ko_fixtures."""
+
+    if ko_fixtures.is_empty():
+        return False
+    for r in ko_fixtures.iter_rows(named=True):
+        h, a = str(r["home_team"]), str(r["away_team"])
+        if {h, a} == {team_a, team_b} and r.get("home_goals") is not None:
+            return True
+    return False
+
+
+def actual_upsets(finished: pl.DataFrame, *, threshold: float = 0.35) -> pl.DataFrame:
+    """Matches where the underdog won — the actual outcome had probability below threshold."""
+
+    if finished.is_empty() or "actual_outcome" not in finished.columns:
+        return pl.DataFrame(schema={"Fixture": pl.Utf8})
+
+    rows = []
+    for r in finished.iter_rows(named=True):
+        probs = {
+            "home": float(r["model_home"]),
+            "draw": float(r["model_draw"]),
+            "away": float(r["model_away"]),
+        }
+        actual = str(r["actual_outcome"])
+        p_actual = probs[actual]
+        if p_actual >= threshold:
+            continue
+        pick = max(probs, key=probs.get)  # type: ignore[arg-type]
+        if pick == actual:
+            continue
+
+        label = {"home": str(r["home_team"]), "draw": "Draw", "away": str(r["away_team"])}
+        rows.append({
+            "Fixture": f"{r['home_team']} vs {r['away_team']}",
+            "Score": f"{int(r['home_goals'])} – {int(r['away_goals'])}",
+            "Model Pick": label.get(pick, pick),
+            "Pick Confidence": f"{max(probs.values()):.0%}",
+            "Actual Result": label.get(actual, actual),
+            "P(Actual)": f"{p_actual:.0%}",
+            "Upset Magnitude": f"{1 - p_actual:.0%}",
+            "_sort": p_actual,
+        })
+
+    if not rows:
+        return pl.DataFrame(schema={"Fixture": pl.Utf8})
+
+    return pl.DataFrame(rows).sort("_sort").drop("_sort")
+
+
+def dark_horses(stage_df: pl.DataFrame, *, n: int = 10) -> pl.DataFrame:
+    """Teams punching above their weight — high QF/SF odds relative to champion odds."""
+
+    if stage_df.is_empty() or "QF" not in stage_df.columns:
+        return stage_df
+
+    df = stage_df.filter(pl.col("QF") > 0)
+    if df.is_empty():
+        return df
+
+    champ_floor = 0.001
+    df = df.with_columns(
+        (pl.col("QF") / pl.max_horizontal(pl.col("champion"), pl.lit(champ_floor)))
+        .alias("overperformance")
+    )
+    # Filter out actual favourites (champion > 5%)
+    df = df.filter(pl.col("champion") <= 0.05)
+    if df.is_empty():
+        return df
+
+    return (
+        df.select(["team", "R16", "QF", "SF", "FINAL", "champion", "overperformance"])
+        .sort("overperformance", descending=True)
+        .head(n)
+    )
