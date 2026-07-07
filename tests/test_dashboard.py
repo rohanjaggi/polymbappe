@@ -328,7 +328,7 @@ def test_prediction_scorecard_metrics() -> None:
 def test_prediction_scorecard_empty_zeroed() -> None:
     empty = data.load_match_predictions(Settings(data_dir=Path("/nonexistent-xyz")))
     scorecard = data.prediction_scorecard(empty)
-    assert scorecard == {"n": 0.0, "accuracy": 0.0, "brier_score": 0.0, "log_loss": 0.0}
+    assert scorecard == {"n": 0.0, "accuracy": 0.0, "brier_score": 0.0, "log_loss": 0.0, "rps": 0.0}
 
 
 def test_accuracy_by_outcome_groups_and_scores() -> None:

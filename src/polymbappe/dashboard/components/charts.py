@@ -481,7 +481,9 @@ def backtest_bar(per_tournament: dict[str, float]) -> Figure:
         hovertemplate="%{x}: %{y:.4f}<extra></extra>",
     ))
     fig.add_hline(y=mean_rps, line_dash="dash", line_color="seagreen",
-                  annotation_text=f"Mean: {mean_rps:.4f}")
+                  annotation_text=f"Our mean: {mean_rps:.4f}")
+    fig.add_hline(y=0.2222, line_dash="dot", line_color="tomato",
+                  annotation_text="Random baseline: 0.2222")
     fig.update_layout(
         title="RPS by Tournament (Leave-One-Out Backtest)",
         xaxis_title="Tournament",

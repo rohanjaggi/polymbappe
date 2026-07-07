@@ -58,21 +58,33 @@ def render(settings: Settings) -> None:
 
 
 def _render_scorecard(st: object, finished: pl.DataFrame) -> None:
-    """Headline accuracy / Brier / log-loss metrics across all finished matches."""
+    """Headline accuracy / RPS / mean confidence metrics across finished matches."""
 
     scorecard = data.prediction_scorecard(finished)
+    n = int(scorecard["n"])
+
+    mean_p_actual = 0.0
+    if n > 0:
+        total = 0.0
+        for r in finished.iter_rows(named=True):
+            probs = {"home": float(r["model_home"]), "draw": float(r["model_draw"]), "away": float(r["model_away"])}
+            total += probs[str(r["actual_outcome"])]
+        mean_p_actual = total / n
+
     cols = st.columns(4)
-    cols[0].metric("Matches scored", int(scorecard["n"]))
+    cols[0].metric("Matches scored", n)
     cols[1].metric("Top-pick accuracy", f"{scorecard['accuracy']:.1%}")
     cols[2].metric(
-        "Brier score",
-        f"{scorecard['brier_score']:.3f}",
-        help="Mean squared error over H/D/A — lower is better (0 best, 2 worst).",
+        "Ranked Probability Score",
+        f"{scorecard['rps']:.4f}",
+        delta=f"{(1 - scorecard['rps'] / 0.2222) * 100:.0f}% better than random",
+        delta_color="normal",
+        help="Measures full probability calibration, not just the top pick. Lower is better. Random = 0.222.",
     )
     cols[3].metric(
-        "Log loss",
-        f"{scorecard['log_loss']:.3f}",
-        help="Mean negative log-probability of the realized outcome — lower is better.",
+        "Avg confidence on result",
+        f"{mean_p_actual:.1%}",
+        help="Mean probability the model assigned to the outcome that actually happened. Random = 33%. Higher is better.",
     )
 
 

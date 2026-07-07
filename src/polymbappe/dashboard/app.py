@@ -39,7 +39,17 @@ def main() -> None:
     import streamlit as st
 
     st.set_page_config(page_title="Polymbappe — 2026 World Cup Forecast", layout="wide")
-    st.sidebar.title("Polymbappe")
+
+    from pathlib import Path
+
+    logo_path = Path(Settings().data_dir).parent / "data" / "polymbappe_logo.jpg"
+    if not logo_path.exists():
+        logo_path = Path(__file__).resolve().parents[3] / "data" / "polymbappe_logo.jpg"
+    if logo_path.exists():
+        st.sidebar.image(str(logo_path), use_container_width=True)
+    else:
+        st.sidebar.title("Polymbappe")
+
     st.sidebar.caption("2026 FIFA World Cup forecasting")
 
     settings = Settings()

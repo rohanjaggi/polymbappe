@@ -68,21 +68,40 @@ def _render_group_predictions(st: object, settings: Settings, team: str) -> None
         return
 
     rows: list[dict[str, object]] = []
-    projected_points = 0.0
+    actual_points = 0
     for record in team_finished.iter_rows(named=True):
         verdict, pts, score = _result_for_team(record, team)
-        projected_points += pts
+        actual_points += pts
         rows.append(_prediction_row(record, team, status="Played", result=verdict, score=score))
     for record in team_upcoming.iter_rows(named=True):
-        p_team, p_draw, _ = _team_perspective(record, team)
-        projected_points += 3.0 * p_team + p_draw
         rows.append(_prediction_row(record, team, status="Upcoming"))
+
+    predicted_df = data.predicted_group_points(match_df)
+    team_pred = predicted_df.filter(pl.col("team") == team)
+    predicted_points = float(team_pred["predicted_points"].item()) if not team_pred.is_empty() else 0.0
+
+    standings_df = data.compute_group_standings(match_df, results)
+    all_predicted = predicted_df.join(
+        standings_df.select(["team", "points"]), on="team", how="inner"
+    )
+    overall_mae = float(
+        (all_predicted["predicted_points"] - all_predicted["points"].cast(pl.Float64)).abs().mean()
+    ) if not all_predicted.is_empty() else 0.0
 
     st.caption(
         f"H/D/A probabilities oriented to {team}. "
-        "Projected points blend actual (played) with expected 3·P(win)+P(draw) (upcoming)."
+        "Predicted points = 3·P(win) + P(draw) summed over group-stage fixtures."
     )
-    st.metric(f"{team} projected group points", f"{projected_points:.1f}")
+    cols = st.columns(3)
+    cols[0].metric("Predicted points", f"{predicted_points:.1f}")
+    cols[1].metric("Actual points", str(actual_points))
+    point_err = abs(predicted_points - actual_points)
+    cols[2].metric(
+        "Error",
+        f"{point_err:.1f}",
+        delta=f"Avg error across all teams: {overall_mae:.1f}",
+        delta_color="off",
+    )
     st.dataframe(pl.DataFrame(rows).to_pandas(), use_container_width=True, hide_index=True)
 
 

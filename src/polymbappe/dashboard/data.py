@@ -512,12 +512,14 @@ def prediction_scorecard(finished: pl.DataFrame) -> dict[str, float]:
     """
 
     if finished.is_empty():
-        return {"n": 0.0, "accuracy": 0.0, "brier_score": 0.0, "log_loss": 0.0}
+        return {"n": 0.0, "accuracy": 0.0, "brier_score": 0.0, "log_loss": 0.0, "rps": 0.0}
 
     n = finished.height
     eps = 1e-12
     brier_total = 0.0
     log_total = 0.0
+    rps_total = 0.0
+    outcome_idx = {"home": 0, "draw": 1, "away": 2}
     for r in finished.iter_rows(named=True):
         probs = {
             "home": float(r["model_home"]),
@@ -529,12 +531,20 @@ def prediction_scorecard(finished: pl.DataFrame) -> dict[str, float]:
             target = 1.0 if outcome == actual else 0.0
             brier_total += (p - target) ** 2
         log_total += -math.log(max(probs[actual], eps))
+        prob_list = [probs["home"], probs["draw"], probs["away"]]
+        actual_vec = [0.0, 0.0, 0.0]
+        actual_vec[outcome_idx[actual]] = 1.0
+        rps_total += sum(
+            (sum(prob_list[: k + 1]) - sum(actual_vec[: k + 1])) ** 2
+            for k in range(3)
+        ) / 2
 
     return {
         "n": float(n),
         "accuracy": float(finished["model_correct"].sum()) / n,
         "brier_score": brier_total / n,
         "log_loss": log_total / n,
+        "rps": rps_total / n,
     }
 
 
