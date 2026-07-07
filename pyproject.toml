@@ -45,6 +45,7 @@ context = [
 dashboard = [
   "streamlit>=1.38.0",
   "plotly>=5.22.0",
+  "openpyxl>=3.1.0",
 ]
 kaggle = [
   "kagglehub>=0.3.0",

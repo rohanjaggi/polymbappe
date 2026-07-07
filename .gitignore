@@ -16,6 +16,12 @@ data/outputs/*
 !data/raw/player_attributes_kaggle.txt
 !data/raw/squad_valuations_kaggle.txt
 
+# Dashboard deployment — track the output parquets and key processed tables
+# so Streamlit Community Cloud can serve the dashboard without re-running pipelines
+!data/outputs/*.parquet
+!data/processed/matches.parquet
+!data/processed/match_xg.parquet
+
 # Autotuner-generated best config (search space is tracked)
 configs/best_config.yaml
 

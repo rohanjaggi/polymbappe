@@ -161,6 +161,46 @@ def hda_bar(
     return fig
 
 
+def phase_decided_bar(p_reg: float, p_et: float, p_pens: float) -> Figure:
+    """Stacked bar of how a knockout tie is decided: regulation / extra time / penalties.
+
+    The three probabilities should sum to ~1. Rendered as a single horizontal stacked bar so
+    the FT/ET/pens split reads at a glance next to the advance-probability metrics.
+    """
+
+    import plotly.graph_objects as go
+
+    segments = (
+        ("Regulation (FT)", p_reg, "seagreen"),
+        ("Extra time (ET)", p_et, "goldenrod"),
+        ("Penalties", p_pens, "indianred"),
+    )
+    fig = go.Figure()
+    for label, value, color in segments:
+        fig.add_trace(
+            go.Bar(
+                x=[value],
+                y=["Decided in"],
+                name=label,
+                orientation="h",
+                marker={"color": color},
+                hovertemplate=f"{label}: %{{x:.1%}}<extra></extra>",
+            )
+        )
+    fig.update_layout(
+        barmode="stack",
+        title="How the tie is decided",
+        xaxis_title="Probability",
+        xaxis_tickformat=".0%",
+        xaxis_range=[0, 1],
+        yaxis={"visible": False},
+        legend={"orientation": "h", "y": -0.3},
+        margin={"l": 20, "r": 20, "t": 50, "b": 30},
+        height=200,
+    )
+    return fig
+
+
 def stage_waterfall(stage_probs: dict[str, float], *, team: str) -> Figure:
     """Stage-reaching probability waterfall for one team (spec 6.1, page 2).
 
@@ -380,6 +420,114 @@ def edge_scatter(df: pl.DataFrame) -> Figure:
     )
     fig.update_layout(
         title="Market edges — magnitude vs. stake",
+        margin={"l": 20, "r": 20, "t": 50, "b": 30},
+    )
+    return fig
+
+
+def group_standings_chart(
+    predicted_df: pl.DataFrame, actual_df: pl.DataFrame, group: str
+) -> Figure:
+    """Grouped horizontal bar comparing predicted vs actual points for one group."""
+
+    import plotly.graph_objects as go
+
+    pred_g = predicted_df.filter(pl.col("group") == group).sort("predicted_points", descending=True)
+    act_g = actual_df.filter(pl.col("group") == group)
+
+    if pred_g.is_empty():
+        return _empty_figure(f"No data for Group {group}.")
+
+    teams = pred_g["team"].to_list()
+    pred_pts = pred_g["predicted_points"].to_list()
+
+    act_map = {}
+    if not act_g.is_empty():
+        for r in act_g.iter_rows(named=True):
+            act_map[r["team"]] = r["points"]
+    act_pts = [act_map.get(t, 0) for t in teams]
+
+    fig = go.Figure()
+    fig.add_trace(go.Bar(
+        y=teams[::-1], x=pred_pts[::-1], orientation="h",
+        name="Predicted", marker={"color": "steelblue", "opacity": 0.7},
+        hovertemplate="%{y}: %{x:.1f} pts<extra>Predicted</extra>",
+    ))
+    fig.add_trace(go.Bar(
+        y=teams[::-1], x=act_pts[::-1], orientation="h",
+        name="Actual", marker={"color": "seagreen"},
+        hovertemplate="%{y}: %{x} pts<extra>Actual</extra>",
+    ))
+    fig.update_layout(
+        title=f"Group {group} — Predicted vs Actual Points",
+        xaxis_title="Points",
+        barmode="group",
+        margin={"l": 20, "r": 20, "t": 50, "b": 30},
+        legend={"orientation": "h", "y": -0.15},
+    )
+    return fig
+
+
+def autotuner_chart(leaderboard_df: pl.DataFrame) -> Figure:
+    """Scatter plot of autotuner experiments showing RPS optimization journey."""
+
+    import plotly.graph_objects as go
+
+    if leaderboard_df.is_empty() or "mean_rps" not in leaderboard_df.columns:
+        return _empty_figure("No autotuner data available.")
+
+    phase_colors = {"phase1": "goldenrod", "phase2": "steelblue"}
+    fig = go.Figure()
+    for phase in ["phase1", "phase2"]:
+        subset = leaderboard_df.filter(pl.col("phase") == phase)
+        if subset.is_empty():
+            continue
+        fig.add_trace(go.Scatter(
+            x=list(range(subset.height)),
+            y=subset["mean_rps"].to_list(),
+            mode="markers",
+            marker={"color": phase_colors.get(phase, "gray"), "size": 5, "opacity": 0.6},
+            name=phase.replace("phase", "Phase "),
+            hovertemplate="RPS: %{y:.4f}<extra>%{fullData.name}</extra>",
+        ))
+
+    best_rps = float(leaderboard_df["mean_rps"].min())
+    fig.add_hline(y=best_rps, line_dash="dash", line_color="seagreen",
+                  annotation_text=f"Best: {best_rps:.4f}")
+    fig.update_layout(
+        title="Hyperparameter Optimization Journey",
+        xaxis_title="Experiment #",
+        yaxis_title="Mean RPS (lower is better)",
+        margin={"l": 20, "r": 20, "t": 50, "b": 30},
+    )
+    return fig
+
+
+def backtest_bar(per_tournament: dict[str, float]) -> Figure:
+    """Bar chart of RPS per tournament from backtest results."""
+
+    import plotly.graph_objects as go
+
+    if not per_tournament:
+        return _empty_figure("No backtest data available.")
+
+    tournaments = sorted(per_tournament.keys())
+    values = [per_tournament[t] for t in tournaments]
+    mean_rps = sum(values) / len(values) if values else 0
+
+    fig = go.Figure(go.Bar(
+        x=tournaments, y=values,
+        marker={"color": "steelblue"},
+        hovertemplate="%{x}: %{y:.4f}<extra></extra>",
+    ))
+    fig.add_hline(y=mean_rps, line_dash="dash", line_color="seagreen",
+                  annotation_text=f"Our mean: {mean_rps:.4f}")
+    fig.add_hline(y=0.2222, line_dash="dot", line_color="tomato",
+                  annotation_text="Random baseline: 0.2222")
+    fig.update_layout(
+        title="RPS by Tournament (Leave-One-Out Backtest)",
+        xaxis_title="Tournament",
+        yaxis_title="Ranked Probability Score",
         margin={"l": 20, "r": 20, "t": 50, "b": 30},
     )
     return fig

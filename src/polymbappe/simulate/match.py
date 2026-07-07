@@ -147,6 +147,54 @@ def knockout_home_winprob(
     return rh + rd * (eh + ed * p_pen)
 
 
+@dataclass(slots=True)
+class KnockoutBreakdown:
+    """Decomposition of a knockout tie into advance and phase-decided probabilities.
+
+    ``p_home_advance`` + ``p_away_advance`` == 1, and ``p_decided_reg`` +
+    ``p_decided_et`` + ``p_decided_pens`` == 1. The phase probabilities are how the tie
+    is *decided* (regulation / extra time / shootout), independent of which side wins.
+    """
+
+    p_home_advance: float
+    p_away_advance: float
+    p_decided_reg: float
+    p_decided_et: float
+    p_decided_pens: float
+
+
+def knockout_outcome_breakdown(
+    matrix_reg: np.ndarray,
+    matrix_et: np.ndarray,
+    home_pen_rate: float = 0.5,
+    away_pen_rate: float = 0.5,
+    first_shooter_home: bool = True,
+    edge: float = DEFAULT_FIRST_SHOOTER_EDGE,
+) -> KnockoutBreakdown:
+    """Closed-form advance probabilities plus the FT/ET/penalties decided-phase split.
+
+    Exposes the intermediate phase probabilities the Monte Carlo engine already computes
+    internally (see :func:`knockout_home_winprob`), so the dashboard can show *how* a tie
+    is expected to be decided without re-simulating.
+
+    ``matrix_reg`` / ``matrix_et`` are the regulation and extra-time score matrices; the
+    ``home_pen_rate`` / ``away_pen_rate`` are the (already-shrunk) shootout win rates.
+    """
+
+    rd = float(np.trace(matrix_reg))  # P(draw at 90') -> extra time
+    ed = float(np.trace(matrix_et))  # P(draw in ET) -> shootout
+    p_home = knockout_home_winprob(
+        matrix_reg, matrix_et, home_pen_rate, away_pen_rate, first_shooter_home, edge
+    )
+    return KnockoutBreakdown(
+        p_home_advance=p_home,
+        p_away_advance=1.0 - p_home,
+        p_decided_reg=1.0 - rd,
+        p_decided_et=rd * (1.0 - ed),
+        p_decided_pens=rd * ed,
+    )
+
+
 def simulate_group_match(matrix: np.ndarray, rng: np.random.Generator) -> MatchOutcome:
     """Sample a group-stage scoreline (no extra time / penalties)."""
 

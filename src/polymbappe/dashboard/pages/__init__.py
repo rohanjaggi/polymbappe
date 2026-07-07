@@ -1,15 +1,18 @@
-"""Streamlit dashboard pages (spec section 6.1).
+"""Streamlit dashboard pages.
 
 Each page module exposes ``render(settings: Settings) -> None`` which lazily imports
 ``streamlit``, reads artifacts through :mod:`polymbappe.dashboard.data`, and renders
-its page. The six pages mirror spec section 6.1:
+its page.
 
 1. :mod:`polymbappe.dashboard.pages.overview` — Tournament Overview
 2. :mod:`polymbappe.dashboard.pages.team_deep_dive` — Team Deep Dive
 3. :mod:`polymbappe.dashboard.pages.match_predictor` — Match Predictor
-4. :mod:`polymbappe.dashboard.pages.market_edges` — Market Edges
-5. :mod:`polymbappe.dashboard.pages.upset_watch` — Upset Watch
-6. :mod:`polymbappe.dashboard.pages.agent_activity` — Agent Activity
+4. :mod:`polymbappe.dashboard.pages.knockout_bracket` — Knockout Bracket
+5. :mod:`polymbappe.dashboard.pages.predictions_vs_actuals` — Predictions vs Actuals
+6. :mod:`polymbappe.dashboard.pages.market_edges` — Market Edges
+7. :mod:`polymbappe.dashboard.pages.upset_watch` — Upset Watch
+8. :mod:`polymbappe.dashboard.pages.model_showcase` — Model Showcase
+9. :mod:`polymbappe.dashboard.pages.agent_activity` — Agent Activity
 """
 
 from __future__ import annotations

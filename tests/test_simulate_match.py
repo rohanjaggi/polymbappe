@@ -7,6 +7,7 @@ import numpy as np
 from polymbappe.simulate.match import (
     hda_marginals,
     knockout_home_winprob,
+    knockout_outcome_breakdown,
     penalty_home_winprob,
     reweight_matrix_to_hda,
     sample_scoreline,
@@ -58,6 +59,30 @@ def test_knockout_winprob_monotonic_in_strength() -> None:
     p_even = knockout_home_winprob(even, et)
     assert 0.0 < p_even < p_strong < 1.0
     assert abs(p_even - 0.5) < 0.05  # even matchup ~ coin flip
+
+
+def test_knockout_outcome_breakdown_sums_and_agrees() -> None:
+    reg = score_matrix_from_rates(1.8, 1.0, 0.0, 8)
+    et = score_matrix_from_rates(1.0, 0.6, 0.0, 8)
+    b = knockout_outcome_breakdown(reg, et, home_pen_rate=0.55, away_pen_rate=0.5)
+    # Advance probabilities partition the tie.
+    assert abs(b.p_home_advance + b.p_away_advance - 1.0) < 1e-9
+    # Decided-phase probabilities partition the tie.
+    assert abs(b.p_decided_reg + b.p_decided_et + b.p_decided_pens - 1.0) < 1e-9
+    assert all(0.0 <= p <= 1.0 for p in (b.p_decided_reg, b.p_decided_et, b.p_decided_pens))
+    # The advance prob agrees with the closed-form used by the engine on identical inputs.
+    expected = knockout_home_winprob(reg, et, home_pen_rate=0.55, away_pen_rate=0.5)
+    assert abs(b.p_home_advance - expected) < 1e-12
+    # Stronger side favoured; regulation is the most common decider here.
+    assert b.p_home_advance > 0.5
+    assert b.p_decided_reg > b.p_decided_pens
+
+
+def test_knockout_outcome_breakdown_symmetric_is_even() -> None:
+    reg = score_matrix_from_rates(1.3, 1.3, 0.0, 8)
+    et = score_matrix_from_rates(0.9, 0.9, 0.0, 8)
+    b = knockout_outcome_breakdown(reg, et, first_shooter_home=False)
+    assert abs(b.p_home_advance - 0.5) < 0.02
 
 
 def test_simulate_knockout_always_decides() -> None:
