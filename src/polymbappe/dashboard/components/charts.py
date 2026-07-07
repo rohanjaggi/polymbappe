@@ -423,3 +423,111 @@ def edge_scatter(df: pl.DataFrame) -> Figure:
         margin={"l": 20, "r": 20, "t": 50, "b": 30},
     )
     return fig
+
+
+def group_standings_chart(
+    predicted_df: pl.DataFrame, actual_df: pl.DataFrame, group: str
+) -> Figure:
+    """Grouped horizontal bar comparing predicted vs actual points for one group."""
+
+    import plotly.graph_objects as go
+
+    pred_g = predicted_df.filter(pl.col("group") == group).sort("predicted_points", descending=True)
+    act_g = actual_df.filter(pl.col("group") == group)
+
+    if pred_g.is_empty():
+        return _empty_figure(f"No data for Group {group}.")
+
+    teams = pred_g["team"].to_list()
+    pred_pts = pred_g["predicted_points"].to_list()
+
+    act_map = {}
+    if not act_g.is_empty():
+        for r in act_g.iter_rows(named=True):
+            act_map[r["team"]] = r["points"]
+    act_pts = [act_map.get(t, 0) for t in teams]
+
+    fig = go.Figure()
+    fig.add_trace(go.Bar(
+        y=teams[::-1], x=pred_pts[::-1], orientation="h",
+        name="Predicted", marker={"color": "steelblue", "opacity": 0.7},
+        hovertemplate="%{y}: %{x:.1f} pts<extra>Predicted</extra>",
+    ))
+    fig.add_trace(go.Bar(
+        y=teams[::-1], x=act_pts[::-1], orientation="h",
+        name="Actual", marker={"color": "seagreen"},
+        hovertemplate="%{y}: %{x} pts<extra>Actual</extra>",
+    ))
+    fig.update_layout(
+        title=f"Group {group} — Predicted vs Actual Points",
+        xaxis_title="Points",
+        barmode="group",
+        margin={"l": 20, "r": 20, "t": 50, "b": 30},
+        legend={"orientation": "h", "y": -0.15},
+    )
+    return fig
+
+
+def autotuner_chart(leaderboard_df: pl.DataFrame) -> Figure:
+    """Scatter plot of autotuner experiments showing RPS optimization journey."""
+
+    import plotly.graph_objects as go
+
+    if leaderboard_df.is_empty() or "mean_rps" not in leaderboard_df.columns:
+        return _empty_figure("No autotuner data available.")
+
+    phase_colors = {"phase1": "goldenrod", "phase2": "steelblue"}
+    fig = go.Figure()
+    for phase in ["phase1", "phase2"]:
+        subset = leaderboard_df.filter(pl.col("phase") == phase)
+        if subset.is_empty():
+            continue
+        fig.add_trace(go.Scatter(
+            x=list(range(subset.height)),
+            y=subset["mean_rps"].to_list(),
+            mode="markers",
+            marker={"color": phase_colors.get(phase, "gray"), "size": 5, "opacity": 0.6},
+            name=phase.replace("phase", "Phase "),
+            hovertemplate="RPS: %{y:.4f}<extra>%{fullData.name}</extra>",
+        ))
+
+    best_rps = float(leaderboard_df["mean_rps"].min())
+    fig.add_hline(y=best_rps, line_dash="dash", line_color="seagreen",
+                  annotation_text=f"Best: {best_rps:.4f}")
+    fig.update_layout(
+        title="Hyperparameter Optimization Journey",
+        xaxis_title="Experiment #",
+        yaxis_title="Mean RPS (lower is better)",
+        margin={"l": 20, "r": 20, "t": 50, "b": 30},
+    )
+    return fig
+
+
+def backtest_bar(per_tournament: dict[str, float]) -> Figure:
+    """Bar chart of RPS per tournament from backtest results."""
+
+    import plotly.graph_objects as go
+
+    if not per_tournament:
+        return _empty_figure("No backtest data available.")
+
+    tournaments = sorted(per_tournament.keys())
+    values = [per_tournament[t] for t in tournaments]
+    mean_rps = sum(values) / len(values) if values else 0
+
+    fig = go.Figure(go.Bar(
+        x=tournaments, y=values,
+        marker={"color": "steelblue"},
+        hovertemplate="%{x}: %{y:.4f}<extra></extra>",
+    ))
+    fig.add_hline(y=mean_rps, line_dash="dash", line_color="seagreen",
+                  annotation_text=f"Our mean: {mean_rps:.4f}")
+    fig.add_hline(y=0.2222, line_dash="dot", line_color="tomato",
+                  annotation_text="Random baseline: 0.2222")
+    fig.update_layout(
+        title="RPS by Tournament (Leave-One-Out Backtest)",
+        xaxis_title="Tournament",
+        yaxis_title="Ranked Probability Score",
+        margin={"l": 20, "r": 20, "t": 50, "b": 30},
+    )
+    return fig
