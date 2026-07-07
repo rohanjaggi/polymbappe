@@ -838,6 +838,18 @@ def run_tournament_simulation(
     compute_knockout_predictions(result.r32_matchup_counts, n_sims, model).write_parquet(
         out / "knockout_predictions.parquet"
     )
+    # Knockout bracket forecast, anchored to the *real* draw: the ingested schedule gives the
+    # bracket structure (R32/R16 fixtures + W##/L## slot placeholders) and the matches table
+    # locks results already played, so future rounds are projected from the current bracket.
+    from polymbappe.simulate.knockout_bracket import compute_knockout_bracket
+
+    schedule_df = (
+        read_table(Table.SCHEDULE, settings) if table_exists(Table.SCHEDULE, settings)
+        else pl.DataFrame()
+    )
+    compute_knockout_bracket(schedule_df, matches_df, model, structure).write_parquet(
+        out / "knockout_bracket.parquet"
+    )
     # Refresh odds AFTER fixtures are written so Polymarket can align to them, then edges.
     if refresh_odds or live:
         refresh_market_odds(settings, logger)

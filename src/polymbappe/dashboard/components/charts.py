@@ -161,6 +161,46 @@ def hda_bar(
     return fig
 
 
+def phase_decided_bar(p_reg: float, p_et: float, p_pens: float) -> Figure:
+    """Stacked bar of how a knockout tie is decided: regulation / extra time / penalties.
+
+    The three probabilities should sum to ~1. Rendered as a single horizontal stacked bar so
+    the FT/ET/pens split reads at a glance next to the advance-probability metrics.
+    """
+
+    import plotly.graph_objects as go
+
+    segments = (
+        ("Regulation (FT)", p_reg, "seagreen"),
+        ("Extra time (ET)", p_et, "goldenrod"),
+        ("Penalties", p_pens, "indianred"),
+    )
+    fig = go.Figure()
+    for label, value, color in segments:
+        fig.add_trace(
+            go.Bar(
+                x=[value],
+                y=["Decided in"],
+                name=label,
+                orientation="h",
+                marker={"color": color},
+                hovertemplate=f"{label}: %{{x:.1%}}<extra></extra>",
+            )
+        )
+    fig.update_layout(
+        barmode="stack",
+        title="How the tie is decided",
+        xaxis_title="Probability",
+        xaxis_tickformat=".0%",
+        xaxis_range=[0, 1],
+        yaxis={"visible": False},
+        legend={"orientation": "h", "y": -0.3},
+        margin={"l": 20, "r": 20, "t": 50, "b": 30},
+        height=200,
+    )
+    return fig
+
+
 def stage_waterfall(stage_probs: dict[str, float], *, team: str) -> Figure:
     """Stage-reaching probability waterfall for one team (spec 6.1, page 2).
 

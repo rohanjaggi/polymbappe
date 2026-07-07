@@ -82,6 +82,84 @@ def test_load_stage_probabilities_reads_written_file(tmp_path: Path) -> None:
     assert set(loaded["team"]) == {"BRA", "ARG", "FRA"}
 
 
+def test_load_knockout_bracket_empty_schema(tmp_path: Path) -> None:
+    df = data.load_knockout_bracket(_settings(tmp_path))
+    assert df.is_empty()
+    assert df.columns == list(data.KO_BRACKET_SCHEMA.keys())
+
+
+def _write_bracket(settings: Settings) -> pl.DataFrame:
+    df = pl.DataFrame(
+        {
+            "round": ["R32", "R16", "QF", "QF"],
+            "match_number": [73, 89, 97, 97],
+            "rank": [1, 1, 1, 2],
+            "team_a": ["BRA", "BRA", "BRA", "ARG"],
+            "team_b": ["SRB", "FRA", "ESP", "ESP"],
+            "matchup_prob": [1.0, 1.0, 0.4, 0.35],
+            "p_a_advance": [0.7, 0.55, 0.52, 0.48],
+            "p_b_advance": [0.3, 0.45, 0.48, 0.52],
+            "p_decided_reg": [0.72, 0.68, 0.6, 0.62],
+            "p_decided_et": [0.18, 0.2, 0.24, 0.22],
+            "p_decided_pens": [0.10, 0.12, 0.16, 0.16],
+            "model_a": [0.5, 0.42, 0.4, 0.38],
+            "model_draw": [0.25, 0.28, 0.3, 0.3],
+            "model_b": [0.25, 0.30, 0.3, 0.32],
+            "exp_a_goals": [1.6, 1.3, 1.4, 1.2],
+            "exp_b_goals": [0.9, 1.2, 1.3, 1.3],
+        }
+    ).with_columns(pl.col("match_number").cast(pl.Int32), pl.col("rank").cast(pl.Int32))
+    settings.outputs_data_dir.mkdir(parents=True, exist_ok=True)
+    df.write_parquet(settings.outputs_data_dir / "knockout_bracket.parquet")
+    return df
+
+
+def test_load_knockout_bracket_reads_written_file(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    _write_bracket(settings)
+    loaded = data.load_knockout_bracket(settings)
+    assert loaded.height == 4
+    assert loaded.columns == list(data.KO_BRACKET_SCHEMA.keys())
+
+
+def test_bracket_slots_and_candidates(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    _write_bracket(settings)
+    bracket = data.load_knockout_bracket(settings)
+    # One rank-1 fixture per slot in the QF (match 97), regardless of how many candidates.
+    qf_slots = data.bracket_slots(bracket, "QF")
+    assert qf_slots.height == 1
+    assert qf_slots.row(0, named=True)["team_a"] == "BRA"  # the rank-1 (most-likely) pairing
+    # All candidate matchups for that fixture, most-probable first.
+    cands = data.bracket_slot_candidates(bracket, 97)
+    assert cands.height == 2
+    assert cands["rank"].to_list() == [1, 2]
+    assert data.bracket_slots(bracket, "SF").is_empty()
+
+
+def test_knockout_results_filters_to_played_knockouts() -> None:
+    from datetime import date
+
+    results = pl.DataFrame(
+        {
+            "match_id": ["ko1", "grp1", "old"],
+            "date": [date(2026, 7, 5), date(2026, 6, 20), date(2018, 7, 5)],
+            "home_team": ["BRA", "ARG", "FRA"],
+            "away_team": ["SRB", "MEX", "CRO"],
+            "home_goals": [2, 1, 4],
+            "away_goals": [1, 1, 2],
+            "competition": ["FIFA World Cup"] * 3,
+            "is_knockout": [True, False, True],
+            "neutral_site": [True, True, True],
+            "group": [None, "C", None],
+        },
+        schema_overrides={"group": pl.Utf8},
+    )
+    ko = data.knockout_results(results)
+    # Only the 2026 knockout game survives (group-stage and pre-2026 dropped).
+    assert ko["match_id"].to_list() == ["ko1"]
+
+
 # -- helpers ------------------------------------------------------------------
 
 
@@ -328,7 +406,10 @@ def test_prediction_scorecard_metrics() -> None:
 def test_prediction_scorecard_empty_zeroed() -> None:
     empty = data.load_match_predictions(Settings(data_dir=Path("/nonexistent-xyz")))
     scorecard = data.prediction_scorecard(empty)
-    assert scorecard == {"n": 0.0, "accuracy": 0.0, "brier_score": 0.0, "log_loss": 0.0, "rps": 0.0}
+    assert scorecard == {
+        "n": 0.0, "accuracy": 0.0, "brier_score": 0.0, "log_loss": 0.0,
+        "rps": 0.0, "rps_skill": 0.0, "log_loss_skill": 0.0, "brier_skill": 0.0,
+    }
 
 
 def test_accuracy_by_outcome_groups_and_scores() -> None:
@@ -364,3 +445,53 @@ def test_calibration_bins_empty_schema() -> None:
     bins = data.calibration_bins(empty)
     assert bins.is_empty()
     assert bins.columns == list(data.CALIBRATION_SCHEMA.keys())
+
+
+# -- extended scoring rules / calibration / segmentation ----------------------
+
+
+def test_prediction_scorecard_includes_rps_and_skill() -> None:
+    card = data.prediction_scorecard(_finished())
+    # RPS present and matches the ordinal H-D-A computation on this frame.
+    assert 0.0 <= card["rps"] <= 1.0
+    # These fixtures are both misses, so the model trails a uniform guess -> negative skill.
+    assert card["rps_skill"] <= 0.0
+    for key in ("rps", "rps_skill", "log_loss_skill", "brier_skill"):
+        assert key in card
+
+
+def test_calibration_summary_keys_and_empty() -> None:
+    summary = data.calibration_summary(_finished())
+    assert set(summary) == {"n", "ece", "mce", "slope", "intercept"}
+    assert summary["n"] == 2.0 and summary["ece"] >= 0.0
+    empty = data.load_match_predictions(Settings(data_dir=Path("/nonexistent-xyz")))
+    assert data.calibration_summary(empty)["n"] == 0.0
+
+
+def test_competitive_subset_filters_by_favourite_band() -> None:
+    # Favourite confidences are 0.6 and 0.7; only the 0.6 fixture is in [0.40, 0.60].
+    subset = data.competitive_subset(_finished())
+    assert subset.height == 1
+    fav = max(
+        subset.row(0, named=True)[c] for c in ("model_home", "model_draw", "model_away")
+    )
+    assert 0.40 <= fav <= 0.60
+
+
+def test_rps_significance_contract() -> None:
+    sig = data.rps_significance(_finished())
+    assert set(sig) >= {"n", "mean_diff", "ci_low", "ci_high", "bootstrap_p", "wilcoxon_p"}
+    assert sig["n"] == 2.0
+    empty = data.load_match_predictions(Settings(data_dir=Path("/nonexistent-xyz")))
+    assert data.rps_significance(empty)["n"] == 0.0
+
+
+def test_bookmaker_comparison_unavailable_without_workbook(tmp_path: Path) -> None:
+    cmp = data.bookmaker_comparison(
+        _finished(), Settings(data_dir=tmp_path / "data"), path=tmp_path / "missing.xlsx"
+    )
+    assert cmp["available"] is False
+    # Market-probability metrics are always stubbed with an explanatory reason.
+    assert cmp["market_rps_skill"] is None
+    assert cmp["roi_vs_closing"] is None
+    assert "closing odds" in cmp["market_prob_reason"]
