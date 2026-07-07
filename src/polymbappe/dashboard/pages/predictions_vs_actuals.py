@@ -63,14 +63,6 @@ def _render_scorecard(st: object, finished: pl.DataFrame) -> None:
     scorecard = data.prediction_scorecard(finished)
     n = int(scorecard["n"])
 
-    mean_p_actual = 0.0
-    if n > 0:
-        total = 0.0
-        for r in finished.iter_rows(named=True):
-            probs = {"home": float(r["model_home"]), "draw": float(r["model_draw"]), "away": float(r["model_away"])}
-            total += probs[str(r["actual_outcome"])]
-        mean_p_actual = total / n
-
     cols = st.columns(4)
     cols[0].metric("Matches scored", n)
     cols[1].metric("Top-pick accuracy", f"{scorecard['accuracy']:.1%}")
@@ -82,9 +74,11 @@ def _render_scorecard(st: object, finished: pl.DataFrame) -> None:
         help="Measures full probability calibration, not just the top pick. Lower is better. Random = 0.222.",
     )
     cols[3].metric(
-        "Avg confidence on result",
-        f"{mean_p_actual:.1%}",
-        help="Mean probability the model assigned to the outcome that actually happened. Random = 33%. Higher is better.",
+        "Brier Score",
+        f"{scorecard['brier_score']:.3f}",
+        delta=f"{(1 - scorecard['brier_score'] / 0.6667) * 100:.0f}% better than random",
+        delta_color="normal",
+        help="Mean squared error over H/D/A probabilities. Lower is better. Random = 0.667.",
     )
 
 

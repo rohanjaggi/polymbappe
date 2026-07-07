@@ -53,9 +53,6 @@ def _render_scorecard(st: object, settings: Settings, match_df: pl.DataFrame) ->
 
     st.subheader("Model Scorecard")
 
-    ko = finished.filter(pl.col("group") == "KO") if "group" in finished.columns else pl.DataFrame()
-    ko_acc = data.prediction_scorecard(ko)["accuracy"] if not ko.is_empty() else None
-
     cols = st.columns(4)
     cols[0].metric("Matches Predicted", n)
     cols[1].metric("Top-Pick Accuracy", f"{scorecard['accuracy']:.0%}")
@@ -67,9 +64,11 @@ def _render_scorecard(st: object, settings: Settings, match_df: pl.DataFrame) ->
         help="Measures full probability calibration, not just the top pick. Lower is better. Random = 0.222.",
     )
     cols[3].metric(
-        "Knockout Accuracy",
-        f"{ko_acc:.0%}" if ko_acc is not None else "—",
-        help="Top-pick accuracy on knockout-stage matches only." if ko_acc is not None else "",
+        "Brier Score",
+        f"{scorecard['brier_score']:.3f}",
+        delta=f"{(1 - scorecard['brier_score'] / 0.6667) * 100:.0f}% better than random",
+        delta_color="normal",
+        help="Mean squared error over H/D/A probabilities. Lower is better. Random = 0.667.",
     )
 
 

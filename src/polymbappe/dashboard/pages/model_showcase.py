@@ -77,7 +77,7 @@ def _render_live_performance(st: object, settings: Settings) -> None:
         (pts_joined["predicted_points"] - pts_joined["points"].cast(pl.Float64)).abs().mean()
     ) if not pts_joined.is_empty() else 0.0
 
-    row1 = st.columns(4)
+    row1 = st.columns(5)
     row1[0].metric(
         "Match prediction accuracy",
         f"{accuracy:.0%}",
@@ -90,15 +90,22 @@ def _render_live_performance(st: object, settings: Settings) -> None:
         delta_color="normal",
         help="RPS measures probabilistic calibration, not just the top pick. Lower is better. A random model scores 0.222.",
     )
+    row1[2].metric(
+        "Brier Score",
+        f"{scorecard['brier_score']:.3f}",
+        delta=f"{(1 - scorecard['brier_score'] / 0.6667) * 100:.0f}% better than random",
+        delta_color="normal",
+        help="Mean squared error over H/D/A probabilities. Lower is better. Random = 0.667.",
+    )
     if ko_sc:
-        row1[2].metric(
+        row1[3].metric(
             "Knockout accuracy",
             f"{ko_sc['accuracy']:.0%}",
             help=f"{int(ko_sc['accuracy'] * ko_sc['n'])}/{int(ko_sc['n'])} knockout matches correctly predicted.",
         )
     else:
-        row1[2].metric("Knockout accuracy", "—")
-    row1[3].metric(
+        row1[3].metric("Knockout accuracy", "—")
+    row1[4].metric(
         "Group points MAE",
         f"{pts_mae:.1f} pts",
         help="Average error in predicted group-stage points per team. Lower is better.",
