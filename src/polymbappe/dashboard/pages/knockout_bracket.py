@@ -158,6 +158,7 @@ def _render_drilldowns(
             continue
         label = _ROUND_LABELS.get(round_name, round_name)
         with st.expander(f"{label} — {slots.height} fixture(s)", expanded=round_name in ("R16", "QF")):
+            st.caption("P(H) / P(A) = advance probability of the first / second team in the fixture.")
             st.dataframe(_slots_table(slots, played), use_container_width=True, hide_index=True)
 
             # Any fixture can be expanded into all the matchups it can still produce.
@@ -187,8 +188,8 @@ def _slots_table(slots: pl.DataFrame, played: dict[frozenset[str], dict[str, obj
                 "Fixture": (
                     f"{a} vs {b}" if _is_concrete(r) else f"{a} vs {b} ({float(r['matchup_prob']):.0%})"
                 ),
-                f"P({a} adv)": f"{float(r['p_a_advance']):.0%}",
-                f"P({b} adv)": f"{float(r['p_b_advance']):.0%}",
+                "P(H)": f"{float(r['p_a_advance']):.0%}",
+                "P(A)": f"{float(r['p_b_advance']):.0%}",
                 "FT": f"{float(r['p_decided_reg']):.0%}",
                 "ET": f"{float(r['p_decided_et']):.0%}",
                 "Pens": f"{float(r['p_decided_pens']):.0%}",
@@ -229,8 +230,8 @@ def _candidates_table(candidates: pl.DataFrame) -> object:
             {
                 "Matchup": f"{a} vs {b}",
                 "Occurs": f"{float(r['matchup_prob']):.0%}",
-                f"P({a} adv)": f"{float(r['p_a_advance']):.0%}",
-                f"P({b} adv)": f"{float(r['p_b_advance']):.0%}",
+                "P(H)": f"{float(r['p_a_advance']):.0%}",
+                "P(A)": f"{float(r['p_b_advance']):.0%}",
                 "FT/ET/Pens": (
                     f"{float(r['p_decided_reg']):.0%} / {float(r['p_decided_et']):.0%} / "
                     f"{float(r['p_decided_pens']):.0%}"
