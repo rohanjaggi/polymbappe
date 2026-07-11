@@ -113,7 +113,8 @@ def _render_knockout_journey(st: object, settings: Settings, team: str) -> None:
         return
 
     results = data.tournament_results(data.load_recorded_results(settings))
-    ko = data.classify_ko_fixtures(match_df, results)
+    schedule = data.load_schedule(settings)
+    ko = data.classify_ko_fixtures(match_df, results, schedule_df=schedule)
     if ko.is_empty() or "stage" not in ko.columns:
         return
 
