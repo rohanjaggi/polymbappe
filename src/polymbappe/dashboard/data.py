@@ -1236,10 +1236,50 @@ def biggest_surprises(finished: pl.DataFrame, *, n: int = 5) -> pl.DataFrame:
     )
 
 
+def _ko_stage_cutoffs(
+    schedule_df: pl.DataFrame | None,
+) -> list[tuple[str, "date"]]:
+    """Return ``(short_label, min_date)`` pairs sorted by date, derived from the schedule.
+
+    Falls back to hardcoded 2026 dates when the schedule is unavailable.
+    """
+
+    import datetime as _dt
+
+    _LABEL_MAP = {
+        "Round of 32": "R32",
+        "Round of 16": "R16",
+        "Quarter-final": "QF",
+        "Semi-final": "SF",
+        "Final": "F",
+    }
+    _FALLBACK: list[tuple[str, _dt.date]] = [
+        ("R32", _dt.date(2026, 6, 28)),
+        ("R16", _dt.date(2026, 7, 4)),
+        ("QF", _dt.date(2026, 7, 9)),
+        ("SF", _dt.date(2026, 7, 14)),
+        ("F", _dt.date(2026, 7, 19)),
+    ]
+
+    if schedule_df is None or schedule_df.is_empty() or "stage" not in schedule_df.columns:
+        return _FALLBACK
+
+    pairs: list[tuple[str, _dt.date]] = []
+    for stage_label, short in _LABEL_MAP.items():
+        sub = schedule_df.filter(pl.col("stage") == stage_label)
+        if not sub.is_empty():
+            pairs.append((short, sub["date"].min()))
+    return sorted(pairs, key=lambda p: p[1]) if pairs else _FALLBACK
+
+
 def classify_ko_fixtures(
-    match_df: pl.DataFrame, results_df: pl.DataFrame
+    match_df: pl.DataFrame,
+    results_df: pl.DataFrame,
+    schedule_df: pl.DataFrame | None = None,
 ) -> pl.DataFrame:
-    """Classify KO entries from match_predictions as R32 or R16 based on result dates.
+    """Classify KO entries from match_predictions by round (R32/R16/QF/SF/F).
+
+    Uses the schedule's date ranges to assign the correct round label.
 
     Returns the KO subset of match_df joined with results, adding columns:
     ``stage, home_goals, away_goals, actual_outcome, model_correct, date``.
@@ -1276,17 +1316,16 @@ def classify_ko_fixtures(
         joined = pl.concat([matched_fwd, reverse_joined], how="diagonal_relaxed")
 
     played = pl.col("home_goals").is_not_null()
-    import datetime as _dt
-    r32_cutoff = _dt.date(2026, 7, 4)
 
-    joined = joined.with_columns(
-        pl.when(~played)
-        .then(pl.lit("upcoming"))
-        .when(pl.col("date") < r32_cutoff)
-        .then(pl.lit("R32"))
-        .otherwise(pl.lit("R16"))
-        .alias("stage")
-    )
+    cutoffs = _ko_stage_cutoffs(schedule_df)
+    # Build a chained when/then from the cutoffs (latest round first so earlier
+    # cutoffs don't shadow later ones).
+    stage_expr = pl.when(~played).then(pl.lit("upcoming"))
+    for short, min_date in reversed(cutoffs):
+        stage_expr = stage_expr.when(pl.col("date") >= pl.lit(min_date)).then(pl.lit(short))
+    stage_expr = stage_expr.otherwise(pl.lit("upcoming"))
+
+    joined = joined.with_columns(stage_expr.alias("stage"))
 
     joined = joined.with_columns(
         pl.when(played)

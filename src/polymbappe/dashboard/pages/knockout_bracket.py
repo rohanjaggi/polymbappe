@@ -256,6 +256,7 @@ def _render_matchup_detail(
             away=b,
         ),
         use_container_width=True,
+        key=f"hda_{a}_{b}_{record['match_number']}",
     )
 
     cols = st.columns(3)
@@ -270,6 +271,7 @@ def _render_matchup_detail(
             float(record["p_decided_pens"]),
         ),
         use_container_width=True,
+        key=f"phase_{a}_{b}_{record['match_number']}",
     )
     st.caption(
         f"Expected scoreline (regulation): {float(record['exp_a_goals']):.2f} – "

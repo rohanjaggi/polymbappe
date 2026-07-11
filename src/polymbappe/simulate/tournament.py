@@ -227,38 +227,45 @@ def build_eliminated_teams(
 ) -> set[str]:
     """Derive the set of teams eliminated from WC 2026 knockout rounds.
 
-    A team that played a knockout match but does not appear in any future scheduled
-    fixture is eliminated. Uses the upcoming schedule (null-score fixtures from the
-    upstream feed) as the source of truth for who is still alive.
+    A team is eliminated when it *lost* a knockout match (the team with fewer goals).
+    Draws (extra-time/penalties where only regulation score is recorded) are left
+    unresolved — both teams stay alive until a decisive result is ingested.
+
+    The knockout phase starts on the first ``Round of 32`` date in *schedule* (falling
+    back to 2026-06-28).  Matches before that date are group-stage regardless of the
+    heuristic ``is_knockout`` flag, which can produce false positives for matchday-3
+    fixtures.
     """
 
     import structlog
 
     logger = structlog.get_logger(__name__)
+
+    # Determine the true knockout start date from the schedule.
+    _ko_start = date(2026, 6, 28)
+    if schedule is not None and not schedule.is_empty() and "stage" in schedule.columns:
+        r32 = schedule.filter(pl.col("stage") == "Round of 32")
+        if not r32.is_empty():
+            _ko_start = r32["date"].min()
+
     ko = matches.filter(
         (pl.col("competition") == "FIFA World Cup")
         & pl.col("is_knockout")
-        & (pl.col("date") >= WC2026_START)
-    )
+        & (pl.col("date") >= _ko_start)
+    ).unique(subset=["home_team", "away_team", "date"])
     if ko.is_empty():
         return set()
 
-    # All teams that have played at least one knockout match.
-    ko_teams = set(ko["home_team"].to_list() + ko["away_team"].to_list())
-
-    # Teams in upcoming scheduled fixtures are still alive.
-    alive_in_schedule: set[str] = set()
-    if schedule is not None and not schedule.is_empty():
-        future = schedule.filter(
-            (pl.col("competition") == "FIFA World Cup")
-            & (pl.col("date") >= WC2026_START)
-        )
-        alive_in_schedule = set(
-            future["home_team"].to_list() + future["away_team"].to_list()
-        )
-
-    # A team is eliminated if it entered the knockout rounds but has no future fixture.
-    eliminated = ko_teams - alive_in_schedule
+    eliminated: set[str] = set()
+    for r in ko.iter_rows(named=True):
+        hg, ag = r.get("home_goals"), r.get("away_goals")
+        if hg is None or ag is None:
+            continue
+        home, away = str(r["home_team"]), str(r["away_team"])
+        if int(hg) > int(ag):
+            eliminated.add(away)
+        elif int(ag) > int(hg):
+            eliminated.add(home)
 
     logger.info("simulate.eliminated_teams", count=len(eliminated), teams=sorted(eliminated))
     return eliminated
@@ -800,9 +807,12 @@ def run_tournament_simulation(
         else None
     )
     # Build the set of teams eliminated from knockout rounds so they can't advance.
-    scheduled_fixtures = _load_scheduled_fixtures(settings, logger)
+    schedule_df = (
+        read_table(Table.SCHEDULE, settings) if table_exists(Table.SCHEDULE, settings)
+        else pl.DataFrame()
+    )
     eliminated_teams = (
-        build_eliminated_teams(matches_df, schedule=scheduled_fixtures)
+        build_eliminated_teams(matches_df, schedule=schedule_df)
         if not matches_df.is_empty()
         else None
     )
@@ -843,10 +853,6 @@ def run_tournament_simulation(
     # locks results already played, so future rounds are projected from the current bracket.
     from polymbappe.simulate.knockout_bracket import compute_knockout_bracket
 
-    schedule_df = (
-        read_table(Table.SCHEDULE, settings) if table_exists(Table.SCHEDULE, settings)
-        else pl.DataFrame()
-    )
     compute_knockout_bracket(schedule_df, matches_df, model, structure).write_parquet(
         out / "knockout_bracket.parquet"
     )

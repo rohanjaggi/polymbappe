@@ -98,7 +98,8 @@ def _render_r32(st: object, settings: Settings) -> None:
         return
 
     results = data.tournament_results(data.load_recorded_results(settings))
-    ko = data.classify_ko_fixtures(match_df, results)
+    schedule = data.load_schedule(settings)
+    ko = data.classify_ko_fixtures(match_df, results, schedule_df=schedule)
     if ko.is_empty():
         st.info("No knockout predictions yet.")
         return
@@ -135,7 +136,7 @@ def _render_r16(st: object, settings: Settings) -> None:
     schedule_df = data.load_schedule(settings)
 
     # Show played R16 matches from predictions
-    ko = data.classify_ko_fixtures(match_df, results) if not match_df.is_empty() else pl.DataFrame()
+    ko = data.classify_ko_fixtures(match_df, results, schedule_df=schedule_df) if not match_df.is_empty() else pl.DataFrame()
     r16_played = ko.filter(pl.col("stage") == "R16") if not ko.is_empty() and "stage" in ko.columns else pl.DataFrame()
 
     if not r16_played.is_empty():
@@ -188,7 +189,7 @@ def _render_bracket_stage(
     match_df = data.load_match_predictions(settings)
     results = data.tournament_results(data.load_recorded_results(settings))
 
-    ko = data.classify_ko_fixtures(match_df, results) if not match_df.is_empty() else pl.DataFrame()
+    ko = data.classify_ko_fixtures(match_df, results, schedule_df=schedule_df) if not match_df.is_empty() else pl.DataFrame()
 
     if not schedule_df.is_empty():
         bracket = data.resolve_bracket(schedule_df, ko, data.load_group_probabilities(settings), match_df, stage_probs=data.load_stage_probabilities(settings))
@@ -222,7 +223,7 @@ def _render_final(st: object, settings: Settings) -> None:
     match_df = data.load_match_predictions(settings)
     results = data.tournament_results(data.load_recorded_results(settings))
 
-    ko = data.classify_ko_fixtures(match_df, results) if not match_df.is_empty() else pl.DataFrame()
+    ko = data.classify_ko_fixtures(match_df, results, schedule_df=schedule_df) if not match_df.is_empty() else pl.DataFrame()
 
     if not schedule_df.is_empty():
         bracket = data.resolve_bracket(schedule_df, ko, data.load_group_probabilities(settings), match_df, stage_probs=data.load_stage_probabilities(settings))

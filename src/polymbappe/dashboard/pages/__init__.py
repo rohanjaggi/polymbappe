@@ -9,10 +9,8 @@ its page.
 3. :mod:`polymbappe.dashboard.pages.match_predictor` — Match Predictor
 4. :mod:`polymbappe.dashboard.pages.knockout_bracket` — Knockout Bracket
 5. :mod:`polymbappe.dashboard.pages.predictions_vs_actuals` — Predictions vs Actuals
-6. :mod:`polymbappe.dashboard.pages.market_edges` — Market Edges
-7. :mod:`polymbappe.dashboard.pages.upset_watch` — Upset Watch
-8. :mod:`polymbappe.dashboard.pages.model_showcase` — Model Showcase
-9. :mod:`polymbappe.dashboard.pages.agent_activity` — Agent Activity
+6. :mod:`polymbappe.dashboard.pages.upset_watch` — Upset Watch
+7. :mod:`polymbappe.dashboard.pages.model_showcase` — Model Showcase
 """
 
 from __future__ import annotations
