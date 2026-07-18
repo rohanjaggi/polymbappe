@@ -147,6 +147,27 @@ def knockout_home_winprob(
     return rh + rd * (eh + ed * p_pen)
 
 
+def beyond_regulation_home_winprob(
+    matrix_et: np.ndarray,
+    home_pen_rate: float = 0.5,
+    away_pen_rate: float = 0.5,
+    first_shooter_home: bool = True,
+    edge: float = DEFAULT_FIRST_SHOOTER_EDGE,
+) -> float:
+    """P(home advances | the tie was level after 90').
+
+    The conditional continuation of :func:`knockout_home_winprob`: extra time decides with
+    the ET score matrix, a still-level tie goes to the shootout. Used when a *played* tie's
+    feed scoreline is a draw (extra-time/penalties) but the actual winner isn't inferrable
+    yet — the forecast must not re-include regulation, which is already known to have ended
+    level.
+    """
+
+    eh, ed, _ = _hda(matrix_et)
+    p_pen = penalty_home_winprob(home_pen_rate, away_pen_rate, first_shooter_home, edge)
+    return eh + ed * p_pen
+
+
 @dataclass(slots=True)
 class KnockoutBreakdown:
     """Decomposition of a knockout tie into advance and phase-decided probabilities.

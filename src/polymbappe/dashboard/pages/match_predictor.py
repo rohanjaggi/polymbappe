@@ -1,8 +1,8 @@
 """Page 2 — Match Predictor.
 
 Six tabs covering every tournament stage: Group Stage, R32, R16, QF, SF, Final.
-Group and R32 show predictions with actual results. R16 shows played + upcoming.
-QF/SF/Final show bracket structure with stage probabilities.
+Every knockout tab shows played fixtures (model predictions vs actual results)
+plus upcoming fixtures resolved from the bracket, with advancement probabilities.
 """
 
 from __future__ import annotations
@@ -43,9 +43,9 @@ def render(settings: Settings) -> None:
     with tabs[2]:
         _render_r16(st, settings)
     with tabs[3]:
-        _render_bracket_stage(st, settings, "Quarter-final", "QF")
+        _render_bracket_stage(st, settings, "Quarter-final", "QF", "QF")
     with tabs[4]:
-        _render_bracket_stage(st, settings, "Semi-final", "SF")
+        _render_bracket_stage(st, settings, "Semi-final", "SF", "SF")
     with tabs[5]:
         _render_final(st, settings)
 
@@ -136,34 +136,32 @@ def _render_r16(st: object, settings: Settings) -> None:
     schedule_df = data.load_schedule(settings)
 
     # Show played R16 matches from predictions
-    ko = data.classify_ko_fixtures(match_df, results, schedule_df=schedule_df) if not match_df.is_empty() else pl.DataFrame()
-    r16_played = ko.filter(pl.col("stage") == "R16") if not ko.is_empty() and "stage" in ko.columns else pl.DataFrame()
-
-    if not r16_played.is_empty():
-        st.caption("Played Round of 16 fixtures with predictions and results.")
-        played_with_result = r16_played.filter(pl.col("model_correct").is_not_null())
-        if not played_with_result.is_empty():
-            hits = int(played_with_result["model_correct"].sum())
-            st.metric("Model top-pick accuracy (R16)", f"{hits}/{played_with_result.height}")
-
-        st.dataframe(_ko_table(r16_played), use_container_width=True, hide_index=True)
-
-        labels = [_fixture_label(r) for r in r16_played.iter_rows(named=True)]
-        if labels:
-            choice = st.selectbox("Inspect a R16 fixture", labels, key="r16_fixture")
-            record = r16_played.row(labels.index(choice), named=True)
-            _render_fixture_detail(st, record, finished=record.get("model_correct") is not None)
+    ko = (
+        data.classify_ko_fixtures(match_df, results, schedule_df=schedule_df)
+        if not match_df.is_empty()
+        else pl.DataFrame()
+    )
+    _render_played_stage(st, ko, "R16", "Round of 16 fixtures")
 
     # Show upcoming R16 matches from bracket resolution
     if not schedule_df.is_empty():
-        bracket = data.resolve_bracket(schedule_df, ko, data.load_group_probabilities(settings), match_df, stage_probs=data.load_stage_probabilities(settings))
+        bracket = data.resolve_bracket(
+            schedule_df,
+            ko,
+            data.load_group_probabilities(settings),
+            match_df,
+            stage_probs=stage_df,
+        )
         r16_bracket = bracket.filter(pl.col("stage") == "Round of 16")
         upcoming = r16_bracket.filter(pl.col("status") != "played")
 
         if not upcoming.is_empty():
             st.subheader("Upcoming R16 Fixtures")
-            st.caption("Teams resolved from the R32 bracket. Some slots may show 'TBD' for unresolved R32 draws.")
-            _render_bracket_table(st, upcoming, stage_df, "R16", full_bracket=bracket)
+            st.caption(
+                "Teams resolved from the R32 bracket."
+                " Some slots may show 'TBD' for unresolved R32 draws."
+            )
+            _render_bracket_table(st, upcoming, stage_df, full_bracket=bracket)
 
     # Stage probabilities
     if not stage_df.is_empty():
@@ -182,22 +180,39 @@ def _render_r16(st: object, settings: Settings) -> None:
 # ---------------------------------------------------------------------------
 
 def _render_bracket_stage(
-    st: object, settings: Settings, schedule_stage: str, prob_col: str
+    st: object, settings: Settings, schedule_stage: str, prob_col: str, ko_stage: str
 ) -> None:
     stage_df = data.load_stage_probabilities(settings)
     schedule_df = data.load_schedule(settings)
     match_df = data.load_match_predictions(settings)
     results = data.tournament_results(data.load_recorded_results(settings))
 
-    ko = data.classify_ko_fixtures(match_df, results, schedule_df=schedule_df) if not match_df.is_empty() else pl.DataFrame()
+    ko = (
+        data.classify_ko_fixtures(match_df, results, schedule_df=schedule_df)
+        if not match_df.is_empty()
+        else pl.DataFrame()
+    )
+
+    _render_played_stage(st, ko, ko_stage, f"{schedule_stage}s")
 
     if not schedule_df.is_empty():
-        bracket = data.resolve_bracket(schedule_df, ko, data.load_group_probabilities(settings), match_df, stage_probs=data.load_stage_probabilities(settings))
-        stage_matches = bracket.filter(pl.col("stage") == schedule_stage)
-
-        if not stage_matches.is_empty():
-            st.caption(f"Bracket structure for the {schedule_stage}s. Teams are resolved from prior round results.")
-            _render_bracket_table(st, stage_matches, stage_df, prob_col, full_bracket=bracket)
+        bracket = data.resolve_bracket(
+            schedule_df,
+            ko,
+            data.load_group_probabilities(settings),
+            match_df,
+            stage_probs=stage_df,
+        )
+        upcoming = bracket.filter(
+            (pl.col("stage") == schedule_stage) & (pl.col("status") != "played")
+        )
+        if not upcoming.is_empty():
+            st.subheader(f"Upcoming {schedule_stage} Fixtures")
+            st.caption(
+                "Teams are resolved from prior round results;"
+                " unresolved slots list their possible occupants."
+            )
+            _render_bracket_table(st, upcoming, stage_df, full_bracket=bracket)
 
     if not stage_df.is_empty():
         st.subheader(f"Most Likely to Reach {schedule_stage}s")
@@ -213,6 +228,29 @@ def _render_bracket_stage(
             st.info(f"No teams with >{prob_col} probability > 0.")
 
 
+def _render_played_stage(st: object, ko: pl.DataFrame, ko_stage: str, label: str) -> None:
+    """Played fixtures for one knockout round: accuracy metric, table, inspector."""
+
+    if ko.is_empty() or "stage" not in ko.columns:
+        return
+    played = ko.filter(pl.col("stage") == ko_stage)
+    if played.is_empty():
+        return
+
+    st.caption(f"Played {label} with model predictions and actual results.")
+    with_result = played.filter(pl.col("model_correct").is_not_null())
+    if not with_result.is_empty():
+        hits = int(with_result["model_correct"].sum())
+        st.metric(f"Model top-pick accuracy ({ko_stage})", f"{hits}/{with_result.height}")
+
+    st.dataframe(_ko_table(played), use_container_width=True, hide_index=True)
+
+    labels = [_fixture_label(r) for r in played.iter_rows(named=True)]
+    choice = st.selectbox("Inspect a fixture", labels, key=f"{ko_stage.lower()}_fixture")
+    record = played.row(labels.index(choice), named=True)
+    _render_fixture_detail(st, record, finished=record.get("model_correct") is not None)
+
+
 # ---------------------------------------------------------------------------
 # Final
 # ---------------------------------------------------------------------------
@@ -223,16 +261,30 @@ def _render_final(st: object, settings: Settings) -> None:
     match_df = data.load_match_predictions(settings)
     results = data.tournament_results(data.load_recorded_results(settings))
 
-    ko = data.classify_ko_fixtures(match_df, results, schedule_df=schedule_df) if not match_df.is_empty() else pl.DataFrame()
+    ko = (
+        data.classify_ko_fixtures(match_df, results, schedule_df=schedule_df)
+        if not match_df.is_empty()
+        else pl.DataFrame()
+    )
+
+    _render_played_stage(st, ko, "F", "Final")
+    _render_played_stage(st, ko, "TP", "Third-place match")
 
     if not schedule_df.is_empty():
-        bracket = data.resolve_bracket(schedule_df, ko, data.load_group_probabilities(settings), match_df, stage_probs=data.load_stage_probabilities(settings))
-        final_matches = bracket.filter(
-            (pl.col("stage") == "Final") | (pl.col("stage") == "Match for third place")
+        bracket = data.resolve_bracket(
+            schedule_df,
+            ko,
+            data.load_group_probabilities(settings),
+            match_df,
+            stage_probs=stage_df,
         )
-        if not final_matches.is_empty():
+        upcoming = bracket.filter(
+            pl.col("stage").is_in(["Final", "Match for third place"])
+            & (pl.col("status") != "played")
+        )
+        if not upcoming.is_empty():
             st.caption("Final and third-place match bracket slots.")
-            _render_bracket_table(st, final_matches, stage_df, "FINAL", full_bracket=bracket)
+            _render_bracket_table(st, upcoming, stage_df, full_bracket=bracket)
 
     if not stage_df.is_empty():
         st.subheader("Championship Probabilities")
@@ -250,19 +302,39 @@ def _render_final(st: object, settings: Settings) -> None:
 # Shared helpers
 # ---------------------------------------------------------------------------
 
+#: Stage-probability column giving P(team advances past a match at this stage).
+_ADVANCE_COL = {
+    "Round of 32": "R16",
+    "Round of 16": "QF",
+    "Quarter-final": "SF",
+    "Semi-final": "FINAL",
+    "Final": "champion",
+}
+
+
 def _render_bracket_table(
     st: object,
     bracket_df: pl.DataFrame,
     stage_df: pl.DataFrame,
-    prob_col: str,
     full_bracket: pl.DataFrame | None = None,
 ) -> None:
-    """Render a bracket-stage table with resolved teams and advancement probabilities."""
+    """Render a bracket-stage table with resolved teams and advancement probabilities.
 
-    prob_map: dict[str, float] = {}
-    if not stage_df.is_empty() and prob_col in stage_df.columns:
+    "Advance %" is the probability of surviving *this* match, i.e. of reaching the
+    next stage (winning it, for the final) — not of having reached the current one.
+    """
+
+    prob_rows: dict[str, dict[str, object]] = {}
+    if not stage_df.is_empty():
         for r in stage_df.iter_rows(named=True):
-            prob_map[str(r["team"])] = float(r[prob_col])
+            prob_rows[str(r["team"])] = r
+
+    def _advance_prob(team: str, stage: str) -> str:
+        col = _ADVANCE_COL.get(stage)
+        row = prob_rows.get(team)
+        if col is None or row is None or col not in row:
+            return "—"
+        return f"{float(row[col]):.0%}"
 
     match_teams: dict[int, tuple[str, str]] = {}
     if full_bracket is not None:
@@ -297,8 +369,9 @@ def _render_bracket_table(
 
     rows = []
     for r in bracket_df.iter_rows(named=True):
-        h = r.get("home_resolved") or _resolve_code(r.get("home_code", "TBD"))
-        a = r.get("away_resolved") or _resolve_code(r.get("away_code", "TBD"))
+        h = r.get("home_resolved") or _resolve_code(r.get("home_code") or "TBD")
+        a = r.get("away_resolved") or _resolve_code(r.get("away_code") or "TBD")
+        stage = str(r.get("stage", ""))
         h_is_team = "/" not in str(h) and str(h) != "TBD"
         a_is_team = "/" not in str(a) and str(a) != "TBD"
         rows.append({
@@ -306,8 +379,8 @@ def _render_bracket_table(
             "City": _short_city(str(r["city"])),
             "Home": str(h) if h else "TBD",
             "Away": str(a) if a else "TBD",
-            f"Home Advance %": f"{prob_map.get(str(h), 0):.0%}" if h_is_team else "—",
-            f"Away Advance %": f"{prob_map.get(str(a), 0):.0%}" if a_is_team else "—",
+            "Home Advance %": _advance_prob(str(h), stage) if h_is_team else "—",
+            "Away Advance %": _advance_prob(str(a), stage) if a_is_team else "—",
             "Status": str(r.get("status", "tbd")).title(),
         })
 
@@ -390,7 +463,10 @@ def _ko_table(view: pl.DataFrame) -> object:
                 f"{int(r['home_goals'])} – {int(r['away_goals'])}"
                 if r.get("home_goals") is not None else "—"
             ),
-            "Result": _outcome_label(r, actual_key) if has_result else "—",
+            "Result": (
+                ("Draw (ET/pens)" if actual_key == "draw" else _outcome_label(r, actual_key))
+                if has_result else "—"
+            ),
             "Correct": ("Yes" if r["model_correct"] else "No") if has_result else "Pending",
         })
     return pl.DataFrame(rows).to_pandas()

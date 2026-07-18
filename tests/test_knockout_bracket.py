@@ -50,7 +50,9 @@ def _no_results() -> pl.DataFrame:
 
 def test_bracket_schema_and_probability_partitions() -> None:
     teams = ["A", "B", "C", "D"]
-    df = compute_knockout_bracket(_mini_schedule(), _no_results(), _model(teams), TournamentStructure(groups={}))
+    df = compute_knockout_bracket(
+        _mini_schedule(), _no_results(), _model(teams), TournamentStructure(groups={})
+    )
 
     assert df.columns == list(BRACKET_SCHEMA.keys())
     # R16 fixtures are concrete (one matchup each, prob 1); the QF fans out into 2x2 = 4.
@@ -69,7 +71,9 @@ def test_bracket_schema_and_probability_partitions() -> None:
 
 def test_bracket_most_likely_qf_pairs_favourites() -> None:
     teams = ["A", "B", "C", "D"]  # A strongest, D weakest
-    df = compute_knockout_bracket(_mini_schedule(), _no_results(), _model(teams), TournamentStructure(groups={}))
+    df = compute_knockout_bracket(
+        _mini_schedule(), _no_results(), _model(teams), TournamentStructure(groups={})
+    )
     qf = df.filter(pl.col("round") == "QF").sort("rank")
     top = qf.row(0, named=True)
     # The likeliest QF is the two R16 favourites: A (beats B) vs C (beats D).
@@ -87,7 +91,9 @@ def test_bracket_locks_played_results() -> None:
         },
         schema_overrides={"group": pl.Utf8},
     )
-    df = compute_knockout_bracket(_mini_schedule(), results, _model(teams), TournamentStructure(groups={}))
+    df = compute_knockout_bracket(
+        _mini_schedule(), results, _model(teams), TournamentStructure(groups={})
+    )
     qf = df.filter(pl.col("round") == "QF")
     # B won its R16 (2-0 upset), so every possible QF now has B on one side.
     assert all("B" in {r["team_a"], r["team_b"]} for r in qf.iter_rows(named=True))
@@ -102,3 +108,90 @@ def test_bracket_empty_schedule_returns_typed_empty() -> None:
     )
     assert df.is_empty()
     assert df.columns == list(BRACKET_SCHEMA.keys())
+
+
+def test_bracket_drawn_tie_with_later_evidence_locks_inferred_winner() -> None:
+    teams = ["A", "B", "C", "D"]
+    results = pl.DataFrame(
+        {
+            "match_id": ["m1", "qf"], "date": [date(2026, 7, 4), date(2026, 7, 9)],
+            "home_team": ["A", "B"], "away_team": ["B", "C"],
+            "home_goals": [1, 2], "away_goals": [1, 0],
+            "competition": ["FIFA World Cup"] * 2, "is_knockout": [True] * 2,
+            "neutral_site": [True] * 2, "group": [None] * 2,
+        },
+        schema_overrides={"group": pl.Utf8},
+    )
+    df = compute_knockout_bracket(
+        _mini_schedule(), results, _model(teams), TournamentStructure(groups={})
+    )
+    # B appearing in the played QF proves B won the drawn R16 on penalties.
+    m1 = df.filter(pl.col("match_number") == 89)
+    assert m1.height == 1
+    row = m1.row(0, named=True)
+    assert {row["team_a"], row["team_b"]} == {"A", "B"}
+    winner_side = "p_a_advance" if row["team_a"] == "B" else "p_b_advance"
+    assert row[winner_side] == 1.0
+
+
+def test_bracket_unresolved_draw_emits_beyond_regulation_split() -> None:
+    teams = ["A", "B", "C", "D"]
+    results = pl.DataFrame(
+        {
+            "match_id": ["m1"], "date": [date(2026, 7, 4)],
+            "home_team": ["A"], "away_team": ["B"], "home_goals": [1], "away_goals": [1],
+            "competition": ["FIFA World Cup"], "is_knockout": [True],
+            "neutral_site": [True], "group": [None],
+        },
+        schema_overrides={"group": pl.Utf8},
+    )
+    df = compute_knockout_bracket(
+        _mini_schedule(), results, _model(teams), TournamentStructure(groups={})
+    )
+    m1 = df.filter(pl.col("match_number") == 89).row(0, named=True)
+    # Regulation is known to have ended level: only ET/pens remain in the phase split.
+    assert m1["p_decided_reg"] == 0.0
+    assert abs(m1["p_decided_et"] + m1["p_decided_pens"] - 1.0) < 1e-9
+    assert 0.0 < m1["p_a_advance"] < 1.0
+    # Both teams stay possible occupants of the QF, weighted by the conditional split.
+    qf = df.filter(pl.col("match_number") == 97)
+    occupants = set(qf["team_a"].to_list()) | set(qf["team_b"].to_list())
+    assert {"A", "B"} <= occupants
+
+
+def test_bracket_resolves_position_placeholders_from_complete_groups() -> None:
+    teams = ["W", "X", "Y", "Z"]
+    structure = TournamentStructure(groups={"A": teams})
+    pairs = [("W", "X"), ("W", "Y"), ("W", "Z"), ("X", "Y"), ("X", "Z"), ("Y", "Z")]
+    results = pl.DataFrame(
+        {
+            "match_id": [f"g{i}" for i in range(6)],
+            "date": [date(2026, 6, 15)] * 6,
+            "home_team": [h for h, _ in pairs],
+            "away_team": [a for _, a in pairs],
+            # W wins all, X beats Y/Z, Y beats Z: table order is W, X, Y, Z.
+            "home_goals": [2, 2, 2, 2, 2, 2],
+            "away_goals": [0, 0, 0, 0, 0, 0],
+            "competition": ["FIFA World Cup"] * 6,
+            "is_knockout": [False] * 6,
+            "neutral_site": [True] * 6,
+            "group": [None] * 6,
+        },
+        schema_overrides={"group": pl.Utf8},
+    )
+    schedule = pl.DataFrame(
+        {
+            "match_id": ["r32"],
+            "date": [date(2026, 6, 28)],
+            "stage": ["Round of 32"],
+            "group": [None],
+            "home_team": ["1A"],
+            "away_team": ["2A"],
+            "city": [None],
+        },
+        schema_overrides={"group": pl.Utf8, "city": pl.Utf8},
+    )
+    df = compute_knockout_bracket(schedule, results, _model(teams), structure)
+    row = df.row(0, named=True)
+    # Placeholders resolve to the real group standings, not literal "1A"/"2A" teams.
+    assert (row["team_a"], row["team_b"]) == ("W", "X")

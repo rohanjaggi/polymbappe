@@ -30,6 +30,16 @@ def read_parquet(path: Path) -> pl.DataFrame:
     return pl.read_parquet(path)
 
 
+# Natural keys used to de-duplicate append-mode writes. A re-ingested row whose key
+# already exists REPLACES the stored row (newest wins) — e.g. a match whose inferred
+# ``is_knockout`` flag flipped, or a refreshed odds quote — instead of accumulating
+# near-duplicate full rows that fan out every downstream join.
+_APPEND_KEYS: dict[Table, tuple[str, ...]] = {
+    Table.MATCHES: ("match_id",),
+    Table.MARKET_ODDS: ("match_id", "source"),
+}
+
+
 def write_table(
     table: Table, df: pl.DataFrame, *, mode: str = "overwrite", settings: Settings | None = None
 ) -> Path:
@@ -39,7 +49,9 @@ def write_table(
         table: Canonical table to write.
         df: Normalized frame.
         mode: ``"overwrite"`` (default) or ``"append"``. Append concatenates with the
-            existing table (if any), then de-duplicates on identical rows.
+            existing table (if any), then de-duplicates on the table's natural key
+            (see ``_APPEND_KEYS``, newest row wins) or on identical full rows for
+            tables without one.
         settings: Optional settings override (path resolution).
 
     Returns:
@@ -49,7 +61,12 @@ def write_table(
     path = table_path(table, settings)
     if mode == "append" and path.exists():
         existing = pl.read_parquet(path)
-        df = pl.concat([existing, df.select(existing.columns)], how="vertical").unique()
+        combined = pl.concat([existing, df.select(existing.columns)], how="vertical")
+        keys = _APPEND_KEYS.get(table)
+        if keys is not None:
+            df = combined.unique(subset=list(keys), keep="last", maintain_order=True)
+        else:
+            df = combined.unique(maintain_order=True)
     elif mode not in {"overwrite", "append"}:
         raise ValueError(f"Unknown write mode: {mode!r}")
     write_parquet(df, path)

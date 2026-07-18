@@ -53,6 +53,10 @@ _KNOCKOUT_COMPETITIONS: frozenset[str] = frozenset(
     {"FIFA World Cup", "UEFA Euro", "Copa América"}
 )
 
+#: First day of the 2026 World Cup — scopes the ``wc2026_ko_start`` override in
+#: :func:`normalize_kaggle_results` to the 2026 edition only.
+_WC2026_START = date(2026, 6, 11)
+
 
 def infer_knockout_stage(matches: pl.DataFrame) -> pl.Series:
     """Infer a per-row ``is_knockout`` flag for major-tournament matches.
@@ -134,12 +138,19 @@ def infer_knockout_stage(matches: pl.DataFrame) -> pl.Series:
     return flags.get_column("_knockout").rename("is_knockout")
 
 
-def normalize_kaggle_results(raw: pl.DataFrame) -> pl.DataFrame:
+def normalize_kaggle_results(
+    raw: pl.DataFrame, *, wc2026_ko_start: date | None = None
+) -> pl.DataFrame:
     """Normalize the Kaggle international results CSV into the ``matches`` schema.
 
     Drops unplayed fixtures (null scores) and coerces types. The source carries no stage
     metadata, so ``is_knockout`` is inferred structurally for the major tournaments by
     :func:`infer_knockout_stage`; ``group`` is left null (no group labels in the feed).
+
+    ``wc2026_ko_start`` (the first Round-of-32 date from the ingested schedule) overrides
+    the heuristic for WC 2026 rows: group stage and knockout rounds don't overlap in the
+    2026 calendar, so ``date >= wc2026_ko_start`` is exact — unlike the structural
+    heuristic, which mislabels matchday-3 fixtures while the tournament is in progress.
     """
 
     present = {k: v for k, v in _KAGGLE_RENAME.items() if k in raw.columns}
@@ -171,6 +182,16 @@ def normalize_kaggle_results(raw: pl.DataFrame) -> pl.DataFrame:
         pl.lit(None, dtype=pl.Utf8).alias("group"),
     )
     df = df.with_columns(infer_knockout_stage(df))
+    if wc2026_ko_start is not None:
+        df = df.with_columns(
+            pl.when(
+                (pl.col("competition") == "FIFA World Cup")
+                & (pl.col("date") >= pl.lit(_WC2026_START))
+            )
+            .then(pl.col("date") >= pl.lit(wc2026_ko_start))
+            .otherwise(pl.col("is_knockout"))
+            .alias("is_knockout")
+        )
 
     # ``city`` / ``country`` are the match venue, carried straight from the feed (they are the
     # per-match venue signal the travel feature backfills against). Absent columns are filled
@@ -685,6 +706,9 @@ def normalize_openfootball_schedule(matches: list[dict[str, object]]) -> pl.Data
             "home_team": str(m.get("team1") or "").strip(),
             "away_team": str(m.get("team2") or "").strip(),
             "city": str(m.get("ground") or "").strip(),
+            # Official FIFA match number (73-104 for the knockout tree). It disambiguates
+            # same-date fixtures when wiring W##/L## placeholders; group fixtures may omit it.
+            "match_number": int(m["num"]) if m.get("num") is not None else None,
         }
         for m in matches
     ]
@@ -697,6 +721,7 @@ def normalize_openfootball_schedule(matches: list[dict[str, object]]) -> pl.Data
             "home_team": pl.Utf8,
             "away_team": pl.Utf8,
             "city": pl.Utf8,
+            "match_number": pl.Int32,
         },
     )
     if df.is_empty():

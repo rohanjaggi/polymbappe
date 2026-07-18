@@ -29,7 +29,9 @@ def elo_win_prob(elo_home: float, elo_away: float, home_advantage: float = 65.0)
     return 1.0 / (1.0 + 10 ** (-diff / 400.0))
 
 
-def elo_to_hda(elo_home: float, elo_away: float, neutral: bool = False) -> tuple[float, float, float]:
+def elo_to_hda(
+    elo_home: float, elo_away: float, neutral: bool = False
+) -> tuple[float, float, float]:
     """Convert Elo ratings to (home, draw, away) probabilities.
 
     Uses the empirical draw rate model: draw probability peaks for evenly
@@ -68,7 +70,6 @@ def main() -> None:
 
     settings = Settings()
     matches = read_table(Table.MATCHES, settings)
-    elo_snaps = build_elo_snapshots(matches)
 
     rows: list[dict[str, object]] = []
     for tournament in DEFAULT_TOURNAMENTS:

@@ -87,7 +87,9 @@ def _played_lookup(results: pl.DataFrame) -> dict[frozenset[str], dict[str, obje
     return lookup
 
 
-def _result_for(played: dict[frozenset[str], dict[str, object]], a: str, b: str) -> dict[str, object] | None:
+def _result_for(
+    played: dict[frozenset[str], dict[str, object]], a: str, b: str
+) -> dict[str, object] | None:
     return played.get(frozenset((a, b)))
 
 
@@ -107,7 +109,9 @@ def _is_concrete(row: dict[str, object]) -> bool:
 # -- bracket tree -------------------------------------------------------------
 
 
-def _render_tree(st: object, bracket: pl.DataFrame, played: dict[frozenset[str], dict[str, object]]) -> None:
+def _render_tree(
+    st: object, bracket: pl.DataFrame, played: dict[frozenset[str], dict[str, object]]
+) -> None:
     """Bracket-style tree: one column per round, one card per real fixture/slot in bracket order."""
 
     st.subheader("Bracket")
@@ -157,8 +161,11 @@ def _render_drilldowns(
         if slots.is_empty():
             continue
         label = _ROUND_LABELS.get(round_name, round_name)
-        with st.expander(f"{label} — {slots.height} fixture(s)", expanded=round_name in ("R16", "QF")):
-            st.caption("P(H) / P(A) = advance probability of the first / second team in the fixture.")
+        expanded = round_name in ("R16", "QF")
+        with st.expander(f"{label} — {slots.height} fixture(s)", expanded=expanded):
+            st.caption(
+                "P(H) / P(A) = advance probability of the first / second team in the fixture."
+            )
             st.dataframe(_slots_table(slots, played), use_container_width=True, hide_index=True)
 
             # Any fixture can be expanded into all the matchups it can still produce.
@@ -186,7 +193,9 @@ def _slots_table(slots: pl.DataFrame, played: dict[frozenset[str], dict[str, obj
         rows.append(
             {
                 "Fixture": (
-                    f"{a} vs {b}" if _is_concrete(r) else f"{a} vs {b} ({float(r['matchup_prob']):.0%})"
+                    f"{a} vs {b}"
+                    if _is_concrete(r)
+                    else f"{a} vs {b} ({float(r['matchup_prob']):.0%})"
                 ),
                 "P(H)": f"{float(r['p_a_advance']):.0%}",
                 "P(A)": f"{float(r['p_b_advance']):.0%}",

@@ -404,3 +404,42 @@ def test_normalize_kaggle_results_preserves_city_country() -> None:
     row = out.row(0, named=True)
     assert row["city"] == "São Paulo"  # kept verbatim (accent-folded only at lookup time)
     assert row["country"] == "Brazil"
+
+
+def test_normalize_kaggle_results_wc2026_ko_start_overrides_heuristic() -> None:
+    """The schedule-derived KO start date labels WC2026 rows exactly, both directions:
+    a matchday-3 false positive is cleared and an R32 false negative is set. Non-2026
+    rows keep the structural heuristic's output."""
+
+    raw = pl.DataFrame(
+        {
+            "date": ["2026-06-25", "2026-06-29", "2018-06-15"],
+            "home_team": ["Japan", "Germany", "Portugal"],
+            "away_team": ["Sweden", "Paraguay", "Spain"],
+            "home_score": [1, 1, 3],
+            "away_score": [0, 1, 3],
+            "tournament": ["FIFA World Cup"] * 3,
+            "city": ["Arlington"] * 3,
+            "country": ["United States"] * 3,
+            "neutral": [True] * 3,
+        }
+    )
+    out = normalize_kaggle_results(raw, wc2026_ko_start=date(2026, 6, 28))
+    flags = dict(zip(out["date"].to_list(), out["is_knockout"].to_list(), strict=True))
+    assert flags[date(2026, 6, 25)] is False  # group stage regardless of heuristic
+    assert flags[date(2026, 6, 29)] is True  # on/after KO start -> knockout
+    assert flags[date(2018, 6, 15)] is False  # pre-2026 rows untouched by the override
+
+
+def test_normalize_openfootball_schedule_carries_match_number() -> None:
+    matches = [
+        {"round": "Matchday 1", "date": "2026-06-11", "team1": "Mexico",
+         "team2": "South Africa", "group": "Group A", "ground": "Mexico City"},
+        {"round": "Round of 32", "date": "2026-06-28", "team1": "2A", "team2": "2B",
+         "ground": "Los Angeles (Inglewood)", "num": 73},
+    ]
+    sched = normalize_openfootball_schedule(matches)
+    assert "match_number" in sched.columns
+    by_stage = {r["stage"]: r["match_number"] for r in sched.iter_rows(named=True)}
+    assert by_stage["Round of 32"] == 73
+    assert by_stage["Matchday 1"] is None  # group fixtures carry no number

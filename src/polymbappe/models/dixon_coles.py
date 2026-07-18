@@ -192,7 +192,10 @@ class DixonColesModel(MatchModel):
         # Weights: time decay * competition weight * confederation weight.
         days_ago = np.array([m.days_ago for m in matches], dtype=np.float64)
         comp_weight = np.array(
-            [1.0 if _is_competitive(m.competition) else self.config.friendly_weight for m in matches],
+            [
+                1.0 if _is_competitive(m.competition) else self.config.friendly_weight
+                for m in matches
+            ],
             dtype=np.float64,
         )
         # Fix 2: downweight AFC-vs-AFC WC qualification matches.  Asian qualifiers
@@ -331,7 +334,9 @@ class DixonColesModel(MatchModel):
             np.add.at(grad_defense, home_idx, d_mu_total)
             grad[n_teams - 1 : 2 * (n_teams - 1)] = grad_defense[:-1] - grad_defense[-1]
             if l2_defense > 0.0:
-                grad[n_teams - 1 : 2 * (n_teams - 1)] += 2.0 * l2_defense * (defense[:-1] - defense[-1])
+                grad[n_teams - 1 : 2 * (n_teams - 1)] += (
+                    2.0 * l2_defense * (defense[:-1] - defense[-1])
+                )
 
             # Home advantage: lam depends on it (non-neutral only)
             grad[-2] = float(np.sum(d_lam_total * (~neutral)))

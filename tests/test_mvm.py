@@ -339,6 +339,12 @@ def test_compute_tournament_base_probs() -> None:
 def test_leave_one_tournament_out_runs_and_scores() -> None:
     result = run_leave_one_tournament_out(_make_matches(), TOURNAMENTS)
     assert set(result.per_tournament) == {"WC2016", "EU2018", "CA2020"}
+    tier1 = [
+        f"{side}_{stat}_{window}"
+        for side in ("home", "away")
+        for window in (5, 10)
+        for stat in ("gs", "ga", "pts")
+    ]
     assert result.feature_columns == [
         "dc_home",
         "dc_draw",
@@ -346,6 +352,11 @@ def test_leave_one_tournament_out_runs_and_scores() -> None:
         "elo_home",
         "elo_draw",
         "elo_away",
+        *tier1,
+        "h2h_home_winrate",
+        "h2h_meetings",
+        "home_rest_days",
+        "away_rest_days",
     ]
     # Toy data (4 teams, ~24 meta training rows) won't hit RPS<0.21 — the real-data
     # target. Here we assert the pipeline runs and yields finite, in-range scores.

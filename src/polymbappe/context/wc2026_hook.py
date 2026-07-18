@@ -18,7 +18,6 @@ base probabilities unchanged.
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import TYPE_CHECKING
 
 import numpy as np
 import polars as pl
@@ -26,9 +25,6 @@ import polars as pl
 from polymbappe.context.adaptive import AdaptiveWeightState, _group_scalar_signal
 from polymbappe.context.adjuster import apply_adjustment
 from polymbappe.context.runtime import FEATURE_GROUPS, FixtureContext, fixture_feature_row
-
-if TYPE_CHECKING:
-    from polymbappe.simulate.tournament import ContextHook
 
 #: Callable type alias matching ContextHook without the circular import.
 _ContextHook = Callable[[str, str, np.ndarray], np.ndarray]

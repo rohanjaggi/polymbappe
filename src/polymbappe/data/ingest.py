@@ -58,12 +58,24 @@ def ingest_results(
         raw = sources.fetch_results_csv(url or sources.KAGGLE_RESULTS_RAW_URL)
         logger.info("ingest.results.fetched", rows=raw.height)
 
-    normalized = normalize_kaggle_results(raw)
+    normalized = normalize_kaggle_results(raw, wc2026_ko_start=_wc2026_ko_start(settings))
     write_table(
         Table.MATCHES, normalized, mode="append" if live else "overwrite", settings=settings
     )
     logger.info("ingest.results.stored", rows=normalized.height, live=live)
     return normalized.height
+
+
+def _wc2026_ko_start(settings: Settings) -> date:
+    """First Round-of-32 date from the ingested schedule (fallback: the real 2026 date)."""
+
+    if table_exists(Table.SCHEDULE, settings):
+        schedule = read_table(Table.SCHEDULE, settings)
+        if "stage" in schedule.columns:
+            r32 = schedule.filter(pl.col("stage") == "Round of 32")
+            if not r32.is_empty():
+                return r32["date"].min()  # type: ignore[return-value]
+    return date(2026, 6, 28)
 
 
 def ingest_elo(
@@ -680,13 +692,16 @@ def ingest_schedule(settings: Settings | None = None) -> int:
     """
 
     settings = settings or Settings()
-    required = set(TABLE_COLUMNS[Table.SCHEDULE])
+    # ``match_number`` is optional in the local CSV (older files predate it); null-filled.
+    required = set(TABLE_COLUMNS[Table.SCHEDULE]) - {"match_number"}
     local = settings.raw_data_dir / "schedule.csv"
     if local.exists():
         raw = pl.read_csv(io.BytesIO(local.read_bytes()))
         missing = required - set(raw.columns)
         if missing:
             raise ValueError(f"schedule.csv missing columns: {sorted(missing)}")
+        if "match_number" not in raw.columns:
+            raw = raw.with_columns(pl.lit(None, dtype=pl.Int32).alias("match_number"))
         normalized = raw.with_columns(
             pl.col("date").cast(pl.Utf8).str.to_date(strict=False).alias("date"),
             pl.col("stage").cast(pl.Utf8),
@@ -694,6 +709,7 @@ def ingest_schedule(settings: Settings | None = None) -> int:
             normalize_team_expr("home_team").alias("home_team"),
             normalize_team_expr("away_team").alias("away_team"),
             pl.col("city").cast(pl.Utf8),
+            pl.col("match_number").cast(pl.Int32, strict=False),
         ).with_columns(
             pl.format("{}__{}__{}", pl.col("date"), pl.col("home_team"), pl.col("away_team"))
             .alias("match_id")
@@ -1097,7 +1113,11 @@ def _value_squads_from_kaggle(settings: Settings) -> list[dict[str, object]]:
         )
 
     all_rows = pl.concat(
-        [f for f in [clean_rows, imputed_frame if not imputed_frame.is_empty() else None] if f is not None],
+        [
+            f
+            for f in [clean_rows, imputed_frame if not imputed_frame.is_empty() else None]
+            if f is not None
+        ],
         how="vertical_relaxed",
     )
     player_rows = [

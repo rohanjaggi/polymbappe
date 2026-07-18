@@ -65,7 +65,6 @@ def _render_live_performance(st: object, settings: Settings) -> None:
     live_rps = sum(rps_scores) / len(rps_scores)
 
     # KO accuracy
-    gs = finished.filter(pl.col("group") != "KO") if "group" in finished.columns else finished
     ko = finished.filter(pl.col("group") == "KO") if "group" in finished.columns else pl.DataFrame()
     ko_sc = data.prediction_scorecard(ko) if not ko.is_empty() else None
 
@@ -88,7 +87,10 @@ def _render_live_performance(st: object, settings: Settings) -> None:
         f"{live_rps:.4f}",
         delta=f"{(1 - live_rps / 0.2222) * 100:.0f}% better than random",
         delta_color="normal",
-        help="RPS measures probabilistic calibration, not just the top pick. Lower is better. A random model scores 0.222.",
+        help=(
+            "RPS measures probabilistic calibration, not just the top pick."
+            " Lower is better. A random model scores 0.222."
+        ),
     )
     row1[2].metric(
         "Brier Score",
@@ -101,7 +103,10 @@ def _render_live_performance(st: object, settings: Settings) -> None:
         row1[3].metric(
             "Knockout accuracy",
             f"{ko_sc['accuracy']:.0%}",
-            help=f"{int(ko_sc['accuracy'] * ko_sc['n'])}/{int(ko_sc['n'])} knockout matches correctly predicted.",
+            help=(
+                f"{int(ko_sc['accuracy'] * ko_sc['n'])}/{int(ko_sc['n'])}"
+                " knockout matches correctly predicted."
+            ),
         )
     else:
         row1[3].metric("Knockout accuracy", "—")
@@ -224,12 +229,18 @@ def _render_autotuner(st: object, settings: Settings) -> None:
     cols[1].metric(
         "Phase 1 (structural)",
         f"{phase1.height} runs",
-        help="Explores structural choices: which features to include, meta-learner family, GBM toggle.",
+        help=(
+            "Explores structural choices: which features to include,"
+            " meta-learner family, GBM toggle."
+        ),
     )
     cols[2].metric(
         "Phase 2 (numeric)",
         f"{phase2.height} runs",
-        help="Optimizes continuous hyperparameters (decay rate, regularization, Elo K-factor) via Optuna TPE.",
+        help=(
+            "Optimizes continuous hyperparameters (decay rate, regularization,"
+            " Elo K-factor) via Optuna TPE."
+        ),
     )
 
     st.caption(
@@ -242,7 +253,10 @@ def _render_autotuner(st: object, settings: Settings) -> None:
 
     st.subheader("Simulations per Forecast")
     st.metric("Monte Carlo runs", "100,000",
-              help="Each forecast cycle simulates the full 48-team bracket 100,000 times to compute stage-reaching probabilities.")
+              help=(
+                  "Each forecast cycle simulates the full 48-team bracket 100,000 times"
+                  " to compute stage-reaching probabilities."
+              ))
 
 
 def _tournament_label(code: str) -> str:

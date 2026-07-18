@@ -495,3 +495,197 @@ def test_bookmaker_comparison_unavailable_without_workbook(tmp_path: Path) -> No
     assert cmp["market_rps_skill"] is None
     assert cmp["roi_vs_closing"] is None
     assert "closing odds" in cmp["market_prob_reason"]
+
+
+# -- knockout classification & bracket resolution ------------------------------
+#
+# Mini 8-team bracket: groups A–D each send their top two straight into the
+# quarter-finals. Two ties finish level to exercise the extra-time/penalties
+# inference paths: the winner must be deduced from the next round's fixtures
+# (Ares) or, when the next round hasn't been played, from stage probabilities
+# (Cato via FINAL == 0 for Ceres).
+
+_GROUP_WINNERS = {"A": "Alpha", "B": "Bravo", "C": "Ceres", "D": "Delta"}
+_GROUP_RUNNERS = {"A": "Ares", "B": "Boreas", "C": "Cato", "D": "Dione"}
+
+
+def _ko_schedule() -> pl.DataFrame:
+    rows = [
+        # (date, stage, home_code, away_code) — enumeration order gives match numbers 73-80.
+        (date(2026, 7, 9), "Quarter-final", "1A", "2B"),
+        (date(2026, 7, 9), "Quarter-final", "1B", "2A"),
+        (date(2026, 7, 10), "Quarter-final", "1C", "2D"),
+        (date(2026, 7, 10), "Quarter-final", "1D", "2C"),
+        (date(2026, 7, 14), "Semi-final", "W73", "W74"),
+        (date(2026, 7, 15), "Semi-final", "W75", "W76"),
+        (date(2026, 7, 18), "Match for third place", "L77", "L78"),
+        (date(2026, 7, 19), "Final", "W77", "W78"),
+    ]
+    return pl.DataFrame(
+        {
+            "match_id": [f"ko{i}" for i in range(len(rows))],
+            "date": [r[0] for r in rows],
+            "stage": [r[1] for r in rows],
+            "group": [None] * len(rows),
+            "home_team": [r[2] for r in rows],
+            "away_team": [r[3] for r in rows],
+            "city": ["Testville"] * len(rows),
+        },
+        schema_overrides={"group": pl.Utf8},
+    )
+
+
+def _ko_match_df(extra_pairs: list[tuple[str, str]] | None = None) -> pl.DataFrame:
+    group_rows = [
+        (g, _GROUP_WINNERS[g], _GROUP_RUNNERS[g]) for g in ("A", "B", "C", "D")
+    ]
+    ko_pairs = [
+        ("Alpha", "Boreas"), ("Bravo", "Ares"), ("Ceres", "Dione"), ("Delta", "Cato"),
+        ("Alpha", "Ares"), ("Ceres", "Cato"),
+    ] + (extra_pairs or [])
+    return pl.DataFrame(
+        {
+            "match_id": [f"g{g}" for g, _, _ in group_rows]
+            + [f"k{i}" for i in range(len(ko_pairs))],
+            "group": [g for g, _, _ in group_rows] + ["KO"] * len(ko_pairs),
+            "home_team": [h for _, h, _ in group_rows] + [h for h, _ in ko_pairs],
+            "away_team": [a for _, _, a in group_rows] + [a for _, a in ko_pairs],
+            "model_home": [0.5] * (len(group_rows) + len(ko_pairs)),
+            "model_draw": [0.3] * (len(group_rows) + len(ko_pairs)),
+            "model_away": [0.2] * (len(group_rows) + len(ko_pairs)),
+        }
+    )
+
+
+def _ko_results(extra: list[tuple[date, str, str, int, int]] | None = None) -> pl.DataFrame:
+    rows = [
+        (date(2026, 7, 9), "Alpha", "Boreas", 2, 0),
+        (date(2026, 7, 9), "Bravo", "Ares", 1, 1),   # pens — Ares advanced
+        (date(2026, 7, 10), "Ceres", "Dione", 1, 0),
+        (date(2026, 7, 10), "Delta", "Cato", 0, 3),
+        (date(2026, 7, 14), "Alpha", "Ares", 1, 0),
+        (date(2026, 7, 15), "Ceres", "Cato", 2, 2),  # pens — Cato advanced
+    ] + (extra or [])
+    return pl.DataFrame(
+        {
+            "date": [r[0] for r in rows],
+            "home_team": [r[1] for r in rows],
+            "away_team": [r[2] for r in rows],
+            "home_goals": [r[3] for r in rows],
+            "away_goals": [r[4] for r in rows],
+        }
+    )
+
+
+def _ko_group_probs() -> pl.DataFrame:
+    teams = list(_GROUP_WINNERS.values()) + list(_GROUP_RUNNERS.values())
+    return pl.DataFrame(
+        {
+            "team": teams,
+            "finish_1": [1.0] * 4 + [0.0] * 4,
+            "finish_2": [0.0] * 4 + [1.0] * 4,
+            "finish_3": [0.0] * 8,
+            "finish_4": [0.0] * 8,
+        }
+    )
+
+
+def _ko_stage_probs() -> pl.DataFrame:
+    teams = ["Alpha", "Ares", "Bravo", "Boreas", "Ceres", "Cato", "Delta", "Dione"]
+    in_sf = {"Alpha", "Ares", "Ceres", "Cato"}
+    in_final = {"Alpha", "Cato"}
+    return pl.DataFrame(
+        {
+            "team": teams,
+            "R32": [1.0] * 8,
+            "R16": [1.0] * 8,
+            "QF": [1.0] * 8,
+            "SF": [1.0 if t in in_sf else 0.0 for t in teams],
+            "FINAL": [1.0 if t in in_final else 0.0 for t in teams],
+            "champion": [0.6 if t == "Alpha" else 0.4 if t == "Cato" else 0.0 for t in teams],
+        }
+    )
+
+
+def test_classify_ko_fixtures_assigns_rounds_from_schedule() -> None:
+    ko = data.classify_ko_fixtures(_ko_match_df(), _ko_results(), schedule_df=_ko_schedule())
+    stages = {
+        (r["home_team"], r["away_team"]): r["stage"] for r in ko.iter_rows(named=True)
+    }
+    assert stages[("Alpha", "Boreas")] == "QF"
+    assert stages[("Alpha", "Ares")] == "SF"
+    # Level ties keep the drawn scoreline and a "draw" outcome.
+    drawn = ko.filter(pl.col("home_team") == "Bravo").row(0, named=True)
+    assert drawn["actual_outcome"] == "draw"
+
+
+def test_classify_ko_fixtures_separates_third_place_from_final() -> None:
+    extra_pairs = [("Ares", "Ceres"), ("Alpha", "Cato")]
+    extra_results = [
+        (date(2026, 7, 18), "Ares", "Ceres", 1, 0),
+        (date(2026, 7, 19), "Alpha", "Cato", 2, 1),
+    ]
+    ko = data.classify_ko_fixtures(
+        _ko_match_df(extra_pairs), _ko_results(extra_results), schedule_df=_ko_schedule()
+    )
+    stages = {
+        (r["home_team"], r["away_team"]): r["stage"] for r in ko.iter_rows(named=True)
+    }
+    # The third-place match (played the day before the final) is not a semi-final.
+    assert stages[("Ares", "Ceres")] == "TP"
+    assert stages[("Alpha", "Cato")] == "F"
+
+
+def test_dark_horses_excludes_eliminated_teams() -> None:
+    df = pl.DataFrame(
+        {
+            # Out: eliminated in the QF (conditioned champion prob is 0).
+            # Alive: a live underdog. Fav: the live favourite.
+            "team": ["Out", "Alive", "Fav"],
+            "R16": [1.0, 1.0, 1.0],
+            "QF": [1.0, 1.0, 1.0],
+            "SF": [0.0, 0.6, 0.9],
+            "FINAL": [0.0, 0.3, 0.7],
+            "champion": [0.0, 0.02, 0.5],
+        }
+    )
+    horses = data.dark_horses(df)
+    assert horses["team"].to_list() == ["Alive"]
+    assert horses["overperformance"].to_list() == [pytest.approx(50.0)]
+
+
+def test_resolve_bracket_cascades_winners_to_final() -> None:
+    match_df = _ko_match_df()
+    ko = data.classify_ko_fixtures(match_df, _ko_results(), schedule_df=_ko_schedule())
+    bracket = data.resolve_bracket(
+        _ko_schedule(), ko, _ko_group_probs(), match_df, stage_probs=_ko_stage_probs()
+    )
+    by_number = {r["match_number"]: r for r in bracket.iter_rows(named=True)}
+
+    # Quarter-finals resolve from group positions; the drawn tie (74) resolves
+    # its winner from Ares' semi-final appearance.
+    assert (by_number[73]["home_resolved"], by_number[73]["away_resolved"]) == (
+        "Alpha", "Boreas",
+    )
+    assert by_number[74]["status"] == "played"
+
+    # Semi-finals carry the QF winners, including the shootout winner Ares.
+    assert (by_number[77]["home_resolved"], by_number[77]["away_resolved"]) == (
+        "Alpha", "Ares",
+    )
+    assert (by_number[78]["home_resolved"], by_number[78]["away_resolved"]) == (
+        "Ceres", "Cato",
+    )
+    assert by_number[77]["status"] == "played"
+    assert by_number[78]["status"] == "played"
+
+    # The drawn semi (78) resolves via stage probabilities (Ceres' FINAL prob is 0),
+    # so the final and third-place slots are fully resolved but not yet played.
+    assert (by_number[79]["home_resolved"], by_number[79]["away_resolved"]) == (
+        "Ares", "Ceres",
+    )
+    assert (by_number[80]["home_resolved"], by_number[80]["away_resolved"]) == (
+        "Alpha", "Cato",
+    )
+    assert by_number[79]["status"] == "upcoming"
+    assert by_number[80]["status"] == "upcoming"

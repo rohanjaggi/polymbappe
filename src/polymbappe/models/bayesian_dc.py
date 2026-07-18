@@ -192,9 +192,11 @@ class BayesianDixonColesModel(MatchModel):
             lam = pm.math.exp(log_lam)
             mu = pm.math.exp(log_mu)
 
+            from pytensor.tensor import gammaln  # pm.math has no gammaln re-export
+
             base_logp = (
-                home_goals * log_lam - lam - pm.math.gammaln(home_goals + 1)
-            ) + (away_goals * log_mu - mu - pm.math.gammaln(away_goals + 1))
+                home_goals * log_lam - lam - gammaln(home_goals + 1)
+            ) + (away_goals * log_mu - mu - gammaln(away_goals + 1))
             log_tau = self._log_tau(pm, home_goals, away_goals, lam, mu, rho)
             pm.Potential("likelihood", pm.math.sum(weights * (base_logp + log_tau)))
 

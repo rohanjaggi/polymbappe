@@ -276,6 +276,22 @@ def load_live_wc2026_matches(
     )
 
 
+def labels_from_matches(live: pl.DataFrame) -> list[str]:
+    """H/D/A outcome labels for completed matches, row-aligned to ``live``.
+
+    ``live`` must already be filtered to rows with non-null goals; the returned list
+    matches its row order, so it aligns with base predictions and context features
+    computed from the same frame.
+    """
+
+    from polymbappe.features.pipeline import result_label
+
+    return [
+        result_label(int(h), int(a))
+        for h, a in zip(live["home_goals"].to_list(), live["away_goals"].to_list(), strict=True)
+    ]
+
+
 def compute_wc2026_base_predictions(
     live_matches: pl.DataFrame, all_matches: pl.DataFrame, settings: Any | None = None
 ) -> np.ndarray:

@@ -86,6 +86,9 @@ class ScheduledMatch(BaseModel):
     home_team: str
     away_team: str
     city: str
+    #: Official FIFA match number (73-104 for the 2026 knockout tree); wires ``W##``/``L##``
+    #: placeholders unambiguously when several fixtures share a date.
+    match_number: int | None = None
 
 
 class GroupStanding(BaseModel):

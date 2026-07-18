@@ -13,9 +13,13 @@ Per simulation:
    (``delta += lr * (observed_GD - expected_GD)``) and propagates into the knockout rounds,
    modelling that group form reveals true tournament level.
 3. **Best third-placed** — :func:`select_best_third_placed` picks the 8 of 12 qualifiers.
-4. **Knockout** — :func:`seed_round_of_32` seeds R32 with pathway constraints; each tie is
-   resolved by :func:`knockout_home_winprob` (regulation -> extra time -> penalties), with
-   the 48-team upset floor applied to lopsided R32 matchups (spec 4.2).
+4. **Knockout** — anchored to the *real* tree when the ingested schedule provides it
+   (:mod:`polymbappe.simulate.real_bracket`): R32 leaves are filled from the iteration's
+   group standings via the schedule's position/third placeholders and played ties are
+   locked to their real winner. Schedule-less runs (backtests, tests) fall back to
+   :func:`seed_round_of_32` with pathway constraints. Open ties are resolved by
+   :func:`knockout_home_winprob` (regulation -> extra time -> penalties), with the
+   48-team upset floor applied to lopsided R32 matchups (spec 4.2).
 
 Aggregated outputs give per-team stage-reaching and group-finish probabilities. Live
 staleness detection (spec 4.5) is provided separately by :class:`StalenessMonitor`.
@@ -40,11 +44,21 @@ from polymbappe.simulate.bracket import seed_round_of_32
 from polymbappe.simulate.group import resolve_group_table
 from polymbappe.simulate.match import (
     ET_GOAL_SCALE,
+    beyond_regulation_home_winprob,
     hda_marginals,
     knockout_home_winprob,
     reweight_matrix_to_hda,
     sample_scoreline,
     score_matrix_from_rates,
+)
+from polymbappe.simulate.real_bracket import (
+    NEXT_STAGE,
+    ROUND_ORDER,
+    RealBracket,
+    attach_played_results,
+    bracket_compatible,
+    build_real_bracket,
+    fill_r32_leaves,
 )
 from polymbappe.simulate.third_place import select_best_third_placed
 
@@ -174,30 +188,20 @@ class SimulationResult:
     group_finish_counts: dict[str, dict[int, int]]
     r32_matchup_counts: dict[tuple[str, str], int]
 
-    def stage_probabilities(
-        self, eliminated: set[str] | None = None
-    ) -> pl.DataFrame:
+    def stage_probabilities(self) -> pl.DataFrame:
         """Per-team stage-reaching probabilities.
 
-        When ``eliminated`` is supplied, those teams are zeroed out and the
-        remaining probabilities are renormalised so each stage sums to 1.
+        Each stage column sums to its slot count (R32=32, R16=16, ..., champion=1).
+        Mid-tournament conditioning happens inside the simulation itself — played
+        results are locked and the real bracket is walked — so no post-hoc reweighting
+        is applied here.
         """
 
         rows = [
             {"team": team, **{s: counts.get(s, 0) / self.n_sims for s in STAGES}}
             for team, counts in self.stage_counts.items()
         ]
-        df = pl.DataFrame(rows)
-        if eliminated:
-            mask = pl.col("team").is_in(list(eliminated))
-            df = df.with_columns(
-                [pl.when(mask).then(0.0).otherwise(pl.col(s)).alias(s) for s in STAGES]
-            )
-            for s in STAGES:
-                total = df[s].sum()
-                if total > 0:
-                    df = df.with_columns((pl.col(s) / total).alias(s))
-        return df.sort("champion", descending=True)
+        return pl.DataFrame(rows).sort("champion", descending=True)
 
     def group_probabilities(self) -> pl.DataFrame:
         rows = [
@@ -219,56 +223,6 @@ class _LatentStrength:
 
     def update(self, team: str, observed_gd: float, expected_gd: float) -> None:
         self._delta[team] = self.get(team) + self.lr * (observed_gd - expected_gd)
-
-
-def build_eliminated_teams(
-    matches: pl.DataFrame,
-    schedule: pl.DataFrame | None = None,
-) -> set[str]:
-    """Derive the set of teams eliminated from WC 2026 knockout rounds.
-
-    A team is eliminated when it *lost* a knockout match (the team with fewer goals).
-    Draws (extra-time/penalties where only regulation score is recorded) are left
-    unresolved — both teams stay alive until a decisive result is ingested.
-
-    The knockout phase starts on the first ``Round of 32`` date in *schedule* (falling
-    back to 2026-06-28).  Matches before that date are group-stage regardless of the
-    heuristic ``is_knockout`` flag, which can produce false positives for matchday-3
-    fixtures.
-    """
-
-    import structlog
-
-    logger = structlog.get_logger(__name__)
-
-    # Determine the true knockout start date from the schedule.
-    _ko_start = date(2026, 6, 28)
-    if schedule is not None and not schedule.is_empty() and "stage" in schedule.columns:
-        r32 = schedule.filter(pl.col("stage") == "Round of 32")
-        if not r32.is_empty():
-            _ko_start = r32["date"].min()
-
-    ko = matches.filter(
-        (pl.col("competition") == "FIFA World Cup")
-        & pl.col("is_knockout")
-        & (pl.col("date") >= _ko_start)
-    ).unique(subset=["home_team", "away_team", "date"])
-    if ko.is_empty():
-        return set()
-
-    eliminated: set[str] = set()
-    for r in ko.iter_rows(named=True):
-        hg, ag = r.get("home_goals"), r.get("away_goals")
-        if hg is None or ag is None:
-            continue
-        home, away = str(r["home_team"]), str(r["away_team"])
-        if int(hg) > int(ag):
-            eliminated.add(away)
-        elif int(ag) > int(hg):
-            eliminated.add(home)
-
-    logger.info("simulate.eliminated_teams", count=len(eliminated), teams=sorted(eliminated))
-    return eliminated
 
 
 def build_played_group_results(
@@ -412,6 +366,7 @@ def simulate_tournament(
     learning_rate: float = 0.05,
     context_hook: ContextHook | None = None,
     played_results: dict[str, dict[frozenset[str], dict[str, int]]] | None = None,
+    real_bracket: RealBracket | None = None,
 ) -> SimulationResult:
     """Run the full Monte Carlo tournament simulation.
 
@@ -421,6 +376,13 @@ def simulate_tournament(
     ``played_results`` (optional, keyed by group from :func:`build_played_group_results`)
     locks already-played group fixtures to their real scoreline, so a mid-tournament re-run
     reflects the current standings instead of re-rolling the whole group stage.
+
+    ``real_bracket`` (optional, from :func:`build_real_bracket` + played results attached)
+    walks the *actual* knockout tree: R32 leaves are filled from each iteration's group
+    standings via the schedule's position/third-place placeholders, played ties are locked
+    to their real (or shootout-inferred) winner, and only genuinely open ties are sampled.
+    Without it — historical backtests and schedule-less tests — R32 falls back to the
+    random pathway-constrained seeding of :func:`seed_round_of_32`.
     """
 
     rng = rng or np.random.default_rng()
@@ -428,11 +390,19 @@ def simulate_tournament(
     stage_counts: dict[str, dict[str, int]] = {t: {} for t in teams}
     group_finish: dict[str, dict[int, int]] = {t: {} for t in teams}
     matchup_counts: dict[tuple[str, str], int] = {}
+    use_real = real_bracket is not None and bracket_compatible(real_bracket, structure)
+    if real_bracket is not None and not use_real:
+        import structlog
+
+        structlog.get_logger(__name__).warning(
+            "simulate.real_bracket_incompatible", fallback="seed_round_of_32"
+        )
     # The winner of each round reaches the next stage (R16 round -> QF teams, etc.).
     later_rounds = ("QF", "SF", "FINAL", "champion")
 
     for _ in range(n_sims):
         latent = _LatentStrength(learning_rate)
+        standings_by_group: dict[str, list[GroupStanding]] = {}
         winners: list[GroupStanding] = []
         runners_up: list[str] = []
         thirds: list[GroupStanding] = []
@@ -441,11 +411,19 @@ def simulate_tournament(
                 group, members, model, latent, rng, context_hook,
                 played=played_results.get(group) if played_results else None,
             )
+            standings_by_group[group] = standings
             for rank, row in enumerate(standings, start=1):
                 group_finish[row.team][rank] = group_finish[row.team].get(rank, 0) + 1
             winners.append(standings[0])
             runners_up.append(standings[1].team)
             thirds.append(standings[2])
+
+        if use_real:
+            _walk_real_bracket(
+                real_bracket, standings_by_group, thirds, structure, model, latent,
+                rng, context_hook, stage_counts, matchup_counts,
+            )
+            continue
 
         ranked_winners = sorted(
             winners,
@@ -492,6 +470,93 @@ def simulate_tournament(
         group_finish_counts=group_finish,
         r32_matchup_counts=matchup_counts,
     )
+
+
+def _walk_real_bracket(
+    bracket: RealBracket,
+    standings_by_group: dict[str, list[GroupStanding]],
+    thirds: list[GroupStanding],
+    structure: TournamentStructure,
+    model: StrengthModel,
+    latent: _LatentStrength,
+    rng: np.random.Generator,
+    context_hook: ContextHook | None,
+    stage_counts: dict[str, dict[str, int]],
+    matchup_counts: dict[tuple[str, str], int],
+) -> None:
+    """One iteration's knockout phase, conditioned on the real tree.
+
+    R32 occupants come from this iteration's group standings mapped through the schedule
+    placeholders (played R32 ties are pinned to reality regardless of the standings, which
+    only diverge while the group stage is still partially simulated). Played ties advance
+    their known winner; a played extra-time/penalty tie whose winner isn't inferable yet is
+    sampled *beyond regulation* (regulation is known to have ended level); open ties are
+    sampled with the usual model, the R32 upset floor included.
+    """
+
+    positions = {
+        f"{rank}{group}": row.team
+        for group, standings in standings_by_group.items()
+        for rank, row in enumerate(standings, start=1)
+    }
+    qualified = [
+        s.group for s in select_best_third_placed(thirds, structure.n_qualify_thirds)
+    ]
+    leaves = fill_r32_leaves(bracket, positions, qualified, rng)
+
+    winner_of: dict[int, str] = {}
+    for round_name in ROUND_ORDER:
+        next_stage = NEXT_STAGE[round_name]
+        for num in bracket.rounds[round_name]:
+            node = bracket.nodes[num]
+            if round_name == "R32":
+                home, away = leaves[num]
+                for team in (home, away):
+                    stage_counts[team]["R32"] = stage_counts[team].get("R32", 0) + 1
+                key = (home, away)
+                matchup_counts[key] = matchup_counts.get(key, 0) + 1
+            else:
+                h_ref, a_ref = node.home.ref, node.away.ref
+                home = winner_of[h_ref] if h_ref is not None else str(node.home.team)
+                away = winner_of[a_ref] if a_ref is not None else str(node.away.team)
+
+            if node.winner is not None and node.winner in (home, away):
+                winner = node.winner
+            elif node.drawn_unresolved and {home, away} == {node.pinned_home, node.pinned_away}:
+                winner = _sample_beyond_regulation_winner(
+                    node.pinned_home, node.pinned_away, model, latent, structure, rng  # type: ignore[arg-type]
+                )
+            else:
+                winner = _knockout_winner(
+                    home, away, model, latent, structure, rng,
+                    apply_upset_floor=(round_name == "R32"), context_hook=context_hook,
+                )
+            stage_counts[winner][next_stage] = stage_counts[winner].get(next_stage, 0) + 1
+            winner_of[num] = winner
+
+
+def _sample_beyond_regulation_winner(
+    home: str,
+    away: str,
+    model: StrengthModel,
+    latent: _LatentStrength,
+    structure: TournamentStructure,
+    rng: np.random.Generator,
+) -> str:
+    """Sample the winner of a played tie known to have been level after 90'."""
+
+    dh, da = latent.get(home), latent.get(away)
+    lam, mu = model.rates(home, away, neutral=True, dh=dh, da=da)
+    matrix_et = score_matrix_from_rates(
+        lam * ET_GOAL_SCALE, mu * ET_GOAL_SCALE, model.rho, model.max_goals
+    )
+    p_home = beyond_regulation_home_winprob(
+        matrix_et,
+        home_pen_rate=structure.penalty_rate.get(home, 0.5),
+        away_pen_rate=structure.penalty_rate.get(away, 0.5),
+        first_shooter_home=bool(rng.random() < 0.5),
+    )
+    return home if rng.random() < p_home else away
 
 
 def compute_match_predictions(
@@ -626,50 +691,6 @@ def surprise_increment(predicted_prob: float, occurred: bool) -> float:
     return abs((1.0 if occurred else 0.0) - predicted_prob)
 
 
-def _load_scheduled_fixtures(settings: object, logger: object) -> pl.DataFrame | None:
-    """Load upcoming (null-score) WC fixtures from the raw results CSV.
-
-    The upstream Kaggle mirror includes scheduled fixtures before scores are filled in.
-    Normalization drops these, but they're useful for inferring knockout-draw winners
-    (a team scheduled in a later round must have advanced).
-    """
-
-    import io
-    from pathlib import Path
-
-    raw_path = Path(getattr(settings, "raw_data_dir", "data/raw")) / "results.csv"
-    try:
-        if raw_path.exists():
-            raw = pl.read_csv(io.BytesIO(raw_path.read_bytes()), null_values=["NA"])
-        else:
-            from polymbappe.data.sources import KAGGLE_RESULTS_RAW_URL
-            import requests
-            resp = requests.get(KAGGLE_RESULTS_RAW_URL, timeout=30)
-            resp.raise_for_status()
-            raw = pl.read_csv(io.BytesIO(resp.content), null_values=["NA"])
-    except Exception:
-        return None
-
-    score_col = "home_score" if "home_score" in raw.columns else "home_goals"
-    scheduled = raw.filter(pl.col(score_col).is_null())
-    if scheduled.is_empty():
-        return None
-
-    rename = {"home_score": "home_goals", "away_score": "away_goals"}
-    rename = {k: v for k, v in rename.items() if k in scheduled.columns}
-    if rename:
-        scheduled = scheduled.rename(rename)
-
-    from polymbappe.data.aliases import normalize_team_expr
-
-    return scheduled.with_columns(
-        pl.col("date").cast(pl.Utf8).str.to_date(strict=False).alias("date"),
-        normalize_team_expr("home_team").alias("home_team"),
-        normalize_team_expr("away_team").alias("away_team"),
-        pl.col("tournament").cast(pl.Utf8).alias("competition"),
-    )
-
-
 @dataclass(slots=True)
 class StalenessMonitor:
     """Tracks cumulative forecast surprise against historical-baseline thresholds.
@@ -725,6 +746,7 @@ def run_tournament_simulation(
     historical_context: bool = False,
     live: bool = False,
     refresh_odds: bool = False,
+    seed: int | None = None,
 ) -> None:
     """CLI entrypoint: load fitted artifacts + 2026 structure and simulate.
 
@@ -732,6 +754,9 @@ def run_tournament_simulation(
     stage-reaching and group-finish probabilities to ``data/outputs``. When ``refresh_odds``
     (or ``live``) is set, the latest market odds are re-pulled after fixtures are written so
     the edge artifact reflects the current market — the hook the live agent uses on re-runs.
+
+    The Monte Carlo is seeded from ``seed`` (falling back to ``Settings.random_seed``) so
+    repeated runs produce identical outputs and committed-artifact diffs are meaningful.
     """
 
     import structlog
@@ -750,6 +775,9 @@ def run_tournament_simulation(
 
     logger = structlog.get_logger(__name__)
     settings = Settings()
+    rng_seed = settings.random_seed if seed is None else seed
+    rng = np.random.default_rng(rng_seed)
+    logger.info("simulate.rng", seed=rng_seed)
     try:
         dc = load_artifact("dixon_coles", settings)
     except FileNotFoundError as exc:  # pragma: no cover - depends on prior train run
@@ -800,26 +828,28 @@ def run_tournament_simulation(
         )
 
     # Lock already-played 2026 results so the sim reflects the live tournament.
-    matches_df = read_table(Table.MATCHES, settings) if table_exists(Table.MATCHES, settings) else pl.DataFrame()
+    matches_df = (
+        read_table(Table.MATCHES, settings)
+        if table_exists(Table.MATCHES, settings)
+        else pl.DataFrame()
+    )
     played_results = (
         build_played_group_results(matches_df, structure)
         if not matches_df.is_empty()
         else None
     )
-    # Build the set of teams eliminated from knockout rounds so they can't advance.
+    # Anchor the knockout phase to the real tree: schedule wiring + played-tie winners.
     schedule_df = (
         read_table(Table.SCHEDULE, settings) if table_exists(Table.SCHEDULE, settings)
         else pl.DataFrame()
     )
-    eliminated_teams = (
-        build_eliminated_teams(matches_df, schedule=schedule_df)
-        if not matches_df.is_empty()
-        else None
-    )
+    bracket = build_real_bracket(schedule_df)
+    if bracket is not None:
+        attach_played_results(bracket, matches_df)
 
     result = simulate_tournament(
-        structure, model, n_sims=n_sims, context_hook=context_hook,
-        played_results=played_results,
+        structure, model, n_sims=n_sims, rng=rng, context_hook=context_hook,
+        played_results=played_results, real_bracket=bracket,
     )
     predictions = compute_match_predictions(
         structure, model, context_hook, bayesian_model=bayesian_model
@@ -829,7 +859,11 @@ def run_tournament_simulation(
     # excluding any pairing already covered by the group-stage predictions.
     if not matches_df.is_empty():
         group_pairs = set(
-            zip(predictions["home_team"].to_list(), predictions["away_team"].to_list())
+            zip(
+                predictions["home_team"].to_list(),
+                predictions["away_team"].to_list(),
+                strict=True,
+            )
         )
         ko_preds = compute_knockout_fixture_predictions(
             model, matches_df, context_hook, exclude_pairs=group_pairs
@@ -841,7 +875,7 @@ def run_tournament_simulation(
 
     settings.outputs_data_dir.mkdir(parents=True, exist_ok=True)
     out = settings.outputs_data_dir
-    result.stage_probabilities(eliminated=eliminated_teams).write_parquet(out / "stage_probabilities.parquet")
+    result.stage_probabilities().write_parquet(out / "stage_probabilities.parquet")
     result.group_probabilities().write_parquet(out / "group_probabilities.parquet")
     predictions.write_parquet(out / "match_predictions.parquet")
     from polymbappe.simulate.knockout_predictions import compute_knockout_predictions
@@ -860,7 +894,7 @@ def run_tournament_simulation(
     if refresh_odds or live:
         refresh_market_odds(settings, logger)
     _write_edges(predictions, settings, logger).write_parquet(out / "edges.parquet")
-    print(result.stage_probabilities(eliminated=eliminated_teams).head(15))
+    print(result.stage_probabilities().head(15))
 
 
 class _LiveTournament:
@@ -1053,7 +1087,9 @@ def _load_context_hook(
 
     # No adaptive weights yet. Use historical adjuster only when explicitly requested.
     if not historical:
-        logger.info("simulate.context", status="no_adaptive_weights; run contextual-monitor --apply")  # type: ignore[attr-defined]
+        logger.info(  # type: ignore[attr-defined]
+            "simulate.context", status="no_adaptive_weights; run contextual-monitor --apply"
+        )
         return None
 
     from polymbappe.context.adjuster import apply_adjustment

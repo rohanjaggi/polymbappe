@@ -74,3 +74,59 @@ def test_ingest_results_from_local_raw_file(tmp_path: Path) -> None:
     n = ingest_results(settings)
     assert n == 1
     assert read_table(Table.MATCHES, settings).row(0, named=True)["home_team"] == "Russia"
+
+
+def _match_row(is_knockout: bool = False) -> pl.DataFrame:
+    return pl.DataFrame(
+        {
+            "match_id": ["2026-06-25__Japan__Sweden"],
+            "date": [date(2026, 6, 25)],
+            "home_team": ["Japan"],
+            "away_team": ["Sweden"],
+            "home_goals": [1],
+            "away_goals": [0],
+            "competition": ["FIFA World Cup"],
+            "is_knockout": [is_knockout],
+            "neutral_site": [True],
+            "group": [None],
+            "city": ["Arlington"],
+            "country": ["United States"],
+        },
+        schema_overrides={"group": pl.Utf8},
+    )
+
+
+def test_append_mode_dedupes_matches_on_match_id_keeping_newest(tmp_path: Path) -> None:
+    """A re-ingested match whose ``is_knockout`` flag flipped replaces the stored row
+    instead of accumulating a near-duplicate that fans out downstream joins."""
+
+    settings = _settings(tmp_path)
+    write_table(Table.MATCHES, _match_row(is_knockout=False), mode="append", settings=settings)
+    write_table(Table.MATCHES, _match_row(is_knockout=True), mode="append", settings=settings)
+
+    back = read_table(Table.MATCHES, settings)
+    assert back.height == 1
+    assert back["is_knockout"].to_list() == [True]  # newest wins
+
+
+def test_append_mode_dedupes_market_odds_per_source(tmp_path: Path) -> None:
+    def _odds(source: str, home: float) -> pl.DataFrame:
+        return pl.DataFrame(
+            {
+                "match_id": ["2026-06-25__Japan__Sweden"],
+                "source": [source],
+                "home_prob": [home],
+                "draw_prob": [0.3],
+                "away_prob": [1.0 - 0.3 - home],
+            }
+        )
+
+    settings = _settings(tmp_path)
+    write_table(Table.MARKET_ODDS, _odds("polymarket", 0.40), mode="append", settings=settings)
+    write_table(Table.MARKET_ODDS, _odds("polymarket", 0.55), mode="append", settings=settings)
+    write_table(Table.MARKET_ODDS, _odds("football-data", 0.45), mode="append", settings=settings)
+
+    back = read_table(Table.MARKET_ODDS, settings)
+    assert back.height == 2  # one row per (match_id, source)
+    poly = back.filter(pl.col("source") == "polymarket")
+    assert poly["home_prob"].to_list() == [0.55]  # refreshed quote wins

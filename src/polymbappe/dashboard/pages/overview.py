@@ -61,7 +61,10 @@ def _render_scorecard(st: object, settings: Settings, match_df: pl.DataFrame) ->
         f"{scorecard['rps']:.4f}",
         delta=f"{(1 - scorecard['rps'] / 0.2222) * 100:.0f}% better than random",
         delta_color="normal",
-        help="Measures full probability calibration, not just the top pick. Lower is better. Random = 0.222.",
+        help=(
+            "Measures full probability calibration, not just the top pick."
+            " Lower is better. Random = 0.222."
+        ),
     )
     cols[3].metric(
         "Brier Score",

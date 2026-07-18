@@ -744,8 +744,9 @@ def test_value_squads_from_kaggle_drops_fully_unmatched_team(tmp_path: Path, mon
 def test_value_squads_from_kaggle_match_rate_threshold_boundary(
     tmp_path: Path, monkeypatch
 ) -> None:
-    """Boundary around ``MIN_SQUAD_MATCH_RATE`` (0.5): a team exactly at the threshold is kept,
-    one just below it is dropped."""
+    """The three match-rate bands: ``>= MIN_SQUAD_MATCH_RATE`` (0.5) aggregates as-is,
+    ``[MIN_SQUAD_IMPUTE_RATE, MIN_SQUAD_MATCH_RATE)`` imputes unmatched players with the
+    team median, and below ``MIN_SQUAD_IMPUTE_RATE`` (0.25) the group is dropped."""
 
     settings = _settings(tmp_path)
     (settings.raw_data_dir / "squad_valuations_kaggle.txt").write_text("slug\n")
@@ -753,8 +754,9 @@ def test_value_squads_from_kaggle_match_rate_threshold_boundary(
         Table.SQUADS,
         _squads_table(
             {
-                "Edge": ["Match One", "Miss One"],  # 1/2 = 0.5 == threshold -> kept
-                "Below": ["Match Two", "Miss Two", "Miss Three"],  # 1/3 ~ 0.33 -> dropped
+                "Edge": ["Match One", "Miss One"],  # 1/2 = 0.5 == threshold -> aggregated
+                "Mid": ["Match Two", "Miss Two", "Miss Three"],  # 1/3 ~ 0.33 -> imputed
+                "Low": ["Match Three"] + [f"Miss {i}" for i in range(4)],  # 1/5 = 0.2 -> dropped
             },
             "WC2018",
         ),
@@ -764,13 +766,21 @@ def test_value_squads_from_kaggle_match_rate_threshold_boundary(
         ingest_mod.sources,
         "fetch_kaggle_player_valuations",
         lambda *a, **k: _kaggle_values(
-            {"Edge": [("Match One", 50e6)], "Below": [("Match Two", 50e6)]}
+            {
+                "Edge": [("Match One", 50e6)],
+                "Mid": [("Match Two", 50e6)],
+                "Low": [("Match Three", 50e6)],
+            }
         ),
     )
     assert ingest_mod.MIN_SQUAD_MATCH_RATE == 0.5
+    assert ingest_mod.MIN_SQUAD_IMPUTE_RATE == 0.25
 
-    teams = {r["team"] for r in ingest_mod._value_squads_from_kaggle(settings)}
-    assert teams == {"Edge"}  # Edge at exactly 0.5 survives; Below at 0.33 dropped
+    rows = {r["team"]: r for r in ingest_mod._value_squads_from_kaggle(settings)}
+    assert set(rows) == {"Edge", "Mid"}  # Low at 0.2 is dropped entirely
+    # Mid's two unmatched players are imputed at the team median (50M), so the roster
+    # total reflects three players, not a confidently-wrong near-zero sum.
+    assert rows["Mid"]["total_value"] == pytest.approx(150e6)
 
 
 def test_value_squads_from_kaggle_disambiguates_same_name_country_by_birth_year(

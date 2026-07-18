@@ -47,6 +47,8 @@ features:
   toggle_rolling_form: {type: categorical, choices: [true, false]}
   toggle_h2h: {type: categorical, choices: [true, false]}
   toggle_rest_days: {type: categorical, choices: [true, false]}
+  # Tier-1 squad market value (squad_value_ratio); only has a path when the GBM is on.
+  toggle_squad_value: {type: categorical, choices: [true, false]}
 
 gbm:
   # GBM stacks over the base-model H/D/A outputs; `enable` lets TPE switch the layer in/out.

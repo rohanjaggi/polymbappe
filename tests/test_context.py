@@ -546,3 +546,17 @@ def test_context_features_carry_travel_from_gazetteer(tmp_path) -> None:
     wc2 = out.filter(pl.col("match_id") == "wc2").row(0, named=True)
     # Brazil (home) travelled São Paulo -> Rio between its two group games.
     assert wc2["home_travel_km"] == pytest.approx(360.0, abs=60.0)
+
+
+def test_labels_from_matches_row_aligned() -> None:
+    import polars as pl
+
+    from polymbappe.context.adaptive import labels_from_matches
+
+    live = pl.DataFrame(
+        {
+            "home_goals": [2, 1, 0],
+            "away_goals": [0, 1, 3],
+        }
+    )
+    assert labels_from_matches(live) == ["H", "D", "A"]

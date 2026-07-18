@@ -67,7 +67,9 @@ def config_to_configs(config: dict[str, Any]) -> BacktestConfigs:
         l2_attack=float(_get(config, "dixon_coles.l2_attack", default=0.1)),
         l2_defense=float(_get(config, "dixon_coles.l2_defense", default=0.1)),
         afc_qualifier_weight=float(_get(config, "dixon_coles.afc_qualifier_weight", default=0.4)),
-        altitude_qualifier_weight=float(_get(config, "dixon_coles.altitude_qualifier_weight", default=0.4)),
+        altitude_qualifier_weight=float(
+            _get(config, "dixon_coles.altitude_qualifier_weight", default=0.4)
+        ),
     )
     elo = EloConfig(k_factor=float(_get(config, "features.elo_k_factor", default=34.0)))
     base = BaseProbConfig(
@@ -137,6 +139,7 @@ def config_to_metrics(
     toggle_rolling_form = bool(_get(config, "features.toggle_rolling_form", default=True))
     toggle_h2h = bool(_get(config, "features.toggle_h2h", default=True))
     toggle_rest_days = bool(_get(config, "features.toggle_rest_days", default=True))
+    toggle_squad_value = bool(_get(config, "features.toggle_squad_value", default=True))
     result = run_leave_one_tournament_out(
         matches,
         tournaments,
@@ -144,7 +147,7 @@ def config_to_metrics(
         ensemble_config=configs.ensemble,
         contextual_config=configs.contextual,
         market_odds=market_odds,
-        squad_valuations=squad_valuations,
+        squad_valuations=squad_valuations if toggle_squad_value else None,
         toggle_rolling_form=toggle_rolling_form,
         toggle_h2h=toggle_h2h,
         toggle_rest_days=toggle_rest_days,

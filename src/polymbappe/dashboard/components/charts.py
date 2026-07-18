@@ -299,7 +299,9 @@ def calibration_curve(df: pl.DataFrame) -> Figure:
             line={"color": "steelblue"},
             customdata=counts,
             name="Model",
-            hovertemplate="Predicted %{x:.0%}<br>Observed %{y:.0%}<br>n=%{customdata}<extra></extra>",
+            hovertemplate=(
+                "Predicted %{x:.0%}<br>Observed %{y:.0%}<br>n=%{customdata}<extra></extra>"
+            ),
         )
     )
     fig.update_layout(
@@ -382,7 +384,9 @@ def xg_scatter(finished: pl.DataFrame, match_xg: pl.DataFrame | None = None) -> 
                 mode="markers",
                 marker={"color": "tomato", "size": 9, "opacity": 0.75, "symbol": "diamond"},
                 text=xg_labels,
-                hovertemplate="<b>%{text}</b><br>FBref xG: %{x:.2f}<br>Actual goals: %{y}<extra></extra>",
+                hovertemplate=(
+                    "<b>%{text}</b><br>FBref xG: %{x:.2f}<br>Actual goals: %{y}<extra></extra>"
+                ),
                 name="Actual xG vs goals (luck)",
             ))
 

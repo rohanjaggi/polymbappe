@@ -68,7 +68,7 @@ def test_dixon_coles_scales_to_1000_matches() -> None:
     teams = [f"T{i}" for i in range(50)]
     competitions = ["FIFA World Cup", "Friendly", "Nations League"]
     matches = []
-    for i in range(1000):
+    for _ in range(1000):
         h, a = rng.choice(teams, size=2, replace=False)
         matches.append(
             MatchObservation(
@@ -99,7 +99,7 @@ def test_fit_no_overflow_warnings_large_dataset() -> None:
     teams = [f"T{i}" for i in range(80)]
     competitions = ["FIFA World Cup", "Friendly", "Nations League", "World Cup Qualifier"]
     matches = []
-    for i in range(2000):
+    for _ in range(2000):
         h, a = rng.choice(teams, size=2, replace=False)
         matches.append(
             MatchObservation(

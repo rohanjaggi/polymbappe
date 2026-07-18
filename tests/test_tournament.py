@@ -399,3 +399,167 @@ def test_live_context_frame_matches_fit_frame_columns(tmp_path) -> None:
     fit_frame = build_tournament_context_features(_live_matches(), tournaments, settings)
     fit_feature_cols = [c for c in fit_frame.columns if c != "match_id"]
     assert live_frame.columns == fit_feature_cols == list(SIM_CONTEXT_FEATURES)
+
+
+# -- real-bracket conditioning -------------------------------------------------
+
+
+def _wc2026_shaped_schedule() -> pl.DataFrame:
+    """A full 2026-shaped knockout schedule with the real placeholder patterns."""
+
+    from datetime import date as _d
+    from datetime import timedelta
+
+    r32 = [
+        (73, "2A", "2B"), (74, "1E", "3A/B/C/D/F"), (75, "1F", "2C"), (76, "1C", "2F"),
+        (77, "1I", "3C/D/F/G/H"), (78, "2E", "2I"), (79, "1A", "3C/E/F/H/I"),
+        (80, "1L", "3E/H/I/J/K"), (81, "1D", "3B/E/F/I/J"), (82, "1G", "3A/E/H/I/J"),
+        (83, "2K", "2L"), (84, "1H", "2J"), (85, "1B", "3E/F/G/I/J"), (86, "1J", "2H"),
+        (87, "1K", "3D/E/I/J/L"), (88, "2D", "2G"),
+    ]
+    r16 = [(89 + i, f"W{73 + 2 * i}", f"W{74 + 2 * i}") for i in range(8)]
+    qf = [(97 + i, f"W{89 + 2 * i}", f"W{90 + 2 * i}") for i in range(4)]
+    sf = [(101, "W97", "W98"), (102, "W99", "W100")]
+    final = [(104, "W101", "W102")]
+
+    stage_of = {**{n: "Round of 32" for n, *_ in r32}, **{n: "Round of 16" for n, *_ in r16},
+                **{n: "Quarter-final" for n, *_ in qf}, **{n: "Semi-final" for n, *_ in sf},
+                **{n: "Final" for n, *_ in final}}
+    date_of = {}
+    for i, (n, *_x) in enumerate(r32):
+        date_of[n] = _d(2026, 6, 28) + timedelta(days=i // 3)
+    for i, (n, *_x) in enumerate(r16):
+        date_of[n] = _d(2026, 7, 4) + timedelta(days=i // 2)
+    for i, (n, *_x) in enumerate(qf):
+        date_of[n] = _d(2026, 7, 9) + timedelta(days=i)
+    date_of[101], date_of[102], date_of[104] = _d(2026, 7, 14), _d(2026, 7, 15), _d(2026, 7, 19)
+
+    rows = [
+        {
+            "match_id": f"{date_of[n]}__{a}__{b}",
+            "date": date_of[n],
+            "stage": stage_of[n],
+            "group": None,
+            "home_team": a,
+            "away_team": b,
+            "city": f"City{n}",
+            "match_number": n,
+        }
+        for n, a, b in r32 + r16 + qf + sf + final
+    ]
+    return pl.DataFrame(rows).with_columns(pl.col("match_number").cast(pl.Int32))
+
+
+def _ko_matches(rows: list[dict]) -> pl.DataFrame:
+    return pl.DataFrame(
+        [
+            {
+                "match_id": f"{r['date']}__{r['home_team']}__{r['away_team']}",
+                "competition": "FIFA World Cup",
+                "is_knockout": True,
+                "neutral_site": True,
+                "group": None,
+                "country": "",
+                **r,
+            }
+            for r in rows
+        ]
+    )
+
+
+def _real_bracket(matches: pl.DataFrame | None = None):
+    from polymbappe.simulate.real_bracket import attach_played_results, build_real_bracket
+
+    bracket = build_real_bracket(_wc2026_shaped_schedule())
+    assert bracket is not None
+    if matches is not None:
+        attach_played_results(bracket, matches)
+    return bracket
+
+
+def test_conditioned_sim_respects_bracket_structure() -> None:
+    structure = placeholder_structure_2026()
+    model = _model(structure.teams)
+    result = simulate_tournament(
+        structure, model, n_sims=150, rng=np.random.default_rng(3),
+        real_bracket=_real_bracket(),
+    )
+    stage = result.stage_probabilities()
+    sums = {s: stage[s].sum() for s in STAGES}
+    assert np.allclose(
+        [sums[s] for s in STAGES], [32.0, 16.0, 8.0, 4.0, 2.0, 1.0], atol=1e-6
+    )
+    # Same-group teams can never meet in R32 on the real tree (no "1A v 2A" slot).
+    group_of = {t: g for g, members in structure.groups.items() for t in members}
+    assert all(group_of[a] != group_of[b] for a, b in result.r32_matchup_counts)
+    # Per-team monotonic stage chain still holds.
+    row = stage.row(0, named=True)
+    chain = [row[s] for s in STAGES]
+    assert all(chain[i] >= chain[i + 1] - 1e-9 for i in range(len(chain) - 1))
+
+
+def test_conditioned_sim_locks_played_decisive_r32() -> None:
+    from datetime import date as _d
+
+    structure = placeholder_structure_2026()
+    model = _model(structure.teams)
+    # Node 73 = "2A v 2B", played: Team02 beat Team06 2-0.
+    matches = _ko_matches(
+        [
+            {"date": _d(2026, 6, 28), "home_team": "Team02", "away_team": "Team06",
+             "home_goals": 2, "away_goals": 0, "city": "City73"},
+        ]
+    )
+    result = simulate_tournament(
+        structure, model, n_sims=120, rng=np.random.default_rng(4),
+        real_bracket=_real_bracket(matches),
+    )
+    probs = {r["team"]: r for r in result.stage_probabilities().iter_rows(named=True)}
+    assert probs["Team02"]["R32"] == 1.0 and probs["Team06"]["R32"] == 1.0
+    assert probs["Team02"]["R16"] == 1.0
+    assert probs["Team06"]["R16"] == 0.0
+
+
+def test_conditioned_sim_infers_shootout_winner_from_next_round() -> None:
+    from datetime import date as _d
+
+    structure = placeholder_structure_2026()
+    model = _model(structure.teams)
+    # Node 73 drawn (pens), but Team06 then played (and won) the R16 tie at node 89.
+    matches = _ko_matches(
+        [
+            {"date": _d(2026, 6, 28), "home_team": "Team02", "away_team": "Team06",
+             "home_goals": 1, "away_goals": 1, "city": "City73"},
+            {"date": _d(2026, 7, 4), "home_team": "Team06", "away_team": "Team17",
+             "home_goals": 1, "away_goals": 0, "city": "City89"},
+        ]
+    )
+    result = simulate_tournament(
+        structure, model, n_sims=120, rng=np.random.default_rng(5),
+        real_bracket=_real_bracket(matches),
+    )
+    probs = {r["team"]: r for r in result.stage_probabilities().iter_rows(named=True)}
+    assert probs["Team06"]["R16"] == 1.0  # shootout winner advances in every iteration
+    assert probs["Team02"]["R16"] == 0.0  # shootout loser is out in every iteration
+    assert probs["Team06"]["QF"] == 1.0  # and the played R16 win is locked too
+
+
+def test_conditioned_sim_splits_unresolved_shootout() -> None:
+    from datetime import date as _d
+
+    structure = placeholder_structure_2026()
+    model = _model(structure.teams)
+    matches = _ko_matches(
+        [
+            {"date": _d(2026, 6, 28), "home_team": "Team02", "away_team": "Team06",
+             "home_goals": 1, "away_goals": 1, "city": "City73"},
+        ]
+    )
+    result = simulate_tournament(
+        structure, model, n_sims=400, rng=np.random.default_rng(6),
+        real_bracket=_real_bracket(matches),
+    )
+    probs = {r["team"]: r for r in result.stage_probabilities().iter_rows(named=True)}
+    p2, p6 = probs["Team02"]["R16"], probs["Team06"]["R16"]
+    assert abs(p2 + p6 - 1.0) < 1e-9  # exactly one of the pair advances
+    assert 0.0 < p2 < 1.0 and 0.0 < p6 < 1.0  # sampled beyond regulation, not locked

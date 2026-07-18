@@ -78,7 +78,9 @@ def _render_group_predictions(st: object, settings: Settings, team: str) -> None
 
     predicted_df = data.predicted_group_points(match_df)
     team_pred = predicted_df.filter(pl.col("team") == team)
-    predicted_points = float(team_pred["predicted_points"].item()) if not team_pred.is_empty() else 0.0
+    predicted_points = (
+        float(team_pred["predicted_points"].item()) if not team_pred.is_empty() else 0.0
+    )
 
     standings_df = data.compute_group_standings(match_df, results)
     all_predicted = predicted_df.join(

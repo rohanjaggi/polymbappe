@@ -115,8 +115,11 @@ def test_config_to_configs_defaults_to_baseline() -> None:
 def test_search_space_loads_and_samples() -> None:
     space = load_search_space()
     assert any(p.name == "dixon_coles.xi" for p in space.params)
-    assert any(p.name == "contextual.toggle_cohesion" for p in space.params)
-    assert any(p.name == "contextual.toggle_manager" for p in space.params)
+    # Contextual toggles were deliberately removed from the search space (the live
+    # adaptive weighting system owns them); Tier-1 feature toggles remain tunable.
+    assert not any(p.name.startswith("contextual.toggle_") for p in space.params)
+    assert any(p.name == "features.toggle_rolling_form" for p in space.params)
+    assert any(p.name == "features.toggle_squad_value" for p in space.params)
 
     class _Trial:
         def suggest_float(self, name, low, high, log=False):
@@ -131,8 +134,8 @@ def test_search_space_loads_and_samples() -> None:
     sample = space.sample(_Trial())
     assert "dixon_coles.xi" in sample
     assert sample["dixon_coles.max_goals"] == 8
-    assert sample["contextual.toggle_cohesion"] is True
-    assert sample["contextual.toggle_manager"] is True
+    assert sample["features.toggle_rolling_form"] is True
+    assert sample["features.toggle_squad_value"] is True
 
 
 def test_leaderboard_roundtrip(tmp_path) -> None:

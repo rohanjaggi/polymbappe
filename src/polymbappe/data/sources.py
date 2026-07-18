@@ -158,7 +158,9 @@ def cached_get(
 
     for attempt in range(4):
         response = _fetcher(url, headers=_BROWSER_HEADERS, timeout=timeout)
-        if response.status_code == 429:
+        # getattr: the documented ``_fetcher`` seam accepts minimal stubs that may not
+        # carry a ``status_code``; only a real 429 triggers the backoff.
+        if getattr(response, "status_code", None) == 429:
             backoff = 15 * (2 ** attempt)
             logger.warning("sources.rate_limited", url=url, backoff=backoff, attempt=attempt + 1)
             time.sleep(backoff)
@@ -1135,12 +1137,11 @@ def fetch_fotmob_match_xg(
     ``away_team``, ``home_xg``, ``away_xg``. Matches without xG data are skipped.
     """
 
+    import json as _json
     import re
     import ssl
     import time
     import urllib.request
-
-    import json as _json
 
     ctx = ssl.create_default_context()
     ctx.check_hostname = False

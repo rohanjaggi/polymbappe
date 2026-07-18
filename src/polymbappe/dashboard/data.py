@@ -21,7 +21,7 @@ than crashing before the first ``polymbappe simulate`` run.
 from __future__ import annotations
 
 import math
-from datetime import UTC
+from datetime import UTC, date
 from pathlib import Path
 
 import numpy as np
@@ -1138,7 +1138,9 @@ def compute_group_standings(
         h, a = str(r["home_team"]), str(r["away_team"])
         hg, ag = int(r["home_goals"]), int(r["away_goals"])
         for team, gf, ga in [(h, hg, ag), (a, ag, hg)]:
-            s = team_stats.setdefault(team, {"played": 0, "won": 0, "drawn": 0, "lost": 0, "gf": 0, "ga": 0})
+            s = team_stats.setdefault(
+                team, {"played": 0, "won": 0, "drawn": 0, "lost": 0, "gf": 0, "ga": 0}
+            )
             s["played"] += 1
             s["gf"] += gf
             s["ga"] += ga
@@ -1180,7 +1182,9 @@ def predicted_group_points(match_df: pl.DataFrame) -> pl.DataFrame:
     """
 
     if match_df.is_empty():
-        return pl.DataFrame(schema={"group": pl.Utf8, "team": pl.Utf8, "predicted_points": pl.Float64})
+        return pl.DataFrame(
+            schema={"group": pl.Utf8, "team": pl.Utf8, "predicted_points": pl.Float64}
+        )
 
     gs = match_df.filter(pl.col("group") != "KO")
     team_pts: dict[str, float] = {}
@@ -1217,9 +1221,13 @@ def biggest_surprises(finished: pl.DataFrame, *, n: int = 5) -> pl.DataFrame:
         pick = max(probs, key=probs.get)  # type: ignore[arg-type]
         rows.append({
             "Fixture": f"{r['home_team']} vs {r['away_team']}",
-            "Model Pick": {"home": str(r["home_team"]), "draw": "Draw", "away": str(r["away_team"])}.get(pick, pick),
+            "Model Pick": {
+                "home": str(r["home_team"]), "draw": "Draw", "away": str(r["away_team"])
+            }.get(pick, pick),
             "Pick Confidence": f"{max(probs.values()):.0%}",
-            "Actual Result": {"home": str(r["home_team"]), "draw": "Draw", "away": str(r["away_team"])}.get(actual, actual),
+            "Actual Result": {
+                "home": str(r["home_team"]), "draw": "Draw", "away": str(r["away_team"])
+            }.get(actual, actual),
             "P(Actual)": f"{probs[actual]:.0%}",
             "p_actual_raw": probs[actual],
             "Score": (
@@ -1238,7 +1246,7 @@ def biggest_surprises(finished: pl.DataFrame, *, n: int = 5) -> pl.DataFrame:
 
 def _ko_stage_cutoffs(
     schedule_df: pl.DataFrame | None,
-) -> list[tuple[str, "date"]]:
+) -> list[tuple[str, date]]:
     """Return ``(short_label, min_date)`` pairs sorted by date, derived from the schedule.
 
     Falls back to hardcoded 2026 dates when the schedule is unavailable.
@@ -1251,6 +1259,7 @@ def _ko_stage_cutoffs(
         "Round of 16": "R16",
         "Quarter-final": "QF",
         "Semi-final": "SF",
+        "Match for third place": "TP",
         "Final": "F",
     }
     _FALLBACK: list[tuple[str, _dt.date]] = [
@@ -1258,6 +1267,7 @@ def _ko_stage_cutoffs(
         ("R16", _dt.date(2026, 7, 4)),
         ("QF", _dt.date(2026, 7, 9)),
         ("SF", _dt.date(2026, 7, 14)),
+        ("TP", _dt.date(2026, 7, 18)),
         ("F", _dt.date(2026, 7, 19)),
     ]
 
@@ -1402,11 +1412,17 @@ def resolve_bracket(
             r16_teams.add(str(r["home_team"]))
             r16_teams.add(str(r["away_team"]))
 
-    eliminated_teams: set[str] = set()
-    if stage_probs is not None and not stage_probs.is_empty() and "R16" in stage_probs.columns:
-        for r in stage_probs.iter_rows(named=True):
-            if float(r["R16"]) == 0.0:
-                eliminated_teams.add(str(r["team"]))
+    def _eliminated_at(col: str) -> set[str]:
+        """Teams whose probability of reaching ``col`` is zero — knocked out earlier."""
+        if stage_probs is None or stage_probs.is_empty() or col not in stage_probs.columns:
+            return set()
+        return {
+            str(r["team"])
+            for r in stage_probs.iter_rows(named=True)
+            if float(r[col]) == 0.0
+        }
+
+    eliminated_teams = _eliminated_at("R16")
 
     # Build list of R32 fixtures from ko_fixtures for matching
     r32_fixture_pairs: list[tuple[str, str]] = []
@@ -1488,33 +1504,40 @@ def resolve_bracket(
         match_numbers[mn]["home_resolved"] = fixed_h
         match_numbers[mn]["away_resolved"] = fixed_a
 
-    # Resolve R16+ using bracket cascade
+    # Resolve R16 → Final using bracket cascade. Match numbers are assigned in
+    # date order, so each match's W##/L## codes reference already-visited rounds.
     def _resolve_code(code: str) -> str | None:
         if code.startswith("W") or code.startswith("L"):
             return bracket.get(code)
         return _resolve_simple(code) or code
 
+    # Teams seen at each classified round, used to settle ties that finished
+    # level (extra time / penalties): appearing in the next round proves advancement.
+    next_stage_teams: dict[str, set[str]] = {}
+    if not ko_fixtures.is_empty() and "stage" in ko_fixtures.columns:
+        for r in ko_fixtures.iter_rows(named=True):
+            teams = next_stage_teams.setdefault(str(r["stage"]), set())
+            teams.add(str(r["home_team"]))
+            teams.add(str(r["away_team"]))
+    _NEXT_ROUND = {"Round of 16": "QF", "Quarter-final": "SF", "Semi-final": "F"}
+    _NEXT_PROB_COL = {"Round of 16": "QF", "Quarter-final": "SF", "Semi-final": "FINAL"}
+
     for mn, info in sorted(match_numbers.items()):
-        if info["stage"] not in ("Round of 16",):
+        if info["stage"] == "Round of 32":
             continue
         h = _resolve_code(str(info["home_code"]))
         a = _resolve_code(str(info["away_code"]))
         match_numbers[mn]["home_resolved"] = h
         match_numbers[mn]["away_resolved"] = a
+        stage = str(info["stage"])
+        later = next_stage_teams.get(_NEXT_ROUND.get(stage, ""), set())
         if h and a:
-            winner = _find_winner(ko_fixtures, h, a, set(), eliminated_teams)
+            winner = _find_winner(
+                ko_fixtures, h, a, later, _eliminated_at(_NEXT_PROB_COL.get(stage, ""))
+            )
             bracket[f"W{mn}"] = winner
             if winner:
                 bracket[f"L{mn}"] = a if winner == h else h
-
-    # Resolve QF/SF/Final
-    for mn, info in sorted(match_numbers.items()):
-        if info["stage"] in ("Round of 32", "Round of 16"):
-            continue
-        h = _resolve_code(str(info["home_code"]))
-        a = _resolve_code(str(info["away_code"]))
-        match_numbers[mn]["home_resolved"] = h
-        match_numbers[mn]["away_resolved"] = a
 
     # Build output
     rows = []
@@ -1631,19 +1654,21 @@ def actual_upsets(finished: pl.DataFrame, *, threshold: float = 0.35) -> pl.Data
 
 
 def dark_horses(stage_df: pl.DataFrame, *, n: int = 10) -> pl.DataFrame:
-    """Teams punching above their weight — high QF/SF odds relative to champion odds."""
+    """Teams punching above their weight — high QF/SF odds relative to champion odds.
+
+    Only teams still alive qualify: with results conditioned into the simulation,
+    an eliminated team has ``champion == 0`` and must not appear as "still standing".
+    """
 
     if stage_df.is_empty() or "QF" not in stage_df.columns:
         return stage_df
 
-    df = stage_df.filter(pl.col("QF") > 0)
+    df = stage_df.filter((pl.col("QF") > 0) & (pl.col("champion") > 0))
     if df.is_empty():
         return df
 
-    champ_floor = 0.001
     df = df.with_columns(
-        (pl.col("QF") / pl.max_horizontal(pl.col("champion"), pl.lit(champ_floor)))
-        .alias("overperformance")
+        (pl.col("QF") / pl.col("champion")).alias("overperformance")
     )
     # Filter out actual favourites (champion > 5%)
     df = df.filter(pl.col("champion") <= 0.05)

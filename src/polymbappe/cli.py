@@ -71,14 +71,24 @@ def simulate_command(
     tournament: int = 2026,
     n_sims: int = 50_000,
     with_context: bool = typer.Option(
-        False, "--with-context", help="Apply adaptive contextual weights (from contextual-monitor --apply)."
+        False,
+        "--with-context",
+        help="Apply adaptive contextual weights (from contextual-monitor --apply).",
     ),
     historical_context: bool = typer.Option(
-        False, "--historical-context", help="Diagnostic: use the historically-trained LightGBM adjuster instead of adaptive weights."
+        False,
+        "--historical-context",
+        help=(
+            "Diagnostic: use the historically-trained LightGBM adjuster"
+            " instead of adaptive weights."
+        ),
     ),
     live: bool = False,
     refresh_odds: bool = typer.Option(
         False, "--refresh-odds", help="Re-pull market odds before computing edges (live updates)."
+    ),
+    seed: int | None = typer.Option(
+        None, "--seed", help="Override POLYMBAPPE_RANDOM_SEED for this run (reproducible outputs)."
     ),
 ) -> None:
     """Run Monte Carlo tournament simulation."""
@@ -90,6 +100,7 @@ def simulate_command(
         historical_context=historical_context,
         live=live,
         refresh_odds=refresh_odds,
+        seed=seed,
     )
 
 
@@ -161,7 +172,9 @@ def autotune_command(
 @app.command("contextual-monitor")
 def contextual_monitor_command(
     apply: bool = typer.Option(False, "--apply", help="Write weights to file after testing."),
-    min_matches: int = typer.Option(32, "--min-matches", help="Skip if fewer completed WC2026 matches."),
+    min_matches: int = typer.Option(
+        32, "--min-matches", help="Skip if fewer completed WC2026 matches."
+    ),
 ) -> None:
     """Test contextual feature signals on live WC2026 results.
 
@@ -179,6 +192,7 @@ def contextual_monitor_command(
         AdaptiveWeightState,
         append_attribution,
         compute_wc2026_base_predictions,
+        labels_from_matches,
         load_live_wc2026_matches,
         run_all_signal_tests,
         save_adaptive_weights,
@@ -190,12 +204,19 @@ def contextual_monitor_command(
     settings = Settings()
     matches = read_table(Table.MATCHES, settings)
 
-    live = load_live_wc2026_matches(matches, settings)
+    live = (
+        load_live_wc2026_matches(matches, settings)
+        .filter(pl.col("home_goals").is_not_null() & pl.col("away_goals").is_not_null())
+        .unique(subset=["match_id"], keep="last", maintain_order=True)
+        .sort("date", "match_id")
+    )
     n = live.height
     gate = max(min_matches, MIN_MATCHES)
 
     if n < gate:
-        typer.echo(f"Only {n} completed WC2026 matches (need {gate}). Run `ingest --live` to update.")
+        typer.echo(
+            f"Only {n} completed WC2026 matches (need {gate}). Run `ingest --live` to update."
+        )
         return
 
     typer.echo(f"Testing contextual signals on {n} completed WC2026 matches...")
@@ -210,23 +231,25 @@ def contextual_monitor_command(
     @dataclass
     class _WC2026Tournament:
         name: str = "WC2026"
-        competition: str = "FIFA World Cup 2026"
+        # Must match the matches table's competition value ("FIFA World Cup"); the
+        # date window below is what scopes this to the 2026 edition.
+        competition: str = "FIFA World Cup"
         start: _date = _date(2026, 6, 11)
         end: _date = _date(2026, 7, 19)
 
     ctx_df = build_tournament_context_features(matches, [_WC2026Tournament()], settings)
-    # Align context rows to live match order
-    live_ids = live["match_id"].to_list()
+    # Align context rows to live match order (unique on match_id so the join can't fan out)
     ctx_aligned = (
         live.select("match_id")
-        .join(ctx_df, on="match_id", how="left")
+        .join(
+            ctx_df.unique(subset=["match_id"], keep="last", maintain_order=True),
+            on="match_id",
+            how="left",
+        )
         .drop("match_id")
     )
 
-    labels = live["label"].to_list() if "label" in live.columns else []
-    if not labels:
-        typer.echo("Live matches have no labels yet — no signal tests possible.")
-        return
+    labels = labels_from_matches(live)
 
     results = run_all_signal_tests(labels, base_preds, ctx_aligned)
     append_attribution(results, settings)

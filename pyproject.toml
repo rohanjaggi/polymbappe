@@ -12,7 +12,7 @@ dependencies = [
   "beautifulsoup4>=4.12.0",
   "duckdb>=1.0.0",
   "lxml>=5.0.0",
-  "numpy>=1.26.0",
+  "numpy>=1.26.0,<2.5",
   "polars>=1.8.0",
   "pyarrow>=17.0.0",
   "pydantic>=2.8.0",
@@ -32,6 +32,13 @@ modeling = [
   "scikit-learn>=1.4.0",
   "optuna>=3.6.0",
   "shap>=0.45.0",
+  # Transitive via shap, but the resolver otherwise picks an ancient numba that
+  # cannot build on Python >= 3.12; keep it modern (and numpy stays < 2.5 above,
+  # which current numba requires at import time).
+  "numba>=0.60.0",
+  # Transitive via pymc, which declares no upper bound; the arviz 1.x rewrite
+  # removed APIs pymc 5.x imports (e.g. ``concat``).
+  "arviz<1.0",
 ]
 context = [
   "langgraph>=0.2.0",
@@ -95,4 +102,6 @@ ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
-addopts = "-q"
+# -p no:seleniumbase: a globally-installed seleniumbase plugin hijacks flags like
+# --timeout; disabling it is a no-op when the package is absent.
+addopts = "-q -p no:seleniumbase"

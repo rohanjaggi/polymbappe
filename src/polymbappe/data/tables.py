@@ -87,6 +87,7 @@ TABLE_COLUMNS: dict[Table, tuple[str, ...]] = {
         "home_team",
         "away_team",
         "city",
+        "match_number",
     ),
     Table.VENUES: ("venue", "city", "country", "latitude", "longitude"),
     Table.CITY_COORDS: ("city", "country", "latitude", "longitude", "population"),

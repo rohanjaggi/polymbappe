@@ -40,9 +40,14 @@ def render(settings: Settings) -> None:
         "Stage", ["All", "Group Stage", "Knockout"], horizontal=True
     )
     if stage_filter == "Group Stage":
-        finished = finished.filter(pl.col("group") != "KO") if "group" in finished.columns else finished
+        if "group" in finished.columns:
+            finished = finished.filter(pl.col("group") != "KO")
     elif stage_filter == "Knockout":
-        finished = finished.filter(pl.col("group") == "KO") if "group" in finished.columns else pl.DataFrame()
+        finished = (
+            finished.filter(pl.col("group") == "KO")
+            if "group" in finished.columns
+            else pl.DataFrame()
+        )
 
     if finished.is_empty():
         st.info(f"No finished {stage_filter.lower()} matches yet.")
@@ -255,17 +260,26 @@ def _render_xg_analysis(
         row2[0].metric(
             "Model error (MAE)",
             f"{summary['model_vs_xg_mae']:.2f}",
-            help="Avg difference between our predicted xG and FBref's actual xG. Measures pure model quality.",
+            help=(
+                "Avg difference between our predicted xG and FBref's actual xG."
+                " Measures pure model quality."
+            ),
         )
         row2[1].metric(
             "Finishing luck (MAE)",
             f"{summary['xg_vs_goals_mae']:.2f}",
-            help="Avg difference between actual xG and goals scored. Variance outside model control.",
+            help=(
+                "Avg difference between actual xG and goals scored."
+                " Variance outside model control."
+            ),
         )
         row2[2].metric(
             "Total error (MAE)",
             f"{summary['total_mae']:.2f}",
-            help="Avg difference between predicted xG and actual goals. Combines model error + luck.",
+            help=(
+                "Avg difference between predicted xG and actual goals."
+                " Combines model error + luck."
+            ),
         )
     else:
         if not has_actual_xg:

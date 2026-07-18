@@ -41,7 +41,11 @@ def _render_upsets_that_happened(st: object, settings: Settings) -> None:
 
     upsets = data.actual_upsets(finished, threshold=0.35)
 
-    if upsets.is_empty() or (upsets.height == 1 and "Fixture" in upsets.columns and upsets["Fixture"].to_list() == [None]):
+    if upsets.is_empty() or (
+        upsets.height == 1
+        and "Fixture" in upsets.columns
+        and upsets["Fixture"].to_list() == [None]
+    ):
         st.caption("No upsets so far — the model's favoured outcome has won every match!")
         return
 
