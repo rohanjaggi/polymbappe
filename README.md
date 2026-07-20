@@ -7,17 +7,20 @@ LightGBM + meta-learner ensemble, simulates the full 48-team tournament
 prices to surface betting edges. A LangGraph agent monitors news for late
 team changes, and a Streamlit dashboard tracks everything live.
 
-**After 90 matches, the model is running at 70% accuracy** on a
-3-way prediction problem where random guessing gets 33%.
+**Final record: 72.1% accuracy over all 104 matches of the tournament** on a
+3-way prediction problem where random guessing gets 33% — and champions Spain
+were the model's #2 pre-tournament pick at 13%.
 See [full results](docs/results.md) and [architecture](docs/architecture.md).
 
 ## Results
 
-Scored against actual WC2026 group-stage outcomes as they came in:
+Scored against every played WC2026 match, group stage through the final:
 
-- **70% accuracy** across 90 matches (home win / draw / away win)
-- **87% accuracy** when model confidence was 70%+ (20 out of 23)
-- **90% accuracy** on decisive outcomes — home and away wins combined (60/67)
+- **72.1% accuracy** across 104 matches (home win / draw / away win)
+- **91% accuracy** when model confidence was 70%+ (20 out of 22)
+- **90% accuracy** on decisive outcomes — home and away wins combined (72/80)
+- **0.138 RPS** live (42.5% better than a uniform forecast on the same matches)
+- **Beat the bookmaker favorites** 66.7% vs 62.5% on the 72 overlapping matches
 - **0.185 RPS** on historical backtest across 11 major tournaments over 14 years (target: < 0.21)
 
 Full breakdown with Brier score, log loss, calibration tables, and methodology
@@ -45,7 +48,7 @@ polymbappe edges                                    # model vs market (needs odd
 polymbappe report
 ```
 
-Live tournament loop (once WC2026 is underway):
+Live tournament loop (as run during WC2026):
 
 ```bash
 polymbappe ingest --live                            # pull latest results
@@ -94,8 +97,6 @@ set -a; . .env; set +a
 |----------|---------|-----------|
 | `POLYMBAPPE_RANDOM_SEED` | reproducibility | optional (default 20260611) |
 | `POLYMBAPPE_DATA_DIR` | data root | optional (default `data`) |
-| `POLYMBAPPE_FRIENDLY_WEIGHT` | friendly-match down-weighting | optional (default 0.3) |
-| `POLYMBAPPE_DIXON_COLES_XI` | Dixon-Coles time-decay | optional (default 0.0019) |
 | `KAGGLE_USERNAME` / `KAGGLE_KEY` | player-attribute ingest | optional (public dataset works anonymously) |
 | `REDDIT_CLIENT_ID` / `REDDIT_CLIENT_SECRET` | agent Reddit scan | only if you enable Reddit in the agent |
 
@@ -309,12 +310,19 @@ accessible via `simulate --historical-context` for diagnostic comparison.
 ### Dashboard
 Seven-page Streamlit app with URL-addressable navigation (tournament overview,
 tournament retrospective, predictions vs actuals, match predictor, team deep
-dive, upset watch, model showcase).
+dive, upset watch, model showcase). Branded light/dark theming lives in
+`.streamlit/config.toml`; chart colors are colorblind-safe and defined in
+`dashboard/components/charts.py`.
 
 ```bash
 pip install -e .[dashboard]
 polymbappe dashboard
 ```
+
+To deploy on Streamlit Community Cloud, point it at this repo with main file
+path `src/polymbappe/dashboard/app.py` (the root `requirements.txt` installs
+the package via `-e .`, and the committed parquet artifacts under `data/`
+provide the live data).
 
 ## Architecture
 
