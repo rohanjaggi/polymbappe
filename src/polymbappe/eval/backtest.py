@@ -146,7 +146,7 @@ def _pivot_team_features(
         .select(["match_id"] + feature_cols)
         .rename({c: f"away_{c}" for c in feature_cols})
     )
-    return home_feat.join(away_feat, on="match_id", how="outer_coalesce")
+    return home_feat.join(away_feat, on="match_id", how="full", coalesce=True)
 
 
 def _prepare_rolling_form(

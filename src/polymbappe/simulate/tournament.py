@@ -843,9 +843,14 @@ def run_tournament_simulation(
         read_table(Table.SCHEDULE, settings) if table_exists(Table.SCHEDULE, settings)
         else pl.DataFrame()
     )
+    from polymbappe.simulate.real_bracket import load_ko_winner_overrides
+
+    winner_overrides = load_ko_winner_overrides(settings)
+    if winner_overrides:
+        logger.info("simulate.winner_overrides", overrides=winner_overrides)
     bracket = build_real_bracket(schedule_df)
     if bracket is not None:
-        attach_played_results(bracket, matches_df)
+        attach_played_results(bracket, matches_df, winner_overrides)
 
     result = simulate_tournament(
         structure, model, n_sims=n_sims, rng=rng, context_hook=context_hook,
@@ -887,9 +892,9 @@ def run_tournament_simulation(
     # locks results already played, so future rounds are projected from the current bracket.
     from polymbappe.simulate.knockout_bracket import compute_knockout_bracket
 
-    compute_knockout_bracket(schedule_df, matches_df, model, structure).write_parquet(
-        out / "knockout_bracket.parquet"
-    )
+    compute_knockout_bracket(
+        schedule_df, matches_df, model, structure, winner_overrides=winner_overrides
+    ).write_parquet(out / "knockout_bracket.parquet")
     # Refresh odds AFTER fixtures are written so Polymarket can align to them, then edges.
     if refresh_odds or live:
         refresh_market_odds(settings, logger)

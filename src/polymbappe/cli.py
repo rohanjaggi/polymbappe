@@ -68,7 +68,6 @@ def train_command(
 
 @app.command("simulate")
 def simulate_command(
-    tournament: int = 2026,
     n_sims: int = 50_000,
     with_context: bool = typer.Option(
         False,
@@ -93,7 +92,6 @@ def simulate_command(
 ) -> None:
     """Run Monte Carlo tournament simulation."""
 
-    _ = tournament
     run_tournament_simulation(
         n_sims=n_sims,
         with_context=with_context,
@@ -105,10 +103,9 @@ def simulate_command(
 
 
 @app.command("backtest")
-def backtest_command(format_version: int = 2026) -> None:
+def backtest_command() -> None:
     """Run walk-forward backtest."""
 
-    _ = format_version
     run_walk_forward_backtest()
 
 
@@ -121,7 +118,6 @@ def bayesian_ab_command() -> None:
 
 @app.command("edges")
 def edges_command(
-    tournament: int = 2026,
     outright: bool = typer.Option(
         False, help="Show outright/futures edges (e.g. champion) vs a Polymarket market."
     ),
@@ -131,7 +127,6 @@ def edges_command(
 ) -> None:
     """Print model-vs-market edge table (per-match by default, or --outright futures)."""
 
-    _ = tournament
     if outright:
         from polymbappe.eval.market import compare_outright_to_market
 
@@ -148,11 +143,44 @@ def report_command(tournament: int = 2026) -> None:
     typer.echo(f"Report written to {path}")
 
 
+@app.command("retrospective")
+def retrospective_command() -> None:
+    """Write the full-tournament retrospective to docs/results.md."""
+
+    from polymbappe.eval.retrospective import generate_retrospective
+
+    path = generate_retrospective()
+    typer.echo(f"Retrospective written to {path}")
+
+
+@app.command("trajectory")
+def trajectory_command(
+    n_sims: int = typer.Option(10_000, help="Simulations per replay point."),
+    final_model: bool = typer.Option(
+        False,
+        "--final-model",
+        help=(
+            "Reuse the trained artifact for every date instead of refitting per cutoff"
+            " (fast, but early dates inherit hindsight)."
+        ),
+    ),
+    seed: int | None = typer.Option(None, "--seed", help="Override POLYMBAPPE_RANDOM_SEED."),
+    market: bool = typer.Option(
+        False,
+        "--market",
+        help="Also fetch Polymarket champion price history and compute the Kelly P&L.",
+    ),
+) -> None:
+    """Replay the tournament day by day to build the probability trajectory."""
+
+    from polymbappe.eval.trajectory import run_trajectory
+
+    run_trajectory(n_sims=n_sims, refit=not final_model, seed=seed, market=market)
+
+
 @app.command("autotune")
 def autotune_command(
     budget: str = "2h",
-    metric: str = "rps",
-    resume: bool = False,
     leaderboard: bool = False,
     apply_best: bool = False,
 ) -> None:
@@ -160,13 +188,7 @@ def autotune_command(
 
     from polymbappe.tune.runner import run_autotune
 
-    run_autotune(
-        budget=budget,
-        metric=metric,
-        resume=resume,
-        leaderboard=leaderboard,
-        apply_best=apply_best,
-    )
+    run_autotune(budget=budget, leaderboard=leaderboard, apply_best=apply_best)
 
 
 @app.command("contextual-monitor")
@@ -205,7 +227,7 @@ def contextual_monitor_command(
     matches = read_table(Table.MATCHES, settings)
 
     live = (
-        load_live_wc2026_matches(matches, settings)
+        load_live_wc2026_matches(matches)
         .filter(pl.col("home_goals").is_not_null() & pl.col("away_goals").is_not_null())
         .unique(subset=["match_id"], keep="last", maintain_order=True)
         .sort("date", "match_id")
@@ -267,10 +289,12 @@ def contextual_monitor_command(
     typer.echo(f"\nActive groups: {active_groups or 'none'}")
 
     if apply:
+        from datetime import datetime
+
         state = AdaptiveWeightState(
             weights={r.feature_group: r.weight for r in results},
             n_matches=n,
-            last_updated=__import__("datetime").datetime.now().isoformat(),
+            last_updated=datetime.now().isoformat(),
         )
         path = save_adaptive_weights(state, settings)
         typer.echo(f"Weights saved → {path}")
@@ -283,11 +307,9 @@ def agent_command(
     run_now: bool = False,
     status: bool = False,
     history: bool = False,
-    schedule: str | None = None,
 ) -> None:
     """Control the LangGraph live monitoring agent (Section 5)."""
 
-    from polymbappe.agent.scheduler import parse_interval
     from polymbappe.agent.scheduler import run_now as agent_run_now
     from polymbappe.agent.state import AgentState
 
@@ -303,11 +325,7 @@ def agent_command(
         with AgentState() as state:
             typer.echo(state.changelog_df())
         return
-    if schedule:
-        secs = parse_interval(schedule)
-        typer.echo(f"Scheduling agent every {secs}s (requires the 'context' extra).")
-        return
-    typer.echo("Specify one of --run-now / --status / --history / --schedule.")
+    typer.echo("Specify one of --run-now / --status / --history.")
 
 
 @app.command("dashboard")

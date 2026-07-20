@@ -249,29 +249,19 @@ def append_attribution(
     combined.write_parquet(path)
 
 
-def load_live_wc2026_matches(
-    matches: pl.DataFrame, settings: Any | None = None
-) -> pl.DataFrame:
-    """Return completed WC2026 matches from the matches table by joining with schedule.
+def load_live_wc2026_matches(matches: pl.DataFrame) -> pl.DataFrame:
+    """Return WC2026 rows of the matches table (group stage and knockout).
 
-    Uses the SCHEDULE table's match_ids (which are keyed to WC2026 fixtures) to find
-    completed matches. Filters to matches on or after WC2026_START that appear in both
-    the schedule and the matches table (meaning they have results).
+    Filters by competition + date — the same convention as
+    :func:`~polymbappe.simulate.tournament.build_played_group_results`. A join against
+    the schedule's match_ids is deliberately *not* used: knockout schedule rows carry
+    placeholder ids (``2A``, ``W97``) and a few group fixtures disagree with the results
+    feed on home/away orientation, so an id join silently drops a third of the
+    tournament from the signal tests.
     """
 
-    from polymbappe.config import Settings
-    from polymbappe.data.store import read_table, table_exists
-    from polymbappe.data.tables import Table
-
-    settings = settings or Settings()
-    if not table_exists(Table.SCHEDULE, settings):
-        return pl.DataFrame(schema=matches.schema)
-
-    schedule = read_table(Table.SCHEDULE, settings)
-    schedule_ids = set(schedule["match_id"].to_list())
-
     return matches.filter(
-        pl.col("match_id").is_in(schedule_ids)
+        (pl.col("competition") == "FIFA World Cup")
         & (pl.col("date") >= pl.lit(WC2026_START))
     )
 
@@ -316,7 +306,14 @@ def compute_wc2026_base_predictions(
         settings = settings or Settings()
         calibration = load_artifact("ensemble_calibration", settings)
         return calibration.predict_proba(probs_df)  # type: ignore[attr-defined]
-    except Exception:
+    except Exception as exc:  # noqa: BLE001 - fallback must not break the monitor
+        import structlog
+
+        structlog.get_logger(__name__).warning(
+            "adaptive.base_predictions_fallback",
+            error=f"{type(exc).__name__}: {exc}",
+            hint="ensemble artifact unusable; residuals below are vs a plain DC+Elo average",
+        )
         # Fallback: equal-weight average of DC and Elo probs.
         dc = probs_df.select(["dc_home", "dc_draw", "dc_away"]).to_numpy()
         elo = probs_df.select(["elo_home", "elo_draw", "elo_away"]).to_numpy()

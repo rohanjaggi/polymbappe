@@ -194,6 +194,52 @@ def _write_context_tables(settings: Settings) -> None:
     write_table(Table.MANAGER_RECORDS, records, settings=settings)
 
 
+def test_build_tournament_context_features_uses_team_xg(tmp_path) -> None:
+    """With a team_xg table, the fit path's xg-overperformance is real (non-zero).
+
+    Guards the train/serve skew where the fit path used the goals-vs-goals proxy
+    (identically zero) while the live simulation path passed real xG.
+    """
+
+    settings = Settings(data_dir=tmp_path)
+    history = _assembly_matches()
+    xg_rows = [
+        {"team": r[team_col], "date": r["date"], "xg": 0.3, "xga": 0.9}
+        for r in history.iter_rows(named=True)
+        for team_col in ("home_team", "away_team")
+    ]
+    write_table(Table.TEAM_XG, pl.DataFrame(xg_rows), settings=settings)
+
+    tournaments = (Tournament("WC2022", "FIFA World Cup", date(2022, 11, 20), date(2022, 12, 18)),)
+    out = build_tournament_context_features(history, tournaments, settings)
+    row = out.filter(pl.col("match_id") == "t2").row(0, named=True)
+    # A scores ~1/match against xg 0.3 -> clearly positive overperformance.
+    assert row["home_xg_overperf"] > 0.0
+
+
+def test_load_live_wc2026_matches_captures_group_and_knockout() -> None:
+    from polymbappe.context.adaptive import load_live_wc2026_matches
+
+    matches = pl.DataFrame(
+        {
+            "match_id": ["pre", "grp", "ko", "other"],
+            "date": [date(2026, 3, 1), date(2026, 6, 12), date(2026, 7, 15), date(2026, 6, 20)],
+            "home_team": ["A", "A", "A", "A"],
+            "away_team": ["B", "B", "B", "B"],
+            "home_goals": [1, 2, 1, 0],
+            "away_goals": [0, 0, 1, 0],
+            "competition": ["FIFA World Cup", "FIFA World Cup", "FIFA World Cup", "Friendly"],
+            "is_knockout": [False, False, True, False],
+            "neutral_site": [True] * 4,
+            "group": [None] * 4,
+        },
+        schema_overrides={"group": pl.Utf8},
+    )
+    live = load_live_wc2026_matches(matches)
+    # Group AND knockout rows inside the tournament window; nothing else.
+    assert sorted(live["match_id"].to_list()) == ["grp", "ko"]
+
+
 def test_build_tournament_context_features_no_tables(tmp_path) -> None:
     """Without squads/manager tables: original 3 cols + zero-filled new cols, full schema."""
 

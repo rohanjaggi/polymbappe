@@ -16,6 +16,7 @@ import requests
 GAMMA_BASE_URL = "https://gamma-api.polymarket.com"
 GAMMA_MARKETS_URL = f"{GAMMA_BASE_URL}/markets"
 GAMMA_EVENTS_URL = f"{GAMMA_BASE_URL}/events"
+CLOB_PRICES_HISTORY_URL = "https://clob.polymarket.com/prices-history"
 
 _HEADERS = {"User-Agent": "polymbappe/0.1 (+https://github.com/)"}
 
@@ -215,6 +216,78 @@ def parse_team_yes_prices(event: dict[str, Any], *, normalize: bool = False) -> 
         if total > 0:
             frame = frame.with_columns((pl.col("market_prob") / total).alias("market_prob"))
     return frame
+
+
+def parse_team_yes_tokens(event: dict[str, Any]) -> pl.DataFrame:
+    """Per-team **Yes** CLOB token ids from a grouped Yes/No futures event.
+
+    Mirrors :func:`parse_team_yes_prices` but returns ``[team, token_id]`` — the token that
+    :func:`fetch_polymarket_price_history` needs. ``clobTokenIds`` arrives as a
+    JSON-encoded list aligned with the market's ``outcomes`` order; sub-markets without a
+    Yes outcome, a token list of the wrong length, or a placeholder team are dropped.
+    """
+
+    from polymbappe.data.aliases import normalize_team_name
+
+    rows: list[dict[str, Any]] = []
+    for market in event.get("markets", []):
+        team_raw = market.get("groupItemTitle") or ""
+        outcomes_raw = market.get("outcomes")
+        tokens_raw = market.get("clobTokenIds")
+        if not team_raw or outcomes_raw is None or tokens_raw is None:
+            continue
+        if team_raw.strip().lower() in _NON_TEAM_LABELS:
+            continue
+        outcomes = json.loads(outcomes_raw) if isinstance(outcomes_raw, str) else outcomes_raw
+        tokens = json.loads(tokens_raw) if isinstance(tokens_raw, str) else tokens_raw
+        lowered = [str(o).strip().lower() for o in outcomes]
+        if "yes" not in lowered or len(tokens) != len(outcomes):
+            continue
+        rows.append(
+            {
+                "team": normalize_team_name(team_raw),
+                "token_id": str(tokens[lowered.index("yes")]),
+            }
+        )
+    return pl.DataFrame(rows, schema={"team": pl.Utf8, "token_id": pl.Utf8})
+
+
+def fetch_polymarket_price_history(
+    token_id: str, *, interval: str = "max", fidelity: int = 1440, timeout: float = 30.0
+) -> pl.DataFrame:
+    """Price history for one CLOB token: ``[timestamp, price]`` (UTC, oldest first).
+
+    ``fidelity`` is the sample spacing in minutes (1440 = daily). Any HTTP or payload-shape
+    failure returns a typed empty frame — history for long-resolved markets is not
+    guaranteed to stay served, and callers degrade to an "unavailable" note.
+    """
+
+    empty = pl.DataFrame(schema={"timestamp": pl.Datetime("us", "UTC"), "price": pl.Float64})
+    try:
+        response = requests.get(
+            CLOB_PRICES_HISTORY_URL,
+            params={"market": token_id, "interval": interval, "fidelity": fidelity},
+            headers=_HEADERS,
+            timeout=timeout,
+        )
+        response.raise_for_status()
+        points = response.json().get("history", [])
+    except Exception:  # noqa: BLE001 - degrade to empty; caller logs context
+        return empty
+    rows = [
+        {"t": int(p["t"]), "price": float(p["p"])}
+        for p in points
+        if isinstance(p, dict) and "t" in p and "p" in p
+    ]
+    if not rows:
+        return empty
+    timestamp = pl.from_epoch("t", time_unit="s").dt.replace_time_zone("UTC")
+    return (
+        pl.DataFrame(rows)
+        .with_columns(timestamp.alias("timestamp"))
+        .sort("timestamp")
+        .select("timestamp", "price")
+    )
 
 
 def normalize_polymarket_three_way(

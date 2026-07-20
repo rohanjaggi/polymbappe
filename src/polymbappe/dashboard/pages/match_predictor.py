@@ -1,8 +1,9 @@
-"""Page 2 — Match Predictor.
+"""Match Predictor.
 
-Six tabs covering every tournament stage: Group Stage, R32, R16, QF, SF, Final.
-Every knockout tab shows played fixtures (model predictions vs actual results)
-plus upcoming fixtures resolved from the bracket, with advancement probabilities.
+Seven tabs covering every tournament stage: Group Stage, R32, R16, QF, SF,
+Third Place, Final. Every knockout tab shows played fixtures (model predictions
+vs actual results) plus upcoming fixtures resolved from the bracket, with
+advancement probabilities.
 """
 
 from __future__ import annotations
@@ -34,7 +35,7 @@ def render(settings: Settings) -> None:
     st.header("Match Predictor")
 
     tabs = st.tabs(["Group Stage", "Round of 32", "Round of 16",
-                     "Quarter-Finals", "Semi-Finals", "Final"])
+                     "Quarter-Finals", "Semi-Finals", "Third Place", "Final"])
 
     with tabs[0]:
         _render_group_stage(st, settings)
@@ -47,6 +48,8 @@ def render(settings: Settings) -> None:
     with tabs[4]:
         _render_bracket_stage(st, settings, "Semi-final", "SF", "SF")
     with tabs[5]:
+        _render_third_place(st, settings)
+    with tabs[6]:
         _render_final(st, settings)
 
 
@@ -57,7 +60,7 @@ def render(settings: Settings) -> None:
 def _render_group_stage(st: object, settings: Settings) -> None:
     match_df = data.load_match_predictions(settings)
     if match_df.is_empty():
-        st.info("No match predictions yet. Run `polymbappe simulate`/`report` to populate.")
+        st.info("Match forecasts appear here once the first predictions are published.")
         return
 
     results = data.tournament_results(data.load_recorded_results(settings))
@@ -78,7 +81,7 @@ def _render_group_stage(st: object, settings: Settings) -> None:
     chosen_group = st.selectbox("Filter by group", groups, key="gs_group")
     view = gs if chosen_group == "All" else gs.filter(pl.col("group") == chosen_group)
 
-    st.dataframe(_unified_table(view), use_container_width=True, hide_index=True)
+    st.dataframe(_unified_table(view), width="stretch", hide_index=True)
 
     labels = [_fixture_label(r) for r in view.iter_rows(named=True)]
     if labels:
@@ -116,7 +119,7 @@ def _render_r32(st: object, settings: Settings) -> None:
         hits = int(played["model_correct"].sum())
         st.metric("Model top-pick accuracy (R32)", f"{hits}/{played.height}")
 
-    st.dataframe(_ko_table(r32), use_container_width=True, hide_index=True)
+    st.dataframe(_ko_table(r32), width="stretch", hide_index=True)
 
     labels = [_fixture_label(r) for r in r32.iter_rows(named=True)]
     if labels:
@@ -170,7 +173,7 @@ def _render_r16(st: object, settings: Settings) -> None:
         if not r16_probs.is_empty():
             st.dataframe(
                 r16_probs.select(["team", "R16", "QF", "SF", "FINAL", "champion"]).to_pandas(),
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
             )
 
@@ -221,11 +224,11 @@ def _render_bracket_stage(
             cols = list(dict.fromkeys(["team", prob_col, "SF", "FINAL", "champion"]))
             st.dataframe(
                 probs.select(cols).to_pandas(),
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
             )
         else:
-            st.info(f"No teams with >{prob_col} probability > 0.")
+            st.info(f"No team still has a chance of reaching the {schedule_stage}.")
 
 
 def _render_played_stage(st: object, ko: pl.DataFrame, ko_stage: str, label: str) -> None:
@@ -243,7 +246,7 @@ def _render_played_stage(st: object, ko: pl.DataFrame, ko_stage: str, label: str
         hits = int(with_result["model_correct"].sum())
         st.metric(f"Model top-pick accuracy ({ko_stage})", f"{hits}/{with_result.height}")
 
-    st.dataframe(_ko_table(played), use_container_width=True, hide_index=True)
+    st.dataframe(_ko_table(played), width="stretch", hide_index=True)
 
     labels = [_fixture_label(r) for r in played.iter_rows(named=True)]
     choice = st.selectbox("Inspect a fixture", labels, key=f"{ko_stage.lower()}_fixture")
@@ -252,8 +255,46 @@ def _render_played_stage(st: object, ko: pl.DataFrame, ko_stage: str, label: str
 
 
 # ---------------------------------------------------------------------------
-# Final
+# Third place & Final
 # ---------------------------------------------------------------------------
+
+def _render_third_place(st: object, settings: Settings) -> None:
+    """The third-place play-off: played result, or its projected bracket slot."""
+
+    stage_df = data.load_stage_probabilities(settings)
+    schedule_df = data.load_schedule(settings)
+    match_df = data.load_match_predictions(settings)
+    results = data.tournament_results(data.load_recorded_results(settings))
+
+    ko = (
+        data.classify_ko_fixtures(match_df, results, schedule_df=schedule_df)
+        if not match_df.is_empty()
+        else pl.DataFrame()
+    )
+
+    played = not ko.is_empty() and not ko.filter(pl.col("stage") == "TP").is_empty()
+    _render_played_stage(st, ko, "TP", "Third-place match")
+
+    shown_upcoming = False
+    if not schedule_df.is_empty():
+        bracket = data.resolve_bracket(
+            schedule_df,
+            ko,
+            data.load_group_probabilities(settings),
+            match_df,
+            stage_probs=stage_df,
+        )
+        upcoming = bracket.filter(
+            (pl.col("stage") == "Match for third place") & (pl.col("status") != "played")
+        )
+        if not upcoming.is_empty():
+            st.caption("Third-place match bracket slot.")
+            _render_bracket_table(st, upcoming, stage_df, full_bracket=bracket)
+            shown_upcoming = True
+
+    if not played and not shown_upcoming:
+        st.info("The third-place match appears once the semi-finals are decided.")
+
 
 def _render_final(st: object, settings: Settings) -> None:
     stage_df = data.load_stage_probabilities(settings)
@@ -268,7 +309,6 @@ def _render_final(st: object, settings: Settings) -> None:
     )
 
     _render_played_stage(st, ko, "F", "Final")
-    _render_played_stage(st, ko, "TP", "Third-place match")
 
     if not schedule_df.is_empty():
         bracket = data.resolve_bracket(
@@ -279,21 +319,20 @@ def _render_final(st: object, settings: Settings) -> None:
             stage_probs=stage_df,
         )
         upcoming = bracket.filter(
-            pl.col("stage").is_in(["Final", "Match for third place"])
-            & (pl.col("status") != "played")
+            (pl.col("stage") == "Final") & (pl.col("status") != "played")
         )
         if not upcoming.is_empty():
-            st.caption("Final and third-place match bracket slots.")
+            st.caption("Final bracket slot.")
             _render_bracket_table(st, upcoming, stage_df, full_bracket=bracket)
 
     if not stage_df.is_empty():
         st.subheader("Championship Probabilities")
         champs = stage_df.filter(pl.col("champion") > 0).sort("champion", descending=True)
         if not champs.is_empty():
-            st.plotly_chart(charts.trophy_bar(stage_df, n=10), use_container_width=True)
+            st.plotly_chart(charts.trophy_bar(stage_df, n=10), width="stretch")
             st.dataframe(
                 champs.select(["team", "FINAL", "champion"]).to_pandas(),
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
             )
 
@@ -384,7 +423,7 @@ def _render_bracket_table(
             "Status": str(r.get("status", "tbd")).title(),
         })
 
-    st.dataframe(pl.DataFrame(rows).to_pandas(), use_container_width=True, hide_index=True)
+    st.dataframe(pl.DataFrame(rows).to_pandas(), width="stretch", hide_index=True)
 
 
 def _render_fixture_detail(
@@ -398,7 +437,7 @@ def _render_fixture_detail(
 
     st.plotly_chart(
         charts.hda_bar(home_prob, draw_prob, away_prob, home=home, away=away),
-        use_container_width=True,
+        width="stretch",
     )
 
     cols = st.columns(3)
@@ -440,7 +479,7 @@ def _unified_table(view: pl.DataFrame) -> object:
             ),
             "Score": f"{int(r['home_goals'])} – {int(r['away_goals'])}" if has_result else "—",
             "Result": _outcome_label(r, actual_key) if has_result else "—",
-            "Correct": ("Yes" if r["model_correct"] else "No") if has_result else "Pending",
+            "Correct": ("✅" if r["model_correct"] else "❌") if has_result else "⏳",
         })
     return pl.DataFrame(rows).to_pandas()
 
@@ -467,6 +506,6 @@ def _ko_table(view: pl.DataFrame) -> object:
                 ("Draw (ET/pens)" if actual_key == "draw" else _outcome_label(r, actual_key))
                 if has_result else "—"
             ),
-            "Correct": ("Yes" if r["model_correct"] else "No") if has_result else "Pending",
+            "Correct": ("✅" if r["model_correct"] else "❌") if has_result else "⏳",
         })
     return pl.DataFrame(rows).to_pandas()

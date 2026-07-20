@@ -1,7 +1,7 @@
-"""Page 4 — Team Deep Dive.
+"""Team Deep Dive page.
 
-Team selector, stage-reaching probability waterfall, group-stage fixture
-retrospective, and knockout journey.
+Team selector (defaulting to the champion / title favourite), stage-reaching
+probabilities, group-stage fixture retrospective, and knockout journey.
 """
 
 from __future__ import annotations
@@ -24,20 +24,23 @@ def render(settings: Settings) -> None:
 
     teams = data.available_teams(stage_df)
     if not teams:
-        st.info("No simulation results yet. Run `polymbappe simulate` to populate the dashboard.")
+        st.info(
+            "Team-by-team forecasts appear here once the first simulation results "
+            "are published."
+        )
         return
 
-    team = st.selectbox("Select a team", teams)
-
-    st.subheader("Stage-reaching probability waterfall")
-    stage_probs = data.team_stage_row(stage_df, team)
-    st.plotly_chart(charts.stage_waterfall(stage_probs, team=team), use_container_width=True)
+    # Default to the biggest story in the data: the champion (or title favourite).
+    favourite = data.champion_team(stage_df)
+    if favourite is None:
+        contenders = data.top_contenders(stage_df, n=1)
+        favourite = str(contenders["team"][0]) if not contenders.is_empty() else None
+    default_index = teams.index(favourite) if favourite in teams else 0
+    team = st.selectbox("Select a team", teams, index=default_index)
 
     st.subheader("Stage-reaching probabilities")
-    st.dataframe(
-        stage_df.filter(stage_df["team"] == team).to_pandas(),
-        use_container_width=True,
-    )
+    stage_probs = data.team_stage_row(stage_df, team)
+    st.plotly_chart(charts.stage_waterfall(stage_probs, team=team), width="stretch")
 
     _render_group_predictions(st, settings, team)
     st.divider()
@@ -104,7 +107,7 @@ def _render_group_predictions(st: object, settings: Settings, team: str) -> None
         delta=f"Avg error across all teams: {overall_mae:.1f}",
         delta_color="off",
     )
-    st.dataframe(pl.DataFrame(rows).to_pandas(), use_container_width=True, hide_index=True)
+    st.dataframe(pl.DataFrame(rows).to_pandas(), width="stretch", hide_index=True)
 
 
 def _render_knockout_journey(st: object, settings: Settings, team: str) -> None:

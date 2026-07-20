@@ -1,4 +1,4 @@
-"""Page 5 — Upset Watch.
+"""Upset Watch.
 
 Two sections: retrospective upsets that happened, and forward-looking dark
 horses still alive in the tournament.
@@ -59,7 +59,7 @@ def _render_upsets_that_happened(st: object, settings: Settings) -> None:
         "Matches where the model's favoured outcome lost and the actual result had "
         "less than 35% predicted probability. Sorted by upset magnitude."
     )
-    st.dataframe(upsets.to_pandas(), use_container_width=True, hide_index=True)
+    st.dataframe(upsets.to_pandas(), width="stretch", hide_index=True)
 
 
 def _render_dark_horses(st: object, settings: Settings) -> None:
@@ -82,4 +82,4 @@ def _render_dark_horses(st: object, settings: Settings) -> None:
         "probabilities. Sorted by overperformance score (QF probability relative to "
         "champion probability)."
     )
-    st.dataframe(horses.to_pandas(), use_container_width=True, hide_index=True)
+    st.dataframe(horses.to_pandas(), width="stretch", hide_index=True)

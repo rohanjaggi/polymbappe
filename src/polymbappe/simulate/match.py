@@ -100,13 +100,6 @@ def sample_scoreline(matrix: np.ndarray, rng: np.random.Generator) -> tuple[int,
     return int(idx // matrix.shape[1]), int(idx % matrix.shape[1])
 
 
-def _hda(matrix: np.ndarray) -> tuple[float, float, float]:
-    home = float(np.tril(matrix, k=-1).sum())
-    draw = float(np.trace(matrix))
-    away = float(np.triu(matrix, k=1).sum())
-    return home, draw, away
-
-
 def shrink_penalty_rate(rate: float, n_obs: float, prior_n: float = PENALTY_PRIOR_N) -> float:
     """Shrink a team's observed shootout win rate toward 0.5 (spec 4.1)."""
 
@@ -141,8 +134,8 @@ def knockout_home_winprob(
 ) -> float:
     """Closed-form P(home advances) across regulation, extra time, and penalties."""
 
-    rh, rd, _ = _hda(matrix_reg)
-    eh, ed, _ = _hda(matrix_et)
+    rh, rd, _ = hda_marginals(matrix_reg)
+    eh, ed, _ = hda_marginals(matrix_et)
     p_pen = penalty_home_winprob(home_pen_rate, away_pen_rate, first_shooter_home, edge)
     return rh + rd * (eh + ed * p_pen)
 
@@ -163,7 +156,7 @@ def beyond_regulation_home_winprob(
     level.
     """
 
-    eh, ed, _ = _hda(matrix_et)
+    eh, ed, _ = hda_marginals(matrix_et)
     p_pen = penalty_home_winprob(home_pen_rate, away_pen_rate, first_shooter_home, edge)
     return eh + ed * p_pen
 

@@ -234,6 +234,111 @@ def test_attach_resolves_drawn_semi_via_third_place_match() -> None:
     assert semi.winner == "Alpha" and semi.loser == "Beta"
 
 
+def _final_weekend_schedule() -> pl.DataFrame:
+    return _schedule(
+        [
+            {"date": date(2026, 7, 14), "stage": "Semi-final", "home_team": "Alpha",
+             "away_team": "Beta", "city": "Dallas (Arlington)", "match_number": 101},
+            {"date": date(2026, 7, 15), "stage": "Semi-final", "home_team": "Gamma",
+             "away_team": "Delta", "city": "Atlanta", "match_number": 102},
+            {"date": date(2026, 7, 18), "stage": "Match for third place",
+             "home_team": "L101", "away_team": "L102", "city": "Miami (Miami Gardens)",
+             "match_number": 103},
+            {"date": date(2026, 7, 19), "stage": "Final", "home_team": "W101",
+             "away_team": "W102", "city": "New York/New Jersey (East Rutherford)",
+             "match_number": 104},
+        ]
+    )
+
+
+def test_drawn_final_is_unresolved_without_override() -> None:
+    bracket = build_real_bracket(_final_weekend_schedule())
+    assert bracket is not None
+    matches = _matches(
+        [
+            {"date": date(2026, 7, 14), "home_team": "Alpha", "away_team": "Beta",
+             "home_goals": 2, "away_goals": 0, "city": "Arlington"},
+            {"date": date(2026, 7, 15), "home_team": "Gamma", "away_team": "Delta",
+             "home_goals": 1, "away_goals": 0, "city": "Atlanta"},
+            {"date": date(2026, 7, 19), "home_team": "Alpha", "away_team": "Gamma",
+             "home_goals": 1, "away_goals": 1, "city": "East Rutherford"},
+        ]
+    )
+    attach_played_results(bracket, matches)
+    final = bracket.nodes[104]
+    assert final.winner is None and final.drawn_unresolved  # no later round to look at
+
+
+def test_winner_override_resolves_drawn_final() -> None:
+    bracket = build_real_bracket(_final_weekend_schedule())
+    assert bracket is not None
+    matches = _matches(
+        [
+            {"date": date(2026, 7, 14), "home_team": "Alpha", "away_team": "Beta",
+             "home_goals": 2, "away_goals": 0, "city": "Arlington"},
+            {"date": date(2026, 7, 15), "home_team": "Gamma", "away_team": "Delta",
+             "home_goals": 1, "away_goals": 0, "city": "Atlanta"},
+            {"date": date(2026, 7, 19), "home_team": "Alpha", "away_team": "Gamma",
+             "home_goals": 1, "away_goals": 1, "city": "East Rutherford"},
+        ]
+    )
+    attach_played_results(bracket, matches, winner_overrides={104: "Gamma"})
+    final = bracket.nodes[104]
+    assert final.winner == "Gamma" and final.loser == "Alpha"
+    assert not final.drawn_unresolved
+
+
+def test_winner_override_ignores_team_not_in_tie() -> None:
+    bracket = build_real_bracket(_final_weekend_schedule())
+    assert bracket is not None
+    matches = _matches(
+        [
+            {"date": date(2026, 7, 19), "home_team": "Alpha", "away_team": "Gamma",
+             "home_goals": 0, "away_goals": 0, "city": "East Rutherford"},
+        ]
+    )
+    attach_played_results(bracket, matches, winner_overrides={104: "Zeta"})
+    final = bracket.nodes[104]
+    assert final.winner is None and final.drawn_unresolved
+
+
+def test_winner_override_resolves_drawn_third_place() -> None:
+    bracket = build_real_bracket(_final_weekend_schedule())
+    assert bracket is not None
+    matches = _matches(
+        [
+            {"date": date(2026, 7, 14), "home_team": "Alpha", "away_team": "Beta",
+             "home_goals": 2, "away_goals": 0, "city": "Arlington"},
+            {"date": date(2026, 7, 15), "home_team": "Gamma", "away_team": "Delta",
+             "home_goals": 1, "away_goals": 0, "city": "Atlanta"},
+            {"date": date(2026, 7, 18), "home_team": "Beta", "away_team": "Delta",
+             "home_goals": 2, "away_goals": 2, "city": "Miami Gardens"},
+        ]
+    )
+    attach_played_results(bracket, matches)
+    tp = bracket.third_place
+    assert tp is not None and tp.winner is None and tp.drawn_unresolved
+
+    bracket2 = build_real_bracket(_final_weekend_schedule())
+    assert bracket2 is not None
+    attach_played_results(bracket2, matches, winner_overrides={103: "Delta"})
+    tp2 = bracket2.third_place
+    assert tp2 is not None and tp2.winner == "Delta" and tp2.loser == "Beta"
+    assert not tp2.drawn_unresolved
+
+
+def test_load_ko_winner_overrides_roundtrip(tmp_path, monkeypatch) -> None:
+    from polymbappe.simulate.real_bracket import load_ko_winner_overrides
+
+    monkeypatch.chdir(tmp_path)
+    assert load_ko_winner_overrides() == {}  # no file yet
+
+    configs = tmp_path / "configs"
+    configs.mkdir()
+    (configs / "ko_winner_overrides.yaml").write_text("104:  Spain \n103: France\n")
+    assert load_ko_winner_overrides() == {104: "Spain", 103: "France"}
+
+
 def test_attach_tolerates_duplicate_match_rows() -> None:
     bracket = build_real_bracket(_mini_bracket())
     assert bracket is not None

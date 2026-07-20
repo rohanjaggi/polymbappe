@@ -1,4 +1,4 @@
-"""Page 1 — Tournament Overview.
+"""Tournament Overview.
 
 Model scorecard hero, trophy probability leaderboard, biggest surprises,
 and group-stage predictions vs actuals.
@@ -23,8 +23,22 @@ def render(settings: Settings) -> None:
     stage_df = data.load_stage_probabilities(settings)
     match_df = data.load_match_predictions(settings)
 
+    champion = data.champion_team(stage_df)
+    if champion is not None:
+        st.markdown(f"## 🏆 {champion} — 2026 World Cup champions")
+        
+    updated = data.last_updated(settings)
+    if updated is not None:
+        st.caption(
+            f"Forecasts last updated {updated:%d %b %Y, %H:%M} UTC · "
+            "[source & methodology](https://github.com/pastchum/polymbappe)"
+        )
+
     if stage_df.is_empty():
-        st.info("No simulation results yet. Run `polymbappe simulate` to populate the dashboard.")
+        st.info(
+            "Forecasts haven't been published yet — the leaderboard, scorecard and "
+            "group-stage comparisons appear here once the first simulation results land."
+        )
         return
 
     _render_scorecard(st, settings, match_df)
@@ -54,35 +68,73 @@ def _render_scorecard(st: object, settings: Settings, match_df: pl.DataFrame) ->
     st.subheader("Model Scorecard")
 
     cols = st.columns(4)
-    cols[0].metric("Matches Predicted", n)
-    cols[1].metric("Top-Pick Accuracy", f"{scorecard['accuracy']:.0%}")
+    cols[0].metric("Matches scored", n)
+    cols[1].metric(
+        "Top-pick accuracy",
+        f"{scorecard['accuracy']:.1%}",
+        help=(
+            "Share of matches where the model's most likely outcome happened. "
+            "Picking home/draw/away at random ≈ 33%."
+        ),
+    )
     cols[2].metric(
-        "Ranked Probability Score",
-        f"{scorecard['rps']:.4f}",
-        delta=f"{(1 - scorecard['rps'] / 0.2222) * 100:.0f}% better than random",
+        "RPS",
+        f"{scorecard['rps']:.3f}",
+        delta=f"{scorecard['rps_skill']:.0%} better than a uniform guess",
         delta_color="normal",
         help=(
-            "Measures full probability calibration, not just the top pick."
-            " Lower is better. Random = 0.222."
+            "Ranked probability score — grades the full home/draw/away probabilities, "
+            "not just the top pick. Lower is better; the benchmark is a uniform "
+            "⅓/⅓/⅓ forecast scored on the same matches."
         ),
     )
     cols[3].metric(
-        "Brier Score",
+        "Brier score",
         f"{scorecard['brier_score']:.3f}",
-        delta=f"{(1 - scorecard['brier_score'] / 0.6667) * 100:.0f}% better than random",
+        delta=f"{scorecard['brier_skill']:.0%} better than a uniform guess",
         delta_color="normal",
-        help="Mean squared error over H/D/A probabilities. Lower is better. Random = 0.667.",
+        help=(
+            "Mean squared error of the home/draw/away probabilities. Lower is "
+            "better; the benchmark is the same uniform forecast."
+        ),
     )
 
 
 def _render_trophy_leaderboard(st: object, stage_df: pl.DataFrame) -> None:
-    """Trophy probability bar chart + top contenders table."""
+    """Title race while it's live; how the field finished once it's decided."""
+
+    if data.champion_team(stage_df) is not None:
+        st.subheader("How the Field Finished")
+        standings = data.final_standings(stage_df)
+        early = ("Round of 32", "Group stage")
+        deep_runs = standings.filter(~pl.col("result").is_in(early))
+        early_exits = standings.filter(pl.col("result").is_in(early))
+        st.dataframe(deep_runs.to_pandas(), width="stretch", hide_index=True)
+        if not early_exits.is_empty():
+            with st.expander(f"Earlier exits ({early_exits.height} teams)"):
+                st.dataframe(
+                    early_exits.to_pandas(), width="stretch", hide_index=True
+                )
+        return
 
     st.subheader("Trophy Probability Leaderboard")
-    st.plotly_chart(charts.trophy_bar(stage_df, n=10), use_container_width=True)
+    alive = stage_df.filter(pl.col("champion") > 0)
+    st.caption(
+        f"{alive.height} of {stage_df.height} teams can still win the title. "
+        "Eliminated teams are excluded."
+    )
+    st.plotly_chart(charts.trophy_bar(alive, n=10), width="stretch")
     st.dataframe(
-        data.top_contenders(stage_df, n=10).to_pandas(),
-        use_container_width=True,
+        data.top_contenders(alive, n=10).to_pandas(),
+        width="stretch",
+        hide_index=True,
+        column_config={
+            "team": st.column_config.TextColumn("Team"),
+            **{
+                stage: st.column_config.NumberColumn(stage, format="percent")
+                for stage in data.STAGE_COLUMNS
+            },
+        },
     )
 
 
@@ -103,7 +155,7 @@ def _render_biggest_surprises(
     )
     surprises = data.biggest_surprises(finished, n=5)
     if not surprises.is_empty():
-        st.dataframe(surprises.to_pandas(), use_container_width=True, hide_index=True)
+        st.dataframe(surprises.to_pandas(), width="stretch", hide_index=True)
 
 
 def _render_group_comparison(
@@ -143,5 +195,5 @@ def _render_group_comparison(
         with col:
             st.plotly_chart(
                 charts.group_standings_chart(predicted, actual, group),
-                use_container_width=True,
+                width="stretch",
             )

@@ -40,10 +40,17 @@ class EloRatings:
             home_rating += self.config.home_advantage
         return 1.0 / (1.0 + 10 ** ((away_rating - home_rating) / 400.0))
 
-    def update(self, home_team: str, away_team: str, home_goals: int, away_goals: int) -> None:
+    def update(
+        self,
+        home_team: str,
+        away_team: str,
+        home_goals: int,
+        away_goals: int,
+        neutral: bool = False,
+    ) -> None:
         """Update Elo ratings from one match result."""
 
-        expected_home = self.expected_home_win_prob(home_team, away_team)
+        expected_home = self.expected_home_win_prob(home_team, away_team, neutral=neutral)
         if home_goals > away_goals:
             observed_home = 1.0
         elif home_goals < away_goals:
@@ -65,8 +72,8 @@ def build_elo_features(
 
     Walks matches in chronological order, recording each team's rating *before* the
     match is played, then updating from the result. The recorded ``elo_pre`` therefore
-    uses only strictly-earlier matches (no leakage). Neutral-site handling follows the
-    underlying :class:`EloRatings` (home advantage applied only to the listed home team).
+    uses only strictly-earlier matches (no leakage). The ``neutral_site`` flag is
+    threaded into each update, so no home advantage is credited at neutral venues.
 
     Args:
         matches: Frame with the ``matches`` schema.
@@ -93,7 +100,10 @@ def build_elo_features(
         records.append(
             {"match_id": match_id, "team": away, "date": match_date, "elo_pre": elo.rating(away)}
         )
-        elo.update(home, away, int(row["home_goals"]), int(row["away_goals"]))
+        elo.update(
+            home, away, int(row["home_goals"]), int(row["away_goals"]),
+            neutral=bool(row.get("neutral_site", False)),
+        )
 
     return pl.DataFrame(
         records,
@@ -119,7 +129,10 @@ def build_elo_snapshots(
     records: list[dict[str, object]] = []
     for row in df.iter_rows(named=True):
         home, away = row["home_team"], row["away_team"]
-        elo.update(home, away, int(row["home_goals"]), int(row["away_goals"]))
+        elo.update(
+            home, away, int(row["home_goals"]), int(row["away_goals"]),
+            neutral=bool(row.get("neutral_site", False)),
+        )
         records.append({"team": home, "date": row["date"], "rating": elo.rating(home)})
         records.append({"team": away, "date": row["date"], "rating": elo.rating(away)})
 

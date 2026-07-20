@@ -1,0 +1,11 @@
+# Manual knockout winner overrides: {FIFA match number: winner team name}.
+#
+# Needed only for a played tie whose feed scoreline is a draw (extra time /
+# penalties) AND whose winner cannot be inferred from a later round — in the
+# 2026 format that is the final (104) and the third-place play-off (103).
+# Every other round resolves automatically from who appears further down the
+# bracket. Team names are alias-normalized, so the results feed's spelling works.
+#
+# Example:
+# 104: Spain
+{}

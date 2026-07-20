@@ -253,6 +253,60 @@ def bracket_compatible(bracket: RealBracket, structure: object) -> bool:
 # ---------------------------------------------------------------------------
 
 
+def load_ko_winner_overrides(settings: object | None = None) -> dict[int, str]:
+    """Manual ``{match_number: winner}`` overrides from ``configs/ko_winner_overrides.yaml``.
+
+    The shootout-winner inference in :func:`_resolve_drawn_ties` works by looking at who
+    appears in a *later* round — which the final and the third-place play-off don't have.
+    A tie decided beyond regulation there (the feed records the 90'/120' draw) can only be
+    resolved by this file. Team names are normalized through the alias table, so the
+    canonical spelling used by the results feed works as-is.
+    """
+
+    from polymbappe.config import Settings
+    from polymbappe.data.aliases import normalize_team_name
+
+    resolved = settings if isinstance(settings, Settings) else Settings()
+    path = resolved.configs_dir / "ko_winner_overrides.yaml"
+    if not path.exists():
+        return {}
+    import yaml
+
+    with path.open() as fh:
+        raw = yaml.safe_load(fh) or {}
+    if not isinstance(raw, dict):
+        logger.warning("real_bracket.bad_override_file", path=str(path))
+        return {}
+    return {int(num): normalize_team_name(str(team)) for num, team in raw.items()}
+
+
+def _apply_winner_overrides(bracket: RealBracket, overrides: dict[int, str]) -> None:
+    """Resolve still-drawn pinned ties from manual overrides (mutates nodes)."""
+
+    candidates = list(bracket.nodes.values()) + (
+        [bracket.third_place] if bracket.third_place is not None else []
+    )
+    for node in candidates:
+        winner = overrides.get(node.number)
+        if winner is None or not node.pinned or node.winner is not None:
+            continue
+        pair = {node.pinned_home, node.pinned_away}
+        if winner not in pair:
+            logger.warning(
+                "real_bracket.invalid_winner_override",
+                match_number=node.number,
+                winner=winner,
+                teams=sorted(t for t in pair if t is not None),
+            )
+            continue
+        node.winner = winner
+        node.loser = (pair - {winner}).pop()
+        node.drawn_unresolved = False
+        logger.info(
+            "real_bracket.winner_override", match_number=node.number, winner=winner
+        )
+
+
 def _city_tokens(city: str | None) -> frozenset[str]:
     """Match tokens for a host-city label: ``"Dallas (Arlington)"`` -> dallas/arlington/full."""
 
@@ -286,7 +340,11 @@ def _played_ko_matches(bracket: RealBracket, matches: pl.DataFrame) -> list[dict
     return list(ko.sort("date").iter_rows(named=True))
 
 
-def attach_played_results(bracket: RealBracket, matches: pl.DataFrame) -> None:
+def attach_played_results(
+    bracket: RealBracket,
+    matches: pl.DataFrame,
+    winner_overrides: dict[int, str] | None = None,
+) -> None:
     """Pin played matches onto bracket nodes and lock/infer their winners (mutates nodes).
 
     Pinning, in priority order per played match: exact team-pair (nodes whose sides are
@@ -298,8 +356,11 @@ def attach_played_results(bracket: RealBracket, matches: pl.DataFrame) -> None:
     records the 90'/120' score, so extra-time/penalty ties land as draws) is resolved by
     who appears further down the tree — the parent node's pinned pair, any later round's
     pinned occupants, or (for a drawn semi-final) the third-place match's participants,
-    who are by definition the SF losers. A draw with no later evidence yet is flagged
-    ``drawn_unresolved`` for the caller to forecast conditionally (beyond regulation).
+    who are by definition the SF losers. ``winner_overrides`` (see
+    :func:`load_ko_winner_overrides`) then settles ties that inference cannot — the final
+    and the third-place play-off have no later round to look at. A draw still unresolved
+    after all that is flagged ``drawn_unresolved`` for the caller to forecast
+    conditionally (beyond regulation).
     """
 
     played = _played_ko_matches(bracket, matches)
@@ -358,6 +419,8 @@ def attach_played_results(bracket: RealBracket, matches: pl.DataFrame) -> None:
             )
 
     _resolve_drawn_ties(bracket)
+    if winner_overrides:
+        _apply_winner_overrides(bracket, winner_overrides)
 
 
 def _pin(node: BracketNode, row: dict[str, object]) -> None:
@@ -427,6 +490,17 @@ def _resolve_drawn_ties(bracket: RealBracket) -> None:
             "real_bracket.draw_unresolved",
             match_number=node.number,
             teams=sorted(pair),
+        )
+
+    # The third-place play-off sits outside the tree: no later round can ever settle a
+    # drawn scoreline, so it goes straight to drawn_unresolved (override or forecast).
+    tp = bracket.third_place
+    if tp is not None and tp.pinned and tp.winner is None:
+        tp.drawn_unresolved = True
+        logger.info(
+            "real_bracket.draw_unresolved",
+            match_number=tp.number,
+            teams=sorted({tp.pinned_home, tp.pinned_away}),  # type: ignore[arg-type]
         )
 
 

@@ -1,4 +1,4 @@
-"""Page 3 — Predictions vs Actuals.
+"""Predictions vs Actuals.
 
 Scores the model's pre-match H/D/A forecasts against recorded tournament results
 with a stage filter (All / Group Stage / Knockout).
@@ -12,9 +12,6 @@ from polymbappe.config import Settings
 from polymbappe.dashboard import data
 from polymbappe.dashboard.components import charts
 
-#: Display label for each H/D/A outcome key.
-_OUTCOME_LABEL = {"home": "Home win", "draw": "Draw", "away": "Away win"}
-
 
 def render(settings: Settings) -> None:
     """Render the Predictions vs Actuals page."""
@@ -25,7 +22,7 @@ def render(settings: Settings) -> None:
 
     match_df = data.load_match_predictions(settings)
     if match_df.is_empty():
-        st.info("No match predictions yet. Run `polymbappe simulate`/`report` to populate.")
+        st.info("Scoring appears here once predictions are published and matches are played.")
         return
 
     results = data.tournament_results(data.load_recorded_results(settings))
@@ -57,15 +54,9 @@ def render(settings: Settings) -> None:
     st.divider()
     _render_breakdowns(st, finished)
     st.divider()
-    _render_significance(st, finished)
-    st.divider()
-    _render_competitive_subset(st, finished)
-    st.divider()
     _render_market(st, finished, settings)
     st.divider()
     _render_xg_analysis(st, finished, match_xg)
-    st.divider()
-    _render_match_table(st, finished)
 
 
 def _render_scorecard(st: object, finished: pl.DataFrame) -> None:
@@ -78,8 +69,9 @@ def _render_scorecard(st: object, finished: pl.DataFrame) -> None:
     cols[2].metric(
         "RPS",
         f"{scorecard['rps']:.3f}",
-        help="Ranked Probability Score — the ordinal (H<D<A) proper scoring rule and the "
-        "standard headline for 1X2 football. Lower is better; uniform ≈ 0.198.",
+        help="Ranked probability score — grades the full home/draw/away probabilities, "
+        "not just the top pick. Lower is better; the benchmark is a uniform "
+        "⅓/⅓/⅓ forecast scored on the same matches (skill below).",
     )
     cols[3].metric(
         "Brier score",
@@ -107,13 +99,13 @@ def _render_breakdowns(st: object, finished: pl.DataFrame) -> None:
         st.subheader("Accuracy by outcome")
         st.plotly_chart(
             charts.outcome_accuracy_bar(data.accuracy_by_outcome(finished)),
-            use_container_width=True,
+            width="stretch",
         )
     with right:
         st.subheader("Calibration")
         st.plotly_chart(
             charts.calibration_curve(data.calibration_bins(finished)),
-            use_container_width=True,
+            width="stretch",
         )
         cal = data.calibration_summary(finished)
         slope = "—" if cal["slope"] != cal["slope"] else f"{cal['slope']:.2f}"  # nan check
@@ -123,53 +115,6 @@ def _render_breakdowns(st: object, finished: pl.DataFrame) -> None:
             f"**{slope}** (1 = perfect; <1 overconfident, >1 underconfident), "
             f"intercept {intercept}."
         )
-
-
-def _render_significance(st: object, finished: pl.DataFrame) -> None:
-    """Paired test that the model's per-match RPS genuinely beats a uniform forecast."""
-
-    st.subheader("Is the edge real? (RPS vs. uniform)")
-    sig = data.rps_significance(finished)
-    cols = st.columns(3)
-    cols[0].metric(
-        "Mean per-match RPS gap",
-        f"{sig['mean_diff']:+.4f}",
-        help="Model minus uniform per-match RPS. Negative = the model is sharper.",
-    )
-    cols[1].metric(
-        "95% bootstrap CI",
-        f"[{sig['ci_low']:+.4f}, {sig['ci_high']:+.4f}]",
-        help="Paired bootstrap over matches. Entirely below 0 ⇒ significant at 95%.",
-    )
-    cols[2].metric("Wilcoxon p", f"{sig['wilcoxon_p']:.3f}")
-    beats = sig["ci_high"] < 0
-    st.caption(
-        "✅ The model's probabilities significantly beat a uniform guess on these "
-        "fixtures (bootstrap CI below 0)." if beats else
-        "⚠️ Not yet significant vs. a uniform guess at this sample size — expected with "
-        "few matches; scoring rules need more fixtures to separate."
-    )
-
-
-def _render_competitive_subset(st: object, finished: pl.DataFrame) -> None:
-    """Re-report the headline scoring rules on close games (favourite prob 40–60%)."""
-
-    st.subheader("Competitive subset (favourite 40–60%)")
-    st.caption(
-        "The number that actually reveals skill: restrict to close games where the "
-        "favourite's probability is 40–60%. If the edge survives here, it isn't just "
-        "calling blowouts."
-    )
-    subset = data.competitive_subset(finished)
-    if subset.is_empty():
-        st.info("No finished matches fall in the 40–60% favourite band yet.")
-        return
-    card = data.prediction_scorecard(subset)
-    cols = st.columns(4)
-    cols[0].metric("Close games", int(card["n"]))
-    cols[1].metric("Accuracy", f"{card['accuracy']:.1%}")
-    cols[2].metric("RPS", f"{card['rps']:.3f}")
-    cols[3].metric("RPS skill vs uniform", f"{card['rps_skill']:+.1%}")
 
 
 def _render_market(st: object, finished: pl.DataFrame, settings: Settings) -> None:
@@ -251,7 +196,7 @@ def _render_xg_analysis(
     # Error decomposition
     if has_actual_xg and "xg_n" in summary:
         st.caption(
-            f"FBref actual xG available for {int(summary['xg_n'])} matches. "
+            f"FotMob actual xG available for {int(summary['xg_n'])} matches. "
             "The model's goal prediction error breaks down into two parts: "
             "how well it predicted the chances created (model error), and "
             "how much finishing variance affected the outcome (luck)."
@@ -261,7 +206,7 @@ def _render_xg_analysis(
             "Model error (MAE)",
             f"{summary['model_vs_xg_mae']:.2f}",
             help=(
-                "Avg difference between our predicted xG and FBref's actual xG."
+                "Avg difference between our predicted xG and FotMob's actual xG."
                 " Measures pure model quality."
             ),
         )
@@ -284,8 +229,8 @@ def _render_xg_analysis(
     else:
         if not has_actual_xg:
             st.caption(
-                "Run `polymbappe ingest --live` to pull FBref actual xG and decompose "
-                "model error from finishing-luck variance."
+                "Actual xG data isn't loaded for these matches yet — once it is, this "
+                "section splits prediction error into model error vs finishing luck."
             )
         row2 = st.columns(3)
         row2[0].metric("Home xG MAE", f"{summary['home_mae']:.2f}",
@@ -296,11 +241,11 @@ def _render_xg_analysis(
 
     st.plotly_chart(
         charts.xg_scatter(finished, match_xg if has_actual_xg else None),
-        use_container_width=True,
+        width="stretch",
     )
 
     st.subheader(f"Per-match xG breakdown ({finished.height})")
-    st.dataframe(_xg_table(finished, match_xg), use_container_width=True, hide_index=True)
+    st.dataframe(_xg_table(finished, match_xg), width="stretch", hide_index=True)
 
 
 def _xg_table(finished: pl.DataFrame, match_xg: pl.DataFrame) -> object:
@@ -345,35 +290,3 @@ def _xg_table(finished: pl.DataFrame, match_xg: pl.DataFrame) -> object:
     return pl.DataFrame(rows).to_pandas()
 
 
-def _render_match_table(st: object, finished: pl.DataFrame) -> None:
-    """Per-match scorecard: scoreline, model pick, and probabilities of pick vs. outcome."""
-
-    st.subheader(f"Per-match scorecard ({finished.height})")
-    st.dataframe(_scorecard_table(finished), use_container_width=True, hide_index=True)
-
-
-def _scorecard_table(finished: pl.DataFrame) -> object:
-    """Pandas display frame: each finished match with its model call vs. the result."""
-
-    rows = []
-    for r in finished.iter_rows(named=True):
-        probs = {
-            "home": float(r["model_home"]),
-            "draw": float(r["model_draw"]),
-            "away": float(r["model_away"]),
-        }
-        actual = str(r["actual_outcome"])
-        rows.append(
-            {
-                "Date": str(r["date"]) if r.get("date") is not None else "",
-                "Group": r["group"],
-                "Fixture": f"{r['home_team']} vs {r['away_team']}",
-                "Score": f"{int(r['home_goals'])} – {int(r['away_goals'])}",
-                "Result": _OUTCOME_LABEL.get(actual, actual),
-                "Model pick": _OUTCOME_LABEL.get(str(r["model_pick"]), str(r["model_pick"])),
-                "P(pick)": f"{max(probs.values()):.1%}",
-                "P(actual)": f"{probs[actual]:.1%}",
-                "Correct": "✅" if r["model_correct"] else "❌",
-            }
-        )
-    return pl.DataFrame(rows).to_pandas()

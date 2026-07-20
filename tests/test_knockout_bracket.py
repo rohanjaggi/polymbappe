@@ -159,6 +159,68 @@ def test_bracket_unresolved_draw_emits_beyond_regulation_split() -> None:
     assert {"A", "B"} <= occupants
 
 
+def _final_weekend_schedule() -> pl.DataFrame:
+    """Two semi-finals feeding the final (W refs) and third place (L refs)."""
+
+    return pl.DataFrame(
+        {
+            "match_id": ["sf1", "sf2", "tp", "final"],
+            "date": [
+                date(2026, 7, 14), date(2026, 7, 15), date(2026, 7, 18), date(2026, 7, 19),
+            ],
+            "stage": ["Semi-final", "Semi-final", "Match for third place", "Final"],
+            "group": [None] * 4,
+            "home_team": ["A", "C", "L101", "W101"],
+            "away_team": ["B", "D", "L102", "W102"],
+            "city": [None] * 4,
+            "match_number": [101, 102, 103, 104],
+        },
+        schema_overrides={"group": pl.Utf8, "city": pl.Utf8, "match_number": pl.Int32},
+    )
+
+
+def test_bracket_forecasts_third_place_from_semi_loser_distributions() -> None:
+    teams = ["A", "B", "C", "D"]
+    df = compute_knockout_bracket(
+        _final_weekend_schedule(), _no_results(), _model(teams), TournamentStructure(groups={})
+    )
+    tp = df.filter(pl.col("round") == "THIRD")
+    # One row per possible SF-loser pairing: {A,B} x {C,D}.
+    assert tp.height == 4
+    assert abs(tp["matchup_prob"].sum() - 1.0) < 1e-9
+    sides_a = set(tp["team_a"].to_list())
+    sides_b = set(tp["team_b"].to_list())
+    assert sides_a == {"A", "B"} and sides_b == {"C", "D"}
+
+
+def test_bracket_locks_played_third_place() -> None:
+    teams = ["A", "B", "C", "D"]
+    results = pl.DataFrame(
+        {
+            "match_id": ["sf1", "sf2", "tp"],
+            "date": [date(2026, 7, 14), date(2026, 7, 15), date(2026, 7, 18)],
+            "home_team": ["A", "C", "B"], "away_team": ["B", "D", "D"],
+            "home_goals": [2, 1, 3], "away_goals": [0, 0, 1],
+            "competition": ["FIFA World Cup"] * 3, "is_knockout": [True] * 3,
+            "neutral_site": [True] * 3, "group": [None] * 3,
+        },
+        schema_overrides={"group": pl.Utf8},
+    )
+    df = compute_knockout_bracket(
+        _final_weekend_schedule(), results, _model(teams), TournamentStructure(groups={})
+    )
+    tp = df.filter(pl.col("round") == "THIRD")
+    assert tp.height == 1
+    row = tp.row(0, named=True)
+    assert {row["team_a"], row["team_b"]} == {"B", "D"}
+    winner_side = "p_a_advance" if row["team_a"] == "B" else "p_b_advance"
+    assert row[winner_side] == 1.0
+    # The final projects the two SF winners.
+    final = df.filter(pl.col("round") == "FINAL")
+    assert final.height == 1
+    assert {final.row(0, named=True)["team_a"], final.row(0, named=True)["team_b"]} == {"A", "C"}
+
+
 def test_bracket_resolves_position_placeholders_from_complete_groups() -> None:
     teams = ["W", "X", "Y", "Z"]
     structure = TournamentStructure(groups={"A": teams})

@@ -299,7 +299,7 @@ def build_tournament_context_features(
     from polymbappe.eval.backtest import select_fixtures
     from polymbappe.features.elo import build_elo_snapshots
 
-    squads, records, city_coords = _load_context_tables(settings)
+    squads, records, city_coords, team_xg = _load_context_tables(settings)
     travel_coords = (
         build_city_coord_lookup(city_coords) if city_coords is not None else {}
     )
@@ -312,7 +312,10 @@ def build_tournament_context_features(
         history = matches.filter(pl.col("date") < tournament.start)
         if history.is_empty():
             continue
-        overperf = latest_overperformance(history)
+        # team_xg makes the proxy path meaningful; without it the goals-vs-goals proxy is
+        # identically zero historically while non-zero live (train/serve skew). The as_of
+        # cutoff keeps the tournament's own xG rows out of its fit features.
+        overperf = latest_overperformance(history, team_xg, as_of_date=tournament.start)
         snaps = (
             build_elo_snapshots(history)
             .sort(["team", "date"])
@@ -379,15 +382,16 @@ def _tournament_travel(
 
 def _load_context_tables(
     settings: object | None,
-) -> tuple[pl.DataFrame | None, pl.DataFrame | None, pl.DataFrame | None]:
-    """Read the ``squads`` / ``manager_records`` / ``city_coords`` tables, else ``None`` each."""
+) -> tuple[pl.DataFrame | None, pl.DataFrame | None, pl.DataFrame | None, pl.DataFrame | None]:
+    """Read the ``squads`` / ``manager_records`` / ``city_coords`` / ``team_xg`` tables,
+    else ``None`` each."""
 
     try:
         from polymbappe.config import Settings
         from polymbappe.data.store import read_table, table_exists
         from polymbappe.data.tables import Table
     except Exception:  # noqa: BLE001 - data layer optional in minimal test contexts
-        return None, None, None
+        return None, None, None, None
 
     resolved = settings if settings is not None else Settings()
 
@@ -398,4 +402,9 @@ def _load_context_tables(
             else None
         )
 
-    return _maybe(Table.SQUADS), _maybe(Table.MANAGER_RECORDS), _maybe(Table.CITY_COORDS)
+    return (
+        _maybe(Table.SQUADS),
+        _maybe(Table.MANAGER_RECORDS),
+        _maybe(Table.CITY_COORDS),
+        _maybe(Table.TEAM_XG),
+    )

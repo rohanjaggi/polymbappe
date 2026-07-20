@@ -153,14 +153,11 @@ def apply_best_config(result: AutotuneResult, settings: Settings | None = None) 
 
 def run_autotune(
     budget: str = "2h",
-    metric: str = "rps",
-    resume: bool = False,
     leaderboard: bool = False,
     apply_best: bool = False,
 ) -> None:
     """CLI entrypoint for ``polymbappe autotune``."""
 
-    _ = (metric, resume)
     from polymbappe.data.store import read_table, table_exists
     from polymbappe.data.tables import Table
 

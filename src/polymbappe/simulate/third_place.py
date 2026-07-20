@@ -8,6 +8,8 @@ from polymbappe.data.schema import GroupStanding
 def rank_third_placed_teams(third_rows: list[GroupStanding]) -> list[GroupStanding]:
     """Rank third-placed teams across groups using FIFA cross-group rules."""
 
+    # fair_play_score uses FIFA's negative deduction points (yellow = -1, ...),
+    # so higher (closer to zero) is better and sorts descending like the rest.
     return sorted(
         third_rows,
         key=lambda row: (

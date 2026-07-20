@@ -1,106 +1,65 @@
-# WC2026 Prediction Results
+# FIFA World Cup 2026 — Tournament Retrospective
 
-Live prediction accuracy for the 2026 FIFA World Cup group stage, scored by
-the [Predictions vs Actuals](../src/polymbappe/dashboard/pages/predictions_vs_actuals.py)
-dashboard page as results came in.
+How the model actually did, scored against every completed match. Regenerate with `polymbappe retrospective` (trajectory via `polymbappe trajectory`).
 
 ## Headline numbers
 
-After all **90 group-stage matches**:
+Scored over **102 matches** (group stage through the knockout rounds):
 
-- **70% accuracy** on a 3-way classification problem (home win / draw / away win), where random guessing gets 33%
-- **87% accuracy** when the model was 70%+ confident in its pick (20/23)
-- **90% accuracy** on decisive outcomes — home wins and away wins combined (60/67)
+| Metric | Value | Skill vs uniform | What it measures |
+|--------|------:|-----------------:|------------------|
+| Top-pick accuracy | 71.6% | vs 33.3% random | Share of matches where the model's pick matched the result |
+| RPS | 0.1353 | 43.3% | Ranked probability score over ordered H/D/A — lower is better |
+| Brier score | 0.443 | 33.6% | Mean squared probability error — lower is better |
+| Log loss | 0.766 | 30.3% | Surprise at realized outcomes — punishes confident misses |
 
-## Scorecard
+## Accuracy by round
 
-| Metric | Value | Baseline | What it measures |
-|--------|------:|--------:|------------------|
-| Accuracy | 70.0% | 33.3% (random) | Share of matches where the top pick matched the result |
-| Brier score | 0.439 | 0.667 (uniform) | Mean squared error of the probability predictions — lower is better, 0 is perfect |
-| Log loss | 0.759 | 1.020 (benchmark) | How surprised the model is by actual outcomes — penalizes confident wrong calls harshly |
+| Round | Matches | Top-pick accuracy | Avg P(actual) |
+|-------|--------:|------------------:|--------------:|
+| Group stage | 72 | 66.7% | 51.1% |
+| Round of 32 | 16 | 81.2% | 51.6% |
+| Round of 16 | 8 | 75.0% | 46.5% |
+| Quarter-finals | 4 | 100.0% | 51.1% |
+| Semi-finals | 2 | 100.0% | 43.2% |
 
-The Brier score is 34% better than a model that assigns equal probability to
-all three outcomes. Log loss sits well below the 1.02 target used in the
-academic sports-forecasting literature.
+## The title race, replayed honestly
 
-## Accuracy by outcome
+Each column re-simulates the tournament using only information available on that date (Dixon-Coles refit on pre-date history, played results locked, real bracket walked — no hindsight). Full daily resolution lives in `data/outputs/champion_trajectory.parquet` and on the dashboard's Tournament Retrospective page.
 
-| Outcome | Correct | Total | Accuracy |
-|---------|--------:|------:|---------:|
-| Home win | 47 | 53 | 88.7% |
-| Away win | 13 | 14 | 92.9% |
-| Draw | 3 | 23 | 13.0% |
+| Team | Pre-tournament | Mid-tournament | Pre-final | Final |
+|------|---:|---:|---:|---:|
+| Spain | 12.8% | 12.8% | 59.0% | 55.5% |
+| Argentina | 16.2% | 30.1% | 24.6% | 44.5% |
+| France | 4.2% | 9.8% | 0.0% | 0.0% |
+| England | 8.9% | 5.5% | 16.4% | 0.0% |
+| Brazil | 7.1% | 6.1% | 0.0% | 0.0% |
+| Morocco | 5.5% | 3.1% | 0.0% | 0.0% |
 
-The model excels at identifying which team will win (90% combined on decisive
-outcomes). Draw prediction is weak — and deliberately so. Draws are the hardest
-outcome to predict in football; even professional bookmakers rarely make the
-draw their top pick. The model correctly learns that predicting a decisive
-winner is almost always the higher-EV call.
+## Upsets the model didn't see coming
 
-## Confidence calibration
+Results given under 25% probability:
 
-When the model assigns higher confidence, it delivers higher accuracy:
+| Fixture | Score | Model pick | Actual | P(actual) |
+|---------|-------|-----------|--------|----------:|
+| Qatar vs Switzerland | 1 – 1 | Switzerland (90%) | Draw | 8% |
+| Spain vs Cape Verde | 0 – 0 | Spain (83%) | Draw | 13% |
+| Japan vs Sweden | 1 – 1 | Japan (62%) | Draw | 22% |
+| Germany vs Ecuador | 1 – 2 | Germany (44%) | Ecuador | 23% |
+| Iran vs New Zealand | 2 – 2 | Iran (62%) | Draw | 24% |
+| England vs Ghana | 0 – 0 | England (66%) | Draw | 24% |
+| Ivory Coast vs Ecuador | 1 – 0 | Draw (47%) | Ivory Coast | 25% |
 
-| Confidence threshold | Correct | Total | Accuracy |
-|---------------------:|--------:|------:|---------:|
-| >= 50% | 49 | 59 | 83.1% |
-| >= 60% | 33 | 39 | 84.6% |
-| >= 70% | 20 | 23 | 87.0% |
+## Model vs bookmaker favorites
 
-This is the calibration story: the model knows what it knows. When it's
-uncertain, it says so. When it's confident, it's almost always right.
+On the 72 matches shared with the bookmaker favorite tracker:
 
-## xG prediction quality
+- Model top-pick accuracy: **66.7%**
+- Bookmaker favorite accuracy: **62.5%**
+- McNemar's test on disagreements: p = 0.453
 
-The model predicts expected goals (xG) for each team per match. Comparing
-against FBref's actual xG (derived from real shot data) across all 90
-matches:
+The workbook tracks only the shortest-odds favorite (no full 1X2 prices), so this is an accuracy comparison, not a probability-scoring one.
 
-| Comparison | MAE |
-|------------|----:|
-| Model xG vs FBref xG (pure model quality) | 0.47 |
-| FBref xG vs actual goals (finishing luck) | 0.75 |
-| Model xG vs actual goals (combined) | 0.76 |
+## Trading the champion market
 
-The model's predicted xG correlates at **0.74** with FBref's ground truth.
-Its prediction error (0.47) is smaller than the inherent randomness of
-whether shots go in (0.75). In other words, the gap between FBref's
-ground-truth xG and the actual scoreline — pure finishing variance that no
-pre-match model can predict — is larger than the gap between the model and
-FBref. The model is closer to what *should* have happened than what *did*
-happen.
-
-## Historical validation
-
-The model was validated before the tournament using **leave-one-tournament-out**
-(LOTO) cross-validation across 11 major international tournaments spanning 14
-years:
-
-- FIFA World Cup 2010, 2014, 2018, 2022
-- UEFA Euro 2016, 2020, 2024
-- Copa America 2016, 2019, 2021, 2024
-
-Best mean Ranked Probability Score: **0.185** (target: < 0.21). The RPS
-measures how well the full probability distribution matches reality — not just
-the top pick, but whether the model assigns appropriate probabilities to all
-three outcomes. Lower is better.
-
-The automated hyperparameter search ran **231 experiments** across two phases:
-LLM-guided structural search (feature inclusion, architecture, meta-learner
-choice) followed by Optuna TPE numeric optimization. Each candidate was
-accepted only if it improved mean RPS by >0.003 and won on at least 3
-individual tournaments — no single-tournament flukes.
-
-## Methodology
-
-All metrics on this page are computed from the model's **pre-match
-predictions** (generated before each match was played) scored against actual
-results as they were ingested. No post-hoc fitting, no cherry-picking. The
-same scoring logic powers the live Streamlit dashboard's Predictions vs
-Actuals page.
-
-The prediction pipeline: 50,000 historical matches are ingested, 4 base models
-are stacked through an ensemble, contextual features are layered on top, and
-100,000 Monte Carlo simulations produce the final probabilities. See
-[architecture.md](architecture.md) for the full technical breakdown.
+_No Polymarket price history was available for the resolved champion market, so no P&L backtest was run._

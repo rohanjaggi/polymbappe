@@ -21,7 +21,7 @@ than crashing before the first ``polymbappe simulate`` run.
 from __future__ import annotations
 
 import math
-from datetime import UTC, date
+from datetime import UTC, date, datetime
 from pathlib import Path
 
 import numpy as np
@@ -109,7 +109,7 @@ KO_BRACKET_SCHEMA: dict[str, pl.DataType] = {
 }
 
 #: Knockout matchup rounds, broadest to narrowest (mirrors simulate.tournament.KNOCKOUT_ROUNDS).
-KNOCKOUT_ROUND_ORDER: tuple[str, ...] = ("R32", "R16", "QF", "SF", "FINAL")
+KNOCKOUT_ROUND_ORDER: tuple[str, ...] = ("R32", "R16", "QF", "SF", "FINAL", "THIRD")
 
 CHANGELOG_SCHEMA: dict[str, pl.DataType] = {
     "timestamp": pl.Utf8,
@@ -290,7 +290,7 @@ def knockout_results(results_df: pl.DataFrame, *, year: int = 2026) -> pl.DataFr
 def load_match_xg(settings: Settings) -> pl.DataFrame:
     """Load per-match actual xG from the ``match_xg`` normalized table.
 
-    Populated by ``polymbappe ingest --live`` (scrapes FBref) or a local
+    Populated by ``polymbappe ingest --live`` (fetches FotMob) or a local
     ``data/raw/match_xg.csv``. Returns a typed empty frame when absent so the
     xG analysis section degrades gracefully before any live xG is ingested.
     """
@@ -334,6 +334,60 @@ def top_contenders(df: pl.DataFrame, n: int = 10) -> pl.DataFrame:
     if df.is_empty() or "champion" not in df.columns:
         return df
     return df.sort("champion", descending=True).head(n)
+
+
+def champion_team(stage_df: pl.DataFrame) -> str | None:
+    """The decided champion, or ``None`` while the title is still open.
+
+    With results conditioned into the simulation, a resolved tournament pins one
+    team's ``champion`` probability to 1 — that team is the champion.
+    """
+
+    if stage_df.is_empty() or "champion" not in stage_df.columns:
+        return None
+    decided = stage_df.filter(pl.col("champion") >= 0.999)
+    if decided.is_empty():
+        return None
+    return str(decided.row(0, named=True)["team"])
+
+
+#: Public label for a team whose run ended at (or with) each stage.
+_STANDING_LABELS: tuple[tuple[str, str], ...] = (
+    ("champion", "🏆 Champions"),
+    ("FINAL", "Runners-up"),
+    ("SF", "Semi-finalists"),
+    ("QF", "Quarter-finalists"),
+    ("R16", "Round of 16"),
+    ("R32", "Round of 32"),
+)
+
+
+def final_standings(stage_df: pl.DataFrame) -> pl.DataFrame:
+    """Each team's furthest stage once the bracket has resolved.
+
+    Only meaningful when the tournament is decided (see :func:`champion_team`) —
+    conditioned stage probabilities are then 0/1 and the furthest stage with
+    probability ≥ 0.5 is the stage the team actually reached. Returns
+    ``[team, result]`` sorted deepest run first.
+    """
+
+    if stage_df.is_empty() or "champion" not in stage_df.columns:
+        return pl.DataFrame(schema={"team": pl.Utf8, "result": pl.Utf8})
+
+    rows: list[dict[str, object]] = []
+    for r in stage_df.iter_rows(named=True):
+        depth, label = len(_STANDING_LABELS), "Group stage"
+        for i, (stage, stage_label) in enumerate(_STANDING_LABELS):
+            if stage in r and float(r[stage]) >= 0.5:
+                depth, label = i, stage_label
+                break
+        rows.append({"team": str(r["team"]), "result": label, "_depth": depth})
+
+    return (
+        pl.DataFrame(rows)
+        .sort(["_depth", "team"])
+        .drop("_depth")
+    )
 
 
 def available_teams(stage_df: pl.DataFrame) -> list[str]:
@@ -893,9 +947,9 @@ def xg_error_summary(
     Always computes model-vs-goals MAE. When ``match_xg`` is provided and contains rows
     matching the finished fixtures, additionally computes:
 
-    - ``model_vs_xg_home/away_mae``: model predicted xG vs actual FBref xG (pure model
+    - ``model_vs_xg_home/away_mae``: model predicted xG vs actual FotMob xG (pure model
       quality, removes finishing-luck noise).
-    - ``xg_vs_goals_home/away_mae``: actual FBref xG vs actual goals (finishing luck).
+    - ``xg_vs_goals_home/away_mae``: actual FotMob xG vs actual goals (finishing luck).
 
     Returns zeroed dict when required columns are absent.
     """
@@ -921,7 +975,7 @@ def xg_error_summary(
         return result
 
     # Join actual xG onto finished fixtures by (home_team, away_team), with a
-    # reversed-pairing fallback for neutral-venue matches where FBref and the
+    # reversed-pairing fallback for neutral-venue matches where FotMob and the
     # prediction schedule list home/away in opposite order.
     xg_slim = match_xg.select(["home_team", "away_team", "home_xg", "away_xg"])
     joined = finished.join(xg_slim, on=["home_team", "away_team"], how="inner")
@@ -1053,6 +1107,31 @@ def data_freshness(settings: Settings) -> dict[str, str]:
         else:
             freshness[name] = "missing"
     return freshness
+
+
+def last_updated(settings: Settings) -> datetime | None:
+    """Most recent modification time across the published forecast artifacts.
+
+    The public "forecasts last updated" stamp (spec 6.1, page 1): the max mtime
+    over the ``data/outputs`` parquet artifacts and the ingested results table.
+    Returns ``None`` when nothing has been published yet.
+    """
+
+    from polymbappe.data.tables import Table, table_path
+
+    paths = [
+        _output_path(settings, name)
+        for name in (
+            "stage_probabilities.parquet",
+            "match_predictions.parquet",
+            "knockout_bracket.parquet",
+        )
+    ]
+    paths.append(table_path(Table.MATCHES, settings))
+    mtimes = [p.stat().st_mtime for p in paths if p.exists()]
+    if not mtimes:
+        return None
+    return datetime.fromtimestamp(max(mtimes), tz=UTC)
 
 
 # -- new loaders ---------------------------------------------------------------
@@ -1680,3 +1759,86 @@ def dark_horses(stage_df: pl.DataFrame, *, n: int = 10) -> pl.DataFrame:
         .sort("overperformance", descending=True)
         .head(n)
     )
+
+
+# -- tournament retrospective ---------------------------------------------------
+
+
+def load_champion_trajectory(settings: Settings) -> pl.DataFrame:
+    """Load the replay trajectory (``champion_trajectory.parquet``, `polymbappe trajectory`)."""
+
+    from polymbappe.eval.trajectory import TRAJECTORY_FILE, TRAJECTORY_SCHEMA
+
+    return _read_or_empty(_output_path(settings, TRAJECTORY_FILE), TRAJECTORY_SCHEMA)
+
+
+def load_market_pnl(settings: Settings) -> pl.DataFrame:
+    """Load the champion-market P&L (``market_pnl.parquet``, `polymbappe trajectory --market`)."""
+
+    from polymbappe.eval.trajectory import MARKET_PNL_FILE, PNL_SCHEMA
+
+    return _read_or_empty(_output_path(settings, MARKET_PNL_FILE), PNL_SCHEMA)
+
+
+#: Display order of the per-round accuracy table (group stage first, then KO rounds).
+ROUND_ACCURACY_ORDER: tuple[str, ...] = ("Group", "R32", "R16", "QF", "SF", "TP", "F")
+
+
+def per_round_accuracy(
+    match_df: pl.DataFrame,
+    results_df: pl.DataFrame,
+    schedule_df: pl.DataFrame | None = None,
+) -> pl.DataFrame:
+    """Model top-pick accuracy and mean P(actual) per tournament round.
+
+    Group-stage rows come from :func:`split_fixtures`; knockout rows are classified into
+    R32/R16/QF/SF/TP/F by :func:`classify_ko_fixtures` (schedule date cutoffs). Returns
+    ``[round, n, accuracy, avg_p_actual]`` in play order, skipping rounds with no
+    finished matches.
+    """
+
+    empty_schema: dict[str, pl.DataType] = {
+        "round": pl.Utf8, "n": pl.Int64, "accuracy": pl.Float64, "avg_p_actual": pl.Float64,
+    }
+    if match_df.is_empty() or "model_home" not in match_df.columns:
+        return pl.DataFrame(schema=empty_schema)
+
+    p_actual = (
+        pl.when(pl.col("actual_outcome") == "home").then(pl.col("model_home"))
+        .when(pl.col("actual_outcome") == "draw").then(pl.col("model_draw"))
+        .otherwise(pl.col("model_away"))
+        .alias("_p_actual")
+    )
+
+    def _agg(frame: pl.DataFrame, label: str) -> dict[str, object] | None:
+        if frame.is_empty():
+            return None
+        scored = frame.with_columns(p_actual)
+        return {
+            "round": label,
+            "n": frame.height,
+            "accuracy": float(frame["model_correct"].cast(pl.Int64).mean()),
+            "avg_p_actual": float(scored["_p_actual"].mean()),
+        }
+
+    rows: list[dict[str, object]] = []
+    _, finished = split_fixtures(match_df, results_df)
+    if not finished.is_empty() and "group" in finished.columns:
+        group_row = _agg(finished.filter(pl.col("group") != "KO"), "Group")
+        if group_row is not None:
+            rows.append(group_row)
+
+    ko = classify_ko_fixtures(match_df, results_df, schedule_df)
+    if not ko.is_empty() and "stage" in ko.columns:
+        played = ko.filter(
+            pl.col("home_goals").is_not_null() & (pl.col("stage") != "upcoming")
+        )
+        for label in ROUND_ACCURACY_ORDER[1:]:
+            round_row = _agg(played.filter(pl.col("stage") == label), label)
+            if round_row is not None:
+                rows.append(round_row)
+
+    schema = {
+        "round": pl.Utf8, "n": pl.Int64, "accuracy": pl.Float64, "avg_p_actual": pl.Float64,
+    }
+    return pl.DataFrame(rows, schema=schema) if rows else pl.DataFrame(schema=schema)

@@ -1,5 +1,21 @@
-[client]
-# The dashboard provides its own page navigation via st.sidebar.radio in
-# dashboard/app.py, so hide Streamlit's auto-generated multipage nav header
-# (built from the sibling dashboard/pages/ directory).
-showSidebarNavigation = false
+# Navigation is defined programmatically via st.navigation/st.Page in
+# dashboard/app.py, which supersedes the sibling dashboard/pages/ directory.
+# The sidebar nav widget it renders must stay visible (the Streamlit default),
+# so client.showSidebarNavigation is deliberately NOT set here.
+
+# Brand theme, both modes (auto light/dark switching is preserved when both
+# sections are defined). Primary = the polymbappe logo blue; neutrals are
+# tinted toward that hue. Chart series colors live in
+# dashboard/components/charts.py and were validated for colorblind safety.
+
+[theme.light]
+primaryColor = "#2652f9"
+backgroundColor = "#ffffff"
+secondaryBackgroundColor = "#f2f5ff"
+textColor = "#111421"
+
+[theme.dark]
+primaryColor = "#6d8bfb"
+backgroundColor = "#0f1220"
+secondaryBackgroundColor = "#181c30"
+textColor = "#e9ecf6"

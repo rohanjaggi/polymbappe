@@ -1143,9 +1143,14 @@ def fetch_fotmob_match_xg(
     import time
     import urllib.request
 
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
+    # Verification stays ON; certifi supplies the CA bundle because macOS
+    # framework Pythons ship without one and fail the handshake otherwise.
+    try:
+        import certifi
+
+        ctx = ssl.create_default_context(cafile=certifi.where())
+    except ImportError:  # pragma: no cover - certifi ships with the deps
+        ctx = ssl.create_default_context()
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "

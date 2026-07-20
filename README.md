@@ -39,9 +39,9 @@ Core CLI (works offline, no credentials, no optional extras):
 polymbappe ingest                                   # results + self-computed Elo
 polymbappe features                                 # build the feature matrix
 polymbappe train                                    # Dixon-Coles (+ GBM/Bayesian with extras)
-polymbappe simulate --tournament 2026 --n-sims 50000
-polymbappe backtest --format-version 2018
-polymbappe edges --tournament 2026                  # model vs market (needs odds — see below)
+polymbappe simulate --n-sims 50000
+polymbappe backtest
+polymbappe edges                                    # model vs market (needs odds — see below)
 polymbappe report
 ```
 
@@ -231,7 +231,6 @@ pip install -e .[context]
 polymbappe agent --run-now        # one Scan→Assess→Cross-Ref→Act→Reflect cycle
 polymbappe agent --status         # current player statuses
 polymbappe agent --history        # changelog
-polymbappe agent --schedule 30m   # interval scheduling
 ```
 
 - **BBC Sport RSS** — no credentials (feedparser).
@@ -249,7 +248,7 @@ falling back to a deterministic experiment list.
 
 ```bash
 pip install -e .[modeling]
-polymbappe autotune --budget 2h --metric rps
+polymbappe autotune --budget 2h
 polymbappe autotune --leaderboard
 polymbappe autotune --apply-best          # writes configs/best_config.yaml
 ```
@@ -308,8 +307,9 @@ LightGBM adjuster is known to hurt the LOTO backtest (contextual features
 accessible via `simulate --historical-context` for diagnostic comparison.
 
 ### Dashboard
-Seven-page Streamlit app (overview, team deep-dive, match predictor,
-predictions vs actuals, market edges, upset watch, agent activity).
+Seven-page Streamlit app with URL-addressable navigation (tournament overview,
+tournament retrospective, predictions vs actuals, match predictor, team deep
+dive, upset watch, model showcase).
 
 ```bash
 pip install -e .[dashboard]

@@ -58,6 +58,35 @@ def test_elo_is_point_in_time() -> None:
     assert _row(elo, "m2", "B")["elo_pre"] < 1500.0
 
 
+def test_elo_update_respects_neutral_site() -> None:
+    from polymbappe.features.elo import EloRatings
+
+    # Neutral venue: equal-rated teams have expected score 0.5, so a win moves
+    # exactly k * 0.5. With home advantage the home side is expected to win more
+    # often, so the same result earns less.
+    neutral = EloRatings(EloConfig())
+    neutral.update("A", "B", 1, 0, neutral=True)
+    assert math.isclose(neutral.rating("A") - 1500.0, EloConfig().k_factor * 0.5)
+
+    home_adv = EloRatings(EloConfig())
+    home_adv.update("A", "B", 1, 0)
+    assert home_adv.rating("A") < neutral.rating("A")
+
+
+def test_build_elo_features_threads_neutral_site() -> None:
+    # Same fixtures/results, differing only in the neutral_site flag of m1: the
+    # walker must credit the m1 winner differently, visible in m2's pre-ratings.
+    flagged = MATCHES.with_columns(
+        pl.when(pl.col("match_id") == "m1")
+        .then(True)
+        .otherwise(pl.col("neutral_site"))
+        .alias("neutral_site")
+    )
+    elo_home = build_elo_features(MATCHES, config=EloConfig())
+    elo_neutral = build_elo_features(flagged, config=EloConfig())
+    assert _row(elo_neutral, "m2", "A")["elo_pre"] > _row(elo_home, "m2", "A")["elo_pre"]
+
+
 def test_form_excludes_current_match() -> None:
     form = build_form_features(MATCHES, windows=(5,))
     # A's first appearance has no prior form.

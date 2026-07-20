@@ -53,6 +53,9 @@ class Match(BaseModel):
     group: str | None = None
     city: str | None = None
     country: str | None = None
+    #: FIFA fair-play conduct points: negative deductions (yellow -1, indirect red -3,
+    #: direct red -4, yellow+direct red -5), so a HIGHER total is better. Tiebreaker
+    #: sorts rely on this sign convention.
     fair_play_home: int = 0
     fair_play_away: int = 0
 
@@ -102,6 +105,8 @@ class GroupStanding(BaseModel):
     goal_difference: int
     goals_scored: int
     goals_against: int
+    #: Sum of FIFA fair-play deduction points (negative; higher is better) — see
+    #: :class:`Match`.
     fair_play_score: int = 0
     lots_rank: int = 0
 

@@ -95,6 +95,8 @@ def resolve_group_table(
             row.team: _head_to_head_key(row.team, tied_teams, matches) for row in tied_rows
         }
 
+        # fair_play_score uses FIFA's negative deduction points (yellow = -1, ...),
+        # so higher (closer to zero) is better and sorts descending like the rest.
         tied_rows.sort(
             key=lambda row: (
                 h2h_scores[row.team][0],

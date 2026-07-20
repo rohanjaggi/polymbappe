@@ -141,6 +141,9 @@ class _BracketForecaster:
         side = node.home if side_name == "home" else node.away
         if side.kind == "winner" and side.ref in self._bracket.nodes:
             return self._winner_dist(side.ref)  # type: ignore[arg-type]
+        if side.kind == "loser" and side.ref in self._bracket.nodes:
+            # Third-place play-off sides: the losers of the two semi-finals.
+            return self._loser_dist(side.ref)  # type: ignore[arg-type]
         if node.pinned:
             home_occ, away_occ = oriented_pin(node, self._team_group)
             return {home_occ if side_name == "home" else away_occ: 1.0}
@@ -233,10 +236,13 @@ class _BracketForecaster:
             "exp_b_goals": float((reg.sum(axis=0) * self._grid).sum()),
         }
 
-    def rows_for(self, num: int, top_n: int) -> list[dict[str, object]]:
-        """Emit one row per possible matchup at a fixture, most-probable first."""
+    def rows_for(self, node: BracketNode, top_n: int) -> list[dict[str, object]]:
+        """Emit one row per possible matchup at a fixture, most-probable first.
 
-        node = self._bracket.nodes[num]
+        Takes the node itself (not its number) so the third-place play-off — stored
+        outside ``bracket.nodes`` — can be forecast through the same path.
+        """
+
         if node.pinned:
             a, b = oriented_pin(node, self._team_group)
             if node.winner is not None:
@@ -284,6 +290,7 @@ def compute_knockout_bracket(
     model: object,
     structure: object,
     top_n: int = 30,
+    winner_overrides: dict[int, str] | None = None,
 ) -> pl.DataFrame:
     """Per-fixture knockout forecast for the real bracket (advance + FT/ET/pens).
 
@@ -295,17 +302,21 @@ def compute_knockout_bracket(
         model: ``StrengthModel`` with ``.rates()``, ``.rho`` and ``.max_goals``.
         structure: ``TournamentStructure`` with ``.penalty_rate`` / ``.groups`` mappings.
         top_n: cap on the number of possible matchups emitted per fixture (deepest rounds fan out).
+        winner_overrides: manual ``{match_number: winner}`` for played draws inference
+            can't settle (final / third place) — see
+            :func:`~polymbappe.simulate.real_bracket.load_ko_winner_overrides`.
 
     Returns:
         DataFrame with :data:`BRACKET_SCHEMA` columns: one row per possible matchup at each
-        fixture, ``rank`` 1 = most-probable occupant of that slot. Empty (typed) frame when the
-        schedule carries no knockout fixtures.
+        fixture (the third-place play-off emitted as round ``"THIRD"``), ``rank`` 1 =
+        most-probable occupant of that slot. Empty (typed) frame when the schedule carries
+        no knockout fixtures.
     """
 
     bracket = build_real_bracket(schedule)
     if bracket is None:
         return pl.DataFrame(schema=BRACKET_SCHEMA)
-    attach_played_results(bracket, matches)
+    attach_played_results(bracket, matches, winner_overrides)
 
     positions_qualified = real_group_positions(matches, structure)
     positions, qualified = positions_qualified if positions_qualified else (None, None)
@@ -313,7 +324,9 @@ def compute_knockout_bracket(
     forecaster = _BracketForecaster(bracket, model, structure, positions, qualified)
     rows: list[dict[str, object]] = []
     for num in sorted(bracket.nodes):
-        rows.extend(forecaster.rows_for(num, top_n))
+        rows.extend(forecaster.rows_for(bracket.nodes[num], top_n))
+    if bracket.third_place is not None:
+        rows.extend(forecaster.rows_for(bracket.third_place, top_n))
 
     if not rows:
         return pl.DataFrame(schema=BRACKET_SCHEMA)

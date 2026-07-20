@@ -13,7 +13,6 @@ first ``polymbappe simulate`` run.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 import polars as pl
@@ -22,6 +21,34 @@ from polymbappe.dashboard.data import STAGE_COLUMNS
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, avoids importing plotly at module load
     from plotly.graph_objects import Figure
+
+# -- palette -------------------------------------------------------------------
+#
+# One palette for every chart, anchored on the polymbappe logo blue and
+# validated (dataviz six-checks) for colorblind-safe adjacency and ≥3:1 contrast
+# on the light surface; contrast also holds on the dark theme surface. Trace
+# colors are static across Streamlit's light/dark modes, so they were chosen to
+# work on both.
+
+#: Brand blue (the logo color): primary accent, single-series marks, "model".
+BRAND = "#2652f9"
+#: Light step of the brand ramp: the "predicted/forecast" half of an ordered pair.
+BRAND_LIGHT = "#97adfc"
+#: Warm counterpoint: away side, actual-xG overlay.
+ORANGE = "#eb6834"
+#: Aqua: the draw slot between blue (home) and orange (away).
+AQUA = "#1baf7a"
+#: Muted mode-invariant gray for reference lines and market overlays — never a series.
+NEUTRAL = "#898781"
+
+#: home / draw / away — used everywhere those three outcomes appear, in this order.
+HDA_COLORS: dict[str, str] = {"home": BRAND, "draw": AQUA, "away": ORANGE}
+
+#: Fixed categorical order for multi-series charts (trajectory lines). Adjacent
+#: pairs pass CVD separation; assign in order, never cycled.
+CATEGORICAL: tuple[str, ...] = (
+    BRAND, "#008300", "#e87ba4", "#eda100", AQUA, ORANGE, "#7b6ee0", "#e34948",
+)
 
 
 def _empty_figure(message: str) -> Figure:
@@ -48,7 +75,7 @@ def trophy_bar(df: pl.DataFrame, *, prob_col: str = "champion", n: int = 10) -> 
     import plotly.graph_objects as go
 
     if df.is_empty() or "team" not in df.columns or prob_col not in df.columns:
-        return _empty_figure("No simulation results yet — run `polymbappe simulate`.")
+        return _empty_figure("Forecasts not published yet.")
 
     top = df.sort(prob_col, descending=True).head(n)
     teams = top["team"].to_list()
@@ -58,83 +85,17 @@ def trophy_bar(df: pl.DataFrame, *, prob_col: str = "champion", n: int = 10) -> 
             x=probs[::-1],
             y=teams[::-1],
             orientation="h",
-            marker={"color": "seagreen"},
+            marker={"color": BRAND},
             hovertemplate="%{y}: %{x:.1%}<extra></extra>",
         )
     )
     fig.update_layout(
-        title=f"Trophy probability — top {len(teams)}",
         xaxis_title="P(champion)",
         xaxis_tickformat=".0%",
         margin={"l": 20, "r": 20, "t": 50, "b": 30},
     )
     return fig
 
-
-def advancement_heatmap(df: pl.DataFrame, *, teams: Sequence[str] | None = None) -> Figure:
-    """Heatmap of group-finish probabilities, team x finish position (spec 6.1, page 1).
-
-    Expects a group-probabilities frame with ``team`` and ``finish_1..finish_4``.
-    """
-
-    import plotly.express as px
-
-    finish_cols = ["finish_1", "finish_2", "finish_3", "finish_4"]
-    if df.is_empty() or "team" not in df.columns or not all(c in df.columns for c in finish_cols):
-        return _empty_figure("No group probabilities yet — run `polymbappe simulate`.")
-
-    frame = df
-    if teams is not None:
-        frame = frame.filter(pl.col("team").is_in(list(teams)))
-    if frame.is_empty():
-        return _empty_figure("No teams selected.")
-
-    frame = frame.sort("finish_1", descending=True)
-    matrix = frame.select(finish_cols).to_numpy()
-    fig = px.imshow(
-        matrix,
-        x=["1st", "2nd", "3rd", "4th"],
-        y=frame["team"].to_list(),
-        color_continuous_scale="Greens",
-        aspect="auto",
-        labels={"x": "Group finish", "y": "Team", "color": "Probability"},
-    )
-    fig.update_layout(
-        title="Group advancement probabilities",
-        margin={"l": 20, "r": 20, "t": 50, "b": 30},
-    )
-    return fig
-
-
-def score_heatmap(matrix: Sequence[Sequence[float]], *, max_goals: int | None = None) -> Figure:
-    """Heatmap of a scoreline probability matrix, home goals x away goals (spec 6.1, page 3).
-
-    ``matrix[i][j]`` is P(home scores ``i``, away scores ``j``).
-    """
-
-    import numpy as np
-    import plotly.express as px
-
-    arr = np.asarray(matrix, dtype=float)
-    if arr.size == 0 or arr.ndim != 2:
-        return _empty_figure("No scoreline matrix available.")
-
-    if max_goals is not None:
-        arr = arr[: max_goals + 1, : max_goals + 1]
-    rows, cols = arr.shape
-    fig = px.imshow(
-        arr,
-        x=[str(j) for j in range(cols)],
-        y=[str(i) for i in range(rows)],
-        color_continuous_scale="Blues",
-        aspect="auto",
-        labels={"x": "Away goals", "y": "Home goals", "color": "Probability"},
-    )
-    fig.update_layout(
-        title="Score distribution",
-        margin={"l": 20, "r": 20, "t": 50, "b": 30},
-    )
-    return fig
 
 
 def hda_bar(
@@ -148,7 +109,7 @@ def hda_bar(
         go.Bar(
             x=[f"{home} win", "Draw", f"{away} win"],
             y=[home_prob, draw_prob, away_prob],
-            marker={"color": ["seagreen", "goldenrod", "indianred"]},
+            marker={"color": [HDA_COLORS["home"], HDA_COLORS["draw"], HDA_COLORS["away"]]},
             hovertemplate="%{x}: %{y:.1%}<extra></extra>",
         )
     )
@@ -157,46 +118,6 @@ def hda_bar(
         yaxis_title="Probability",
         yaxis_tickformat=".0%",
         margin={"l": 20, "r": 20, "t": 50, "b": 30},
-    )
-    return fig
-
-
-def phase_decided_bar(p_reg: float, p_et: float, p_pens: float) -> Figure:
-    """Stacked bar of how a knockout tie is decided: regulation / extra time / penalties.
-
-    The three probabilities should sum to ~1. Rendered as a single horizontal stacked bar so
-    the FT/ET/pens split reads at a glance next to the advance-probability metrics.
-    """
-
-    import plotly.graph_objects as go
-
-    segments = (
-        ("Regulation (FT)", p_reg, "seagreen"),
-        ("Extra time (ET)", p_et, "goldenrod"),
-        ("Penalties", p_pens, "indianred"),
-    )
-    fig = go.Figure()
-    for label, value, color in segments:
-        fig.add_trace(
-            go.Bar(
-                x=[value],
-                y=["Decided in"],
-                name=label,
-                orientation="h",
-                marker={"color": color},
-                hovertemplate=f"{label}: %{{x:.1%}}<extra></extra>",
-            )
-        )
-    fig.update_layout(
-        barmode="stack",
-        title="How the tie is decided",
-        xaxis_title="Probability",
-        xaxis_tickformat=".0%",
-        xaxis_range=[0, 1],
-        yaxis={"visible": False},
-        legend={"orientation": "h", "y": -0.3},
-        margin={"l": 20, "r": 20, "t": 50, "b": 30},
-        height=200,
     )
     return fig
 
@@ -218,12 +139,11 @@ def stage_waterfall(stage_probs: dict[str, float], *, team: str) -> Figure:
         go.Bar(
             x=stages,
             y=values,
-            marker={"color": "steelblue"},
+            marker={"color": BRAND},
             hovertemplate="%{x}: %{y:.1%}<extra></extra>",
         )
     )
     fig.update_layout(
-        title=f"{team} — stage-reaching probabilities",
         yaxis_title="Probability",
         yaxis_tickformat=".0%",
         margin={"l": 20, "r": 20, "t": 50, "b": 30},
@@ -244,12 +164,15 @@ def outcome_accuracy_bar(df: pl.DataFrame) -> Figure:
         return _empty_figure("No finished matches yet — accuracy needs recorded results.")
 
     labels = {"home": "Home win", "draw": "Draw", "away": "Away win"}
-    cats = [labels.get(o, o) for o in df["actual_outcome"].to_list()]
+    outcomes = df["actual_outcome"].to_list()
+    cats = [labels.get(o, o) for o in outcomes]
     fig = go.Figure(
         go.Bar(
             x=cats,
             y=df["accuracy"].to_list(),
-            marker={"color": ["seagreen", "goldenrod", "indianred"][: len(cats)]},
+            # Color follows the outcome entity (same mapping as the H/D/A bar),
+            # not the row position — the frame arrives sorted alphabetically.
+            marker={"color": [HDA_COLORS.get(o, NEUTRAL) for o in outcomes]},
             customdata=df["n"].to_list(),
             hovertemplate="%{x}: %{y:.0%} (n=%{customdata})<extra></extra>",
         )
@@ -285,7 +208,7 @@ def calibration_curve(df: pl.DataFrame) -> Figure:
             x=[0, 1],
             y=[0, 1],
             mode="lines",
-            line={"dash": "dash", "color": "gray"},
+            line={"dash": "dash", "color": NEUTRAL},
             name="Perfect calibration",
             hoverinfo="skip",
         )
@@ -295,8 +218,8 @@ def calibration_curve(df: pl.DataFrame) -> Figure:
             x=df["mean_confidence"].to_list(),
             y=df["hit_rate"].to_list(),
             mode="markers+lines",
-            marker={"size": [min(40, 10 + 5 * c) for c in counts], "color": "steelblue"},
-            line={"color": "steelblue"},
+            marker={"size": [min(40, 10 + 5 * c) for c in counts], "color": BRAND},
+            line={"color": BRAND},
             customdata=counts,
             name="Model",
             hovertemplate=(
@@ -321,7 +244,7 @@ def xg_scatter(finished: pl.DataFrame, match_xg: pl.DataFrame | None = None) -> 
     """Scatter of model predicted xG vs actual goals (and actual xG when available).
 
     Plots one point per team per match. When ``match_xg`` is supplied, adds a second
-    series showing actual FBref xG vs actual goals so you can separate model error
+    series showing actual FotMob xG vs actual goals so you can separate model error
     from finishing-luck variance. The diagonal represents perfect prediction.
     """
 
@@ -345,20 +268,20 @@ def xg_scatter(finished: pl.DataFrame, match_xg: pl.DataFrame | None = None) -> 
     fig.add_trace(go.Scatter(
         x=[0, max_val], y=[0, max_val],
         mode="lines",
-        line={"dash": "dash", "color": "gray"},
+        line={"dash": "dash", "color": NEUTRAL},
         name="Perfect prediction",
         hoverinfo="skip",
     ))
     fig.add_trace(go.Scatter(
         x=x_pred, y=y_goals,
         mode="markers",
-        marker={"color": "steelblue", "size": 9, "opacity": 0.75},
+        marker={"color": BRAND, "size": 9, "opacity": 0.75},
         text=labels,
         hovertemplate="<b>%{text}</b><br>Model xG: %{x:.2f}<br>Actual goals: %{y}<extra></extra>",
         name="Model xG vs goals",
     ))
 
-    # Overlay actual FBref xG vs goals when available.
+    # Overlay actual FotMob xG vs goals when available.
     if match_xg is not None and not match_xg.is_empty():
         xg_slim = match_xg.select(["home_team", "away_team", "home_xg", "away_xg"])
         joined = finished.join(xg_slim, on=["home_team", "away_team"], how="inner")
@@ -382,10 +305,10 @@ def xg_scatter(finished: pl.DataFrame, match_xg: pl.DataFrame | None = None) -> 
             fig.add_trace(go.Scatter(
                 x=x_actual_xg, y=y_actual_goals,
                 mode="markers",
-                marker={"color": "tomato", "size": 9, "opacity": 0.75, "symbol": "diamond"},
+                marker={"color": ORANGE, "size": 9, "opacity": 0.75, "symbol": "diamond"},
                 text=xg_labels,
                 hovertemplate=(
-                    "<b>%{text}</b><br>FBref xG: %{x:.2f}<br>Actual goals: %{y}<extra></extra>"
+                    "<b>%{text}</b><br>FotMob xG: %{x:.2f}<br>Actual goals: %{y}<extra></extra>"
                 ),
                 name="Actual xG vs goals (luck)",
             ))
@@ -394,36 +317,6 @@ def xg_scatter(finished: pl.DataFrame, match_xg: pl.DataFrame | None = None) -> 
         title="xG error decomposition — model vs actual vs goals",
         xaxis_title="xG value",
         yaxis_title="Actual goals scored",
-        margin={"l": 20, "r": 20, "t": 50, "b": 30},
-    )
-    return fig
-
-
-def edge_scatter(df: pl.DataFrame) -> Figure:
-    """Scatter of edge magnitude vs. Kelly stake for flagged edges (spec 6.1, page 4).
-
-    Expects an edges frame with ``edge_bps``, ``kelly_fraction``, ``match_id``,
-    ``outcome``.
-    """
-
-    import plotly.express as px
-
-    needed = {"edge_bps", "kelly_fraction"}
-    if df.is_empty() or not needed.issubset(df.columns):
-        return _empty_figure("No market edges flagged — run `polymbappe edges`.")
-
-    pdf = df.to_pandas()
-    pdf["abs_edge_bps"] = pdf["edge_bps"].abs()
-    hover = [c for c in ("match_id", "outcome") if c in pdf.columns]
-    fig = px.scatter(
-        pdf,
-        x="abs_edge_bps",
-        y="kelly_fraction",
-        hover_data=hover or None,
-        labels={"abs_edge_bps": "|edge| (bps)", "kelly_fraction": "Kelly fraction"},
-    )
-    fig.update_layout(
-        title="Market edges — magnitude vs. stake",
         margin={"l": 20, "r": 20, "t": 50, "b": 30},
     )
     return fig
@@ -454,12 +347,12 @@ def group_standings_chart(
     fig = go.Figure()
     fig.add_trace(go.Bar(
         y=teams[::-1], x=pred_pts[::-1], orientation="h",
-        name="Predicted", marker={"color": "steelblue", "opacity": 0.7},
+        name="Predicted", marker={"color": BRAND_LIGHT},
         hovertemplate="%{y}: %{x:.1f} pts<extra>Predicted</extra>",
     ))
     fig.add_trace(go.Bar(
         y=teams[::-1], x=act_pts[::-1], orientation="h",
-        name="Actual", marker={"color": "seagreen"},
+        name="Actual", marker={"color": BRAND},
         hovertemplate="%{y}: %{x} pts<extra>Actual</extra>",
     ))
     fig.update_layout(
@@ -468,41 +361,6 @@ def group_standings_chart(
         barmode="group",
         margin={"l": 20, "r": 20, "t": 50, "b": 30},
         legend={"orientation": "h", "y": -0.15},
-    )
-    return fig
-
-
-def autotuner_chart(leaderboard_df: pl.DataFrame) -> Figure:
-    """Scatter plot of autotuner experiments showing RPS optimization journey."""
-
-    import plotly.graph_objects as go
-
-    if leaderboard_df.is_empty() or "mean_rps" not in leaderboard_df.columns:
-        return _empty_figure("No autotuner data available.")
-
-    phase_colors = {"phase1": "goldenrod", "phase2": "steelblue"}
-    fig = go.Figure()
-    for phase in ["phase1", "phase2"]:
-        subset = leaderboard_df.filter(pl.col("phase") == phase)
-        if subset.is_empty():
-            continue
-        fig.add_trace(go.Scatter(
-            x=list(range(subset.height)),
-            y=subset["mean_rps"].to_list(),
-            mode="markers",
-            marker={"color": phase_colors.get(phase, "gray"), "size": 5, "opacity": 0.6},
-            name=phase.replace("phase", "Phase "),
-            hovertemplate="RPS: %{y:.4f}<extra>%{fullData.name}</extra>",
-        ))
-
-    best_rps = float(leaderboard_df["mean_rps"].min())
-    fig.add_hline(y=best_rps, line_dash="dash", line_color="seagreen",
-                  annotation_text=f"Best: {best_rps:.4f}")
-    fig.update_layout(
-        title="Hyperparameter Optimization Journey",
-        xaxis_title="Experiment #",
-        yaxis_title="Mean RPS (lower is better)",
-        margin={"l": 20, "r": 20, "t": 50, "b": 30},
     )
     return fig
 
@@ -521,17 +379,80 @@ def backtest_bar(per_tournament: dict[str, float]) -> Figure:
 
     fig = go.Figure(go.Bar(
         x=tournaments, y=values,
-        marker={"color": "steelblue"},
-        hovertemplate="%{x}: %{y:.4f}<extra></extra>",
+        marker={"color": BRAND},
+        hovertemplate="%{x}: %{y:.3f}<extra></extra>",
     ))
-    fig.add_hline(y=mean_rps, line_dash="dash", line_color="seagreen",
-                  annotation_text=f"Our mean: {mean_rps:.4f}")
-    fig.add_hline(y=0.2222, line_dash="dot", line_color="tomato",
-                  annotation_text="Random baseline: 0.2222")
+    fig.add_hline(y=mean_rps, line_dash="dash", line_color=NEUTRAL,
+                  annotation_text=f"Mean: {mean_rps:.3f}")
+    fig.add_hline(y=0.21, line_dash="dot", line_color=NEUTRAL,
+                  annotation_text="0.21 benchmark")
     fig.update_layout(
         title="RPS by Tournament (Leave-One-Out Backtest)",
         xaxis_title="Tournament",
         yaxis_title="Ranked Probability Score",
         margin={"l": 20, "r": 20, "t": 50, "b": 30},
+    )
+    return fig
+
+
+def trajectory_lines(
+    df: pl.DataFrame,
+    *,
+    n_teams: int = 8,
+    market: pl.DataFrame | None = None,
+    market_team: str | None = None,
+) -> Figure:
+    """Championship-probability trajectories over the tournament (retrospective page).
+
+    ``df`` is the replay frame (``date, team, ..., champion``); the ``n_teams`` teams with
+    the highest peak champion probability get a line each. When ``market``
+    (``date, team, price``) and ``market_team`` are given, that team's Polymarket price is
+    overlaid as a dashed line for a model-vs-market comparison.
+    """
+
+    import plotly.graph_objects as go
+
+    if df.is_empty() or "champion" not in df.columns:
+        return _empty_figure("The title-race replay has not been computed yet.")
+
+    top = (
+        df.group_by("team")
+        .agg(pl.col("champion").max().alias("peak"))
+        .sort("peak", descending=True)
+        .head(n_teams)["team"]
+        .to_list()
+    )
+    fig = go.Figure()
+    for team in top:
+        series = df.filter(pl.col("team") == team).sort("date")
+        fig.add_trace(
+            go.Scatter(
+                x=series["date"].to_list(),
+                y=series["champion"].to_list(),
+                mode="lines+markers",
+                name=team,
+                hovertemplate=f"{team}: %{{y:.1%}} (%{{x}})<extra></extra>",
+            )
+        )
+    if market is not None and market_team and not market.is_empty():
+        series = market.filter(pl.col("team") == market_team).sort("date")
+        if not series.is_empty():
+            fig.add_trace(
+                go.Scatter(
+                    x=series["date"].to_list(),
+                    y=series["price"].to_list(),
+                    mode="lines",
+                    name=f"{market_team} (Polymarket)",
+                    line={"dash": "dash", "color": NEUTRAL},
+                    hovertemplate=f"{market_team} market: %{{y:.1%}} (%{{x}})<extra></extra>",
+                )
+            )
+    fig.update_layout(
+        xaxis_title="Information cutoff (end of day)",
+        yaxis_title="P(champion)",
+        yaxis_tickformat=".0%",
+        margin={"l": 20, "r": 20, "t": 50, "b": 30},
+        legend={"orientation": "h", "y": -0.2},
+        colorway=list(CATEGORICAL),
     )
     return fig
