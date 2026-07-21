@@ -69,17 +69,15 @@ you need, or all at once:
 ```bash
 pip install -e .[modeling]    # GBM, Bayesian DC, meta-learner, autotuner, SHAP
 pip install -e .[context]     # LangGraph live-news agent (RSS / Reddit / Ollama)
-pip install -e .[dashboard]   # Streamlit + Plotly dashboard
 pip install -e .[kaggle]      # EA FC / FM player-attribute ingest (kagglehub)
-pip install -e .[modeling,context,dashboard,kaggle,dev]   # everything
+pip install -e .[modeling,context,kaggle,dev]   # everything
 ```
 
 | Extra | Unlocks | Key packages |
 |-------|---------|--------------|
-| (core) | results, Elo, Dixon-Coles, simulate, backtest, Polymarket edges, scrapers | polars, requests, duckdb, scipy, soccerdata |
+| (core) | results, Elo, Dixon-Coles, simulate, backtest, Polymarket edges, scrapers, `polymbappe dashboard` | polars, requests, duckdb, scipy, soccerdata, streamlit, plotly |
 | `modeling` | `train --bayesian`, GBM, meta-stacking, `autotune`, SHAP | lightgbm, pymc, scikit-learn, optuna, shap |
 | `context` | `polymbappe agent` live monitoring | langgraph, praw, feedparser, vaderSentiment, ollama, apscheduler |
-| `dashboard` | `polymbappe dashboard` | streamlit, plotly |
 | `kaggle` | player-attribute ingest (agent importance tiers) | kagglehub |
 
 ## Configuration & credentials
@@ -315,7 +313,7 @@ dive, upset watch, model showcase). Branded light/dark theming lives in
 `dashboard/components/charts.py`.
 
 ```bash
-pip install -e .[dashboard]
+pip install -e .
 polymbappe dashboard
 ```
 

@@ -2828,6 +2828,8 @@ dependencies = [
     { name = "duckdb" },
     { name = "lxml" },
     { name = "numpy" },
+    { name = "openpyxl" },
+    { name = "plotly" },
     { name = "polars" },
     { name = "pyarrow" },
     { name = "pydantic" },
@@ -2837,6 +2839,7 @@ dependencies = [
     { name = "scipy", version = "1.17.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
     { name = "scipy", version = "1.18.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
     { name = "soccerdata" },
+    { name = "streamlit" },
     { name = "structlog" },
     { name = "typer" },
 ]
@@ -2850,11 +2853,6 @@ context = [
     { name = "ollama" },
     { name = "praw" },
     { name = "vadersentiment" },
-]
-dashboard = [
-    { name = "openpyxl" },
-    { name = "plotly" },
-    { name = "streamlit" },
 ]
 dev = [
     { name = "black" },
@@ -2895,9 +2893,9 @@ requires-dist = [
     { name = "numba", marker = "extra == 'modeling'", specifier = ">=0.60.0" },
     { name = "numpy", specifier = ">=1.26.0,<2.5" },
     { name = "ollama", marker = "extra == 'context'", specifier = ">=0.4.0" },
-    { name = "openpyxl", marker = "extra == 'dashboard'", specifier = ">=3.1.0" },
+    { name = "openpyxl", specifier = ">=3.1.0" },
     { name = "optuna", marker = "extra == 'modeling'", specifier = ">=3.6.0" },
-    { name = "plotly", marker = "extra == 'dashboard'", specifier = ">=5.22.0" },
+    { name = "plotly", specifier = ">=5.22.0" },
     { name = "polars", specifier = ">=1.8.0" },
     { name = "praw", marker = "extra == 'context'", specifier = ">=7.7.0" },
     { name = "pre-commit", marker = "extra == 'dev'", specifier = ">=3.8.0" },
@@ -2913,12 +2911,12 @@ requires-dist = [
     { name = "scipy", specifier = ">=1.14.0" },
     { name = "shap", marker = "extra == 'modeling'", specifier = ">=0.45.0" },
     { name = "soccerdata", specifier = ">=1.8.7" },
-    { name = "streamlit", marker = "extra == 'dashboard'", specifier = ">=1.38.0" },
+    { name = "streamlit", specifier = ">=1.38.0" },
     { name = "structlog", specifier = ">=24.4.0" },
     { name = "typer", specifier = ">=0.12.3" },
     { name = "vadersentiment", marker = "extra == 'context'", specifier = ">=3.3.0" },
 ]
-provides-extras = ["modeling", "context", "dashboard", "kaggle", "dev"]
+provides-extras = ["modeling", "context", "kaggle", "dev"]
 
 [[package]]
 name = "praw"
